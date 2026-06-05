@@ -26,7 +26,7 @@ CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/config/port.env"))
 PORT = int(os.environ.get("PORT", "8000"))
 PUBLIC_PORT = os.environ.get("PUBLIC_PORT") or os.environ.get("WAREHOUSE_HOST_PORT") or os.environ.get("PORT", "8000")
 BEIJING_TZ = timezone(timedelta(hours=8))
-APP_VERSION = "20260605-print-template-settings-v65"
+APP_VERSION = "20260605-template-export-clear-v67"
 REQUEST_IP = contextvars.ContextVar("request_ip", default="")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -2072,7 +2072,10 @@ def group_assets_by_keeper(conn, assets):
     groups = []
     for keeper_id in user_ids:
         group_items = [asset for asset in assets if asset.get("keeper_id") == keeper_id]
-        groups.append((keeper_id, names.get(keeper_id, ""), group_items))
+        name = names.get(keeper_id, "")
+        if name in ("未填写", "未填", "无"):
+            name = ""
+        groups.append((keeper_id, name, group_items))
     return groups
 
 
@@ -2845,6 +2848,45 @@ class Handler(SimpleHTTPRequestHandler):
                     add_audit(conn, user["id"], "更新系统设置", "登录展示图已更新" if image else "登录展示图已恢复默认")
                     self.send_json(200, get_state(conn, user))
                     return
+                if parsed.path == "/api/settings/print-template":
+                    require_admin(user)
+                    kind = str(payload.get("kind") or "").strip()
+                    if kind not in ("asset", "consumable"):
+                        self.send_json(400, {"error": "模板类型不正确"})
+                        return
+                    try:
+                        file_name, content_base64 = valid_docx_template(payload.get("fileName"), payload.get("contentBase64"))
+                    except ValueError as exc:
+                        self.send_json(400, {"error": str(exc)})
+                        return
+                    if kind == "asset":
+                        set_setting(conn, "print_asset_template_name", file_name)
+                        set_setting(conn, "print_asset_template_content", content_base64)
+                        label = "资产领用打印模板"
+                    else:
+                        set_setting(conn, "print_consumable_template_name", file_name)
+                        set_setting(conn, "print_consumable_template_content", content_base64)
+                        label = "耗材领用打印模板"
+                    add_audit(conn, user["id"], "更新打印设置", f"{label}：{file_name}")
+                    self.send_json(200, get_state(conn, user))
+                    return
+                if parsed.path == "/api/settings/print-template/reset":
+                    require_admin(user)
+                    kind = str(payload.get("kind") or "").strip()
+                    if kind not in ("asset", "consumable"):
+                        self.send_json(400, {"error": "模板类型不正确"})
+                        return
+                    if kind == "asset":
+                        set_setting(conn, "print_asset_template_name", "")
+                        set_setting(conn, "print_asset_template_content", "")
+                        label = "资产领用打印模板"
+                    else:
+                        set_setting(conn, "print_consumable_template_name", "")
+                        set_setting(conn, "print_consumable_template_content", "")
+                        label = "耗材领用打印模板"
+                    add_audit(conn, user["id"], "更新打印设置", f"{label}已恢复内置无隐私模板")
+                    self.send_json(200, get_state(conn, user))
+                    return
                 if parsed.path == "/api/settings/service-port":
                     require_admin(user)
                     port = valid_port(payload.get("port"))
@@ -2857,9 +2899,10 @@ class Handler(SimpleHTTPRequestHandler):
                     except OSError as exc:
                         self.send_json(500, {"error": f"端口配置写入失败：{exc}"})
                         return
+                    command = f"$env:WAREHOUSE_HOST_PORT='{port}'; docker compose -p warehouse up -d"
                     add_audit(conn, user["id"], "更新系统设置", f"服务端口改为 {port}，重启 Docker 后生效")
                     data = get_state(conn, user)
-                    data["portNotice"] = f"端口已保存为 {port}，需要重新执行 docker compose up -d 后生效。"
+                    data["portNotice"] = f"端口已保存为 {port}。请在 PowerShell 执行：\n{command}\n然后打开 http://127.0.0.1:{port}/"
                     self.send_json(200, data)
                     return
                 if parsed.path == "/api/debug/clear-files":
