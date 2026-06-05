@@ -1,0 +1,36 @@
+# Local runtime configuration
+.env
+*.local
+
+# SQLite/runtime data
+data/
+*.db
+*.sqlite
+*.sqlite3
+warehouse.db
+
+# Uploaded/imported business files and generated archives
+uploads/
+archives/
+import_archives/
+*.zip
+
+# Python/cache/build noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Browser/test artifacts
+.edge-profile/
+*.png
+*.jpg
+*.jpeg
+*.webp
+screenshot*/
+playwright-report/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
