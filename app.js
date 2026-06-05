@@ -1,7 +1,7 @@
 ﻿const USER_KEY = "warehouse-current-user";
 const SESSION_USER_KEY = "warehouse-session-user";
 const VIEW_MODE_KEY = "warehouse-view-mode";
-const APP_VERSION = "20260605-exact-browser-template-v63";
+const APP_VERSION = "20260605-template-export-clear-v67";
 
 let state = {
   currentUser: null,
@@ -14,7 +14,7 @@ let state = {
   adminRequests: [],
   assetRequests: [],
   purchaseWishes: [],
-  settings: { departments: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, loginBackgroundImage: "", servicePort: "" }
+  settings: { departments: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, loginBackgroundImage: "", servicePort: "", printAssetTemplateName: "", printAssetTemplateCustom: false, printConsumableTemplateName: "", printConsumableTemplateCustom: false }
 };
 let loginSettings = { adminPrefillEnabled: false, loginBackgroundImage: "", appVersion: APP_VERSION };
 let view = "dashboard";
@@ -551,6 +551,7 @@ function renderAssetTopbarActions() {
     <div class="asset-page-actions no-print">
       <button class="secondary" id="downloadAssets" type="button">下载资产表</button>
       <button class="secondary" id="printAssets" type="button">打印资产表</button>
+      <button class="secondary" id="exportPrintTemplates" type="button">导出模板单</button>
       ${isAdmin() ? `<button class="primary" id="openAssetDrawer" type="button">+ 新增资产</button>` : ""}
     </div>
   `;
@@ -1379,6 +1380,39 @@ function renderPurchaseWishMessages() {
   `;
 }
 
+function printTemplateLabel(kind) {
+  if (kind === "asset") {
+    return state.settings?.printAssetTemplateCustom
+      ? state.settings?.printAssetTemplateName || "自定义资产领用模板"
+      : "内置无隐私资产领用模板";
+  }
+  return state.settings?.printConsumableTemplateCustom
+    ? state.settings?.printConsumableTemplateName || "自定义耗材领用模板"
+    : "内置无隐私耗材领用模板";
+}
+
+function renderPrintTemplateSetting(kind, title, description) {
+  return `
+    <div class="print-template-card">
+      <div>
+        <strong>${title}</strong>
+        <p class="hint">${description}</p>
+        <p class="hint">当前：${printTemplateLabel(kind)}</p>
+      </div>
+      <div class="setting-actions">
+        <input id="${kind}PrintTemplateFile" class="visually-hidden" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
+        <label class="secondary" for="${kind}PrintTemplateFile">选择模板</label>
+        <button class="primary" data-save-print-template="${kind}" type="button">保存模板</button>
+        <button class="ghost" data-reset-print-template="${kind}" type="button">恢复内置</button>
+      </div>
+    </div>
+  `;
+}
+
+function portApplyCommand(port = state.settings?.servicePort || "38280") {
+  return `$env:WAREHOUSE_HOST_PORT='${port}'; docker compose -p warehouse up -d`;
+}
+
 function renderSettings() {
   if (!isAdmin()) return "";
   return `
@@ -1419,12 +1453,14 @@ function renderSettings() {
       </form>
       <form id="servicePortForm" class="setting-row">
         <div>
-          <strong>后台访问端口</strong>
-          <p class="hint">保存后会写入 Docker 端口配置；需要重新执行 docker compose up -d 后生效。</p>
+          <strong>后台端口设置</strong>
+          <p class="hint">当前访问端口：${state.settings?.servicePort || "38280"}。修改后需要在宿主机重新执行 Docker 命令，网页不能直接热切换端口。</p>
+          <code class="inline-command">${portApplyCommand()}</code>
         </div>
         <div class="port-setting">
           <input name="port" type="number" min="1" max="65535" required value="${state.settings?.servicePort || "38280"}" />
           <button class="primary" type="submit">保存端口</button>
+          <button class="secondary" id="copyPortCommand" type="button">复制命令</button>
         </div>
       </form>
       ${isDeveloperMode() ? `
@@ -1445,6 +1481,14 @@ function renderSettings() {
         </div>
         <button class="danger" id="clearDebugFiles" type="button">清空业务数据</button>
       </div>` : ""}
+    </section>
+    <section class="panel">
+      <div class="section-title"><h2>打印设置</h2></div>
+      <p class="hint">默认使用系统内置的空白无隐私 Word 模板。上传自定义 .docx 后，“导出模板单”会优先使用这里保存的模板；浏览器“打印资产表”使用网页打印样式。</p>
+      <div class="print-template-grid">
+        ${renderPrintTemplateSetting("asset", "资产领用模板", "用于“物品领用申请及确认单”，建议使用空白模板，不填写真实姓名、资产编号或业务内容。")}
+        ${renderPrintTemplateSetting("consumable", "耗材领用模板", "用于“耗材领用申请及确认单”，建议使用空白模板，不填写真实姓名、资产编号或业务内容。")}
+      </div>
     </section>
     ${isMultiDepartment() ? `
     <section class="panel">
@@ -1847,7 +1891,36 @@ function assetPrintChunks(items, size = 5) {
   return chunks;
 }
 
-function renderAssetPrintPage(chunk, pageIndex, today) {
+function printApplicantId(asset) {
+  const flow = assetFlow(asset);
+  if (flow.borrowerId) return flow.borrowerId;
+  if (asset?.keeperId && asset.keeperId !== "u-import-unknown") return asset.keeperId;
+  if (assetKeeperFilter !== "all") return assetKeeperFilter;
+  return state.currentUser?.id || "";
+}
+
+function printApplicantNameById(userId) {
+  const name = userName(userId);
+  return name === "未知用户" || name === "未填写" ? "" : name;
+}
+
+function groupPrintItemsByApplicant(items) {
+  const groups = new Map();
+  items.forEach((asset) => {
+    const applicantId = printApplicantId(asset);
+    if (!groups.has(applicantId)) {
+      groups.set(applicantId, {
+        applicantId,
+        applicantName: printApplicantNameById(applicantId),
+        items: []
+      });
+    }
+    groups.get(applicantId).items.push(asset);
+  });
+  return [...groups.values()];
+}
+
+function renderAssetPrintPage(chunk, pageIndex, today, applicantName) {
   const rows = Array.from({ length: 5 }, (_, rowIndex) => chunk[rowIndex] || null);
   return `
     <section class="asset-print-page asset-print-page-request">
@@ -1855,7 +1928,7 @@ function renderAssetPrintPage(chunk, pageIndex, today) {
       <div class="asset-print-meta">
         <span>编号：ZITTC-WG-WPLY-${String(new Date().getFullYear()).slice(2)}-${String(pageIndex + 1).padStart(2, "0")}</span>
         <span>本单序号：${today}-${String(pageIndex + 1).padStart(2, "0")}</span>
-        <span>申请人：${state.currentUser?.name || ""}</span>
+        <span>申请人：${applicantName || ""}</span>
       </div>
       <table class="asset-print-table">
         <thead>
@@ -1883,7 +1956,7 @@ function renderAssetPrintPage(chunk, pageIndex, today) {
   `;
 }
 
-function renderConsumablePrintPage(chunk, pageIndex, today, startIndex) {
+function renderConsumablePrintPage(chunk, pageIndex, today, startIndex, applicantName) {
   const rows = Array.from({ length: 15 }, (_, rowIndex) => chunk[rowIndex] || null);
   return `
     <section class="asset-print-page consumable-print-page">
@@ -1891,7 +1964,7 @@ function renderConsumablePrintPage(chunk, pageIndex, today, startIndex) {
       <div class="asset-print-meta consumable-print-meta">
         <span>编号：ZITTC-WG-WPLY-${String(new Date().getFullYear()).slice(2)}-${String(pageIndex + 1).padStart(2, "0")}</span>
         <span>本单序号：${today}-${String(pageIndex + 1).padStart(2, "0")}</span>
-        <span>申请人：${state.currentUser?.name || ""}</span>
+        <span>申请人：${applicantName || ""}</span>
       </div>
       <table class="asset-print-table consumable-print-table">
         <thead>
@@ -1901,7 +1974,7 @@ function renderConsumablePrintPage(chunk, pageIndex, today, startIndex) {
           ${rows.map((asset, rowIndex) => `
             <tr>
               <td>${asset ? startIndex + rowIndex + 1 : ""}</td>
-              <td>${asset ? state.currentUser?.name || "" : ""}</td>
+              <td>${asset ? applicantName || "" : ""}</td>
               <td>${asset?.name || ""}</td>
               <td>${asset?.spec || ""}</td>
               <td>${asset?.quantity || ""}</td>
@@ -1917,14 +1990,25 @@ function renderConsumablePrintPage(chunk, pageIndex, today, startIndex) {
 
 function renderPrintableAssetSheets(items) {
   const today = new Date().toISOString().slice(0, 10).replaceAll("-", "");
-  const assetItems = items.filter((asset) => assetKind(asset) === "资产");
-  const consumableItems = items.filter((asset) => assetKind(asset) === "耗材");
-  const assetPages = assetItems.length ? assetPrintChunks(assetItems, 5).map((chunk, pageIndex) => renderAssetPrintPage(chunk, pageIndex, today)) : [];
-  const consumablePages = consumableItems.length ? assetPrintChunks(consumableItems, 15).map((chunk, pageIndex) => renderConsumablePrintPage(chunk, pageIndex, today, pageIndex * 15)) : [];
-  if (!assetPages.length && !consumablePages.length) {
-    assetPages.push(renderAssetPrintPage([], 0, today));
+  const pages = [];
+  groupPrintItemsByApplicant(items).forEach((group) => {
+    const assetItems = group.items.filter((asset) => assetKind(asset) === "资产");
+    const consumableItems = group.items.filter((asset) => assetKind(asset) === "耗材");
+    if (assetItems.length) {
+      assetPrintChunks(assetItems, 5).forEach((chunk, pageIndex) => {
+        pages.push(renderAssetPrintPage(chunk, pageIndex, today, group.applicantName));
+      });
+    }
+    if (consumableItems.length) {
+      assetPrintChunks(consumableItems, 15).forEach((chunk, pageIndex) => {
+        pages.push(renderConsumablePrintPage(chunk, pageIndex, today, pageIndex * 15, group.applicantName));
+      });
+    }
+  });
+  if (!pages.length) {
+    pages.push(renderAssetPrintPage([], 0, today, ""));
   }
-  return `<div class="print-assets-template">${[...assetPages, ...consumablePages].join("")}</div>`;
+  return `<div class="print-assets-template">${pages.join("")}</div>`;
 }
 
 function downloadInboundTemplate() {
@@ -2340,6 +2424,13 @@ function bindEvents() {
     setTimeout(() => {
       document.title = oldTitle;
     }, 1000);
+  });
+  document.querySelector("#exportPrintTemplates")?.addEventListener("click", async () => {
+    try {
+      await downloadAssetPrintTemplates();
+    } catch (error) {
+      alert(error.message || "生成模板失败");
+    }
   });
   document.querySelector("#downloadAssets")?.addEventListener("click", downloadAssetsTable);
 
@@ -2784,6 +2875,54 @@ function bindEvents() {
     render();
   });
 
+  document.querySelectorAll("[data-save-print-template]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const kind = button.dataset.savePrintTemplate;
+      const file = document.querySelector(`#${kind}PrintTemplateFile`)?.files?.[0];
+      if (!file) {
+        alert("请先选择一个 .docx 模板文件。");
+        return;
+      }
+      if (!file.name.toLowerCase().endsWith(".docx")) {
+        alert("打印模板必须是 .docx 文件。");
+        return;
+      }
+      if (file.size > 2 * 1024 * 1024) {
+        alert("模板文件不能超过 2MB。");
+        return;
+      }
+      try {
+        state = await api("/api/settings/print-template", {
+          method: "POST",
+          body: JSON.stringify(withActor({
+            kind,
+            fileName: file.name,
+            contentBase64: await fileToBase64(file)
+          }))
+        });
+        alert("打印模板已保存。");
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-reset-print-template]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const kind = button.dataset.resetPrintTemplate;
+      try {
+        state = await api("/api/settings/print-template/reset", {
+          method: "POST",
+          body: JSON.stringify(withActor({ kind }))
+        });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
   document.querySelector("#servicePortForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const payload = withActor({ port: Number(event.target.port.value) });
@@ -2793,6 +2932,16 @@ function bindEvents() {
     });
     if (state.portNotice) alert(state.portNotice);
     render();
+  });
+
+  document.querySelector("#copyPortCommand")?.addEventListener("click", async () => {
+    const command = portApplyCommand();
+    try {
+      await navigator.clipboard.writeText(command);
+      alert("端口重启命令已复制。");
+    } catch {
+      prompt("复制下面的命令，在 PowerShell 里执行：", command);
+    }
   });
 
   document.querySelector("#clearDebugFiles")?.addEventListener("click", async () => {

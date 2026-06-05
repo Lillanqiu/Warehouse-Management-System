@@ -26,7 +26,7 @@ CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/config/port.env"))
 PORT = int(os.environ.get("PORT", "8000"))
 PUBLIC_PORT = os.environ.get("PUBLIC_PORT") or os.environ.get("WAREHOUSE_HOST_PORT") or os.environ.get("PORT", "8000")
 BEIJING_TZ = timezone(timedelta(hours=8))
-APP_VERSION = "20260605-exact-browser-template-v63"
+APP_VERSION = "20260605-template-export-clear-v67"
 REQUEST_IP = contextvars.ContextVar("request_ip", default="")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -827,6 +827,10 @@ def init_db():
         conn.execute("insert or ignore into system_settings values ('admin_prefill_enabled', '0')")
         conn.execute("insert or ignore into system_settings values ('login_background_image', '')")
         conn.execute("insert or ignore into system_settings values ('service_port', ?)", (str(PUBLIC_PORT),))
+        conn.execute("insert or ignore into system_settings values ('print_asset_template_name', '')")
+        conn.execute("insert or ignore into system_settings values ('print_asset_template_content', '')")
+        conn.execute("insert or ignore into system_settings values ('print_consumable_template_name', '')")
+        conn.execute("insert or ignore into system_settings values ('print_consumable_template_content', '')")
         ensure_column(conn, "records", "photo", "text")
         ensure_column(conn, "audits", "ip", "text")
         migrate_server_times_to_beijing(conn)
@@ -951,6 +955,39 @@ def valid_login_background(value):
     if re.match(r"^https?://", text):
         return text
     raise ValueError("只支持图片上传或 http/https 图片地址")
+
+
+def valid_docx_template(file_name, content_base64):
+    clean_name = safe_download_name(file_name or "print-template.docx")
+    if not clean_name.lower().endswith(".docx"):
+        raise ValueError("打印模板必须是 .docx 文件")
+    try:
+        content = base64.b64decode(content_base64 or "")
+    except (ValueError, TypeError):
+        raise ValueError("模板文件内容无效")
+    if len(content) > 2 * 1024 * 1024:
+        raise ValueError("模板文件不能超过 2MB")
+    try:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as archive:
+            if "word/document.xml" not in archive.namelist():
+                raise ValueError("模板文件不是有效的 Word 文档")
+    except zipfile.BadZipFile:
+        raise ValueError("模板文件不是有效的 Word 文档")
+    return clean_name, base64.b64encode(content).decode("ascii")
+
+
+def template_source(conn, kind):
+    if kind == "asset":
+        return (
+            setting_value(conn, "print_asset_template_name", ""),
+            setting_value(conn, "print_asset_template_content", ""),
+            ASSET_REQUEST_TEMPLATE,
+        )
+    return (
+        setting_value(conn, "print_consumable_template_name", ""),
+        setting_value(conn, "print_consumable_template_content", ""),
+        CONSUMABLE_REQUEST_TEMPLATE,
+    )
 
 
 def write_port_config(port):
@@ -1568,6 +1605,10 @@ def get_state(conn, user, view_role=""):
     admin_prefill = setting_value(conn, "admin_prefill_enabled", "0")
     login_background = setting_value(conn, "login_background_image", "")
     service_port = setting_value(conn, "service_port", str(PUBLIC_PORT))
+    print_asset_template_name = setting_value(conn, "print_asset_template_name", "")
+    print_asset_template_content = setting_value(conn, "print_asset_template_content", "")
+    print_consumable_template_name = setting_value(conn, "print_consumable_template_name", "")
+    print_consumable_template_content = setting_value(conn, "print_consumable_template_content", "")
     archives = rows_to_list(
         conn.execute(
             """
@@ -1677,6 +1718,10 @@ def get_state(conn, user, view_role=""):
             "adminPrefillEnabled": bool(int(admin_prefill)),
             "loginBackgroundImage": login_background,
             "servicePort": service_port,
+            "printAssetTemplateName": print_asset_template_name,
+            "printAssetTemplateCustom": bool(print_asset_template_content),
+            "printConsumableTemplateName": print_consumable_template_name,
+            "printConsumableTemplateCustom": bool(print_consumable_template_content),
             "appVersion": APP_VERSION,
         },
     }
@@ -1899,10 +1944,15 @@ def replace_body_content(body, content, sect_pr):
         body.append(copy.deepcopy(sect_pr))
 
 
-def fill_template_docx(template_path, chunks, fill_segment):
+def fill_template_docx(template_path, chunks, fill_segment, template_content_base64=""):
     if not template_path.exists():
         raise FileNotFoundError(f"模板不存在：{template_path}")
-    with zipfile.ZipFile(template_path, "r") as source:
+    if template_content_base64:
+        source_bytes = io.BytesIO(base64.b64decode(template_content_base64))
+        source_zip = zipfile.ZipFile(source_bytes, "r")
+    else:
+        source_zip = zipfile.ZipFile(template_path, "r")
+    with source_zip as source:
         original_files = {name: source.read(name) for name in source.namelist()}
     root = ElementTree.fromstring(original_files["word/document.xml"])
     body, template_content, sect_pr = docx_body_template(root)
@@ -2008,28 +2058,55 @@ def selected_assets_for_user(conn, user, asset_ids):
     return [by_id[item_id] for item_id in asset_ids if item_id in by_id]
 
 
+def group_assets_by_keeper(conn, assets):
+    user_ids = []
+    for asset in assets:
+        keeper_id = asset.get("keeper_id") or ""
+        if keeper_id and keeper_id not in user_ids:
+            user_ids.append(keeper_id)
+    if not user_ids:
+        return [("", "", assets)]
+    placeholders = ",".join("?" for _ in user_ids)
+    users = rows_to_list(conn.execute(f"select id, name from users where id in ({placeholders})", user_ids))
+    names = {item["id"]: item["name"] for item in users}
+    groups = []
+    for keeper_id in user_ids:
+        group_items = [asset for asset in assets if asset.get("keeper_id") == keeper_id]
+        name = names.get(keeper_id, "")
+        if name in ("未填写", "未填", "无"):
+            name = ""
+        groups.append((keeper_id, name, group_items))
+    return groups
+
+
 def build_asset_template_download(conn, user, asset_ids):
     assets = selected_assets_for_user(conn, user, asset_ids)
     if not assets:
         raise ValueError("没有可打印的资产数据")
-    applicant = user["name"]
-    asset_items = [item for item in assets if not is_consumable_asset(item)]
-    consumable_items = [item for item in assets if is_consumable_asset(item)]
     files = []
-    if asset_items:
-        content = fill_template_docx(
-            ASSET_REQUEST_TEMPLATE,
-            chunked(asset_items, 5),
-            lambda segment, chunk, index: fill_asset_template_segment(segment, chunk, index, applicant),
-        )
-        files.append(("资产申请及确认单.docx", content))
-    if consumable_items:
-        content = fill_template_docx(
-            CONSUMABLE_REQUEST_TEMPLATE,
-            chunked(consumable_items, 15),
-            lambda segment, chunk, index: fill_consumable_template_segment(segment, chunk, index, applicant),
-        )
-        files.append(("耗材申请及确认单.docx", content))
+    _, asset_template_content, asset_template_path = template_source(conn, "asset")
+    _, consumable_template_content, consumable_template_path = template_source(conn, "consumable")
+    for _, applicant, group_items in group_assets_by_keeper(conn, assets):
+        applicant_name = applicant or user["name"]
+        asset_items = [item for item in group_items if not is_consumable_asset(item)]
+        consumable_items = [item for item in group_items if is_consumable_asset(item)]
+        safe_name = safe_download_name(applicant_name or "未命名")
+        if asset_items:
+            content = fill_template_docx(
+                asset_template_path,
+                chunked(asset_items, 5),
+                lambda segment, chunk, index: fill_asset_template_segment(segment, chunk, index, applicant_name),
+                asset_template_content,
+            )
+            files.append((f"{safe_name}-资产申请及确认单.docx", content))
+        if consumable_items:
+            content = fill_template_docx(
+                consumable_template_path,
+                chunked(consumable_items, 15),
+                lambda segment, chunk, index: fill_consumable_template_segment(segment, chunk, index, applicant_name),
+                consumable_template_content,
+            )
+            files.append((f"{safe_name}-耗材申请及确认单.docx", content))
     if len(files) == 1:
         return files[0][0], "application/vnd.openxmlformats-officedocument.wordprocessingml.document", files[0][1]
     output = io.BytesIO()
@@ -2771,6 +2848,45 @@ class Handler(SimpleHTTPRequestHandler):
                     add_audit(conn, user["id"], "更新系统设置", "登录展示图已更新" if image else "登录展示图已恢复默认")
                     self.send_json(200, get_state(conn, user))
                     return
+                if parsed.path == "/api/settings/print-template":
+                    require_admin(user)
+                    kind = str(payload.get("kind") or "").strip()
+                    if kind not in ("asset", "consumable"):
+                        self.send_json(400, {"error": "模板类型不正确"})
+                        return
+                    try:
+                        file_name, content_base64 = valid_docx_template(payload.get("fileName"), payload.get("contentBase64"))
+                    except ValueError as exc:
+                        self.send_json(400, {"error": str(exc)})
+                        return
+                    if kind == "asset":
+                        set_setting(conn, "print_asset_template_name", file_name)
+                        set_setting(conn, "print_asset_template_content", content_base64)
+                        label = "资产领用打印模板"
+                    else:
+                        set_setting(conn, "print_consumable_template_name", file_name)
+                        set_setting(conn, "print_consumable_template_content", content_base64)
+                        label = "耗材领用打印模板"
+                    add_audit(conn, user["id"], "更新打印设置", f"{label}：{file_name}")
+                    self.send_json(200, get_state(conn, user))
+                    return
+                if parsed.path == "/api/settings/print-template/reset":
+                    require_admin(user)
+                    kind = str(payload.get("kind") or "").strip()
+                    if kind not in ("asset", "consumable"):
+                        self.send_json(400, {"error": "模板类型不正确"})
+                        return
+                    if kind == "asset":
+                        set_setting(conn, "print_asset_template_name", "")
+                        set_setting(conn, "print_asset_template_content", "")
+                        label = "资产领用打印模板"
+                    else:
+                        set_setting(conn, "print_consumable_template_name", "")
+                        set_setting(conn, "print_consumable_template_content", "")
+                        label = "耗材领用打印模板"
+                    add_audit(conn, user["id"], "更新打印设置", f"{label}已恢复内置无隐私模板")
+                    self.send_json(200, get_state(conn, user))
+                    return
                 if parsed.path == "/api/settings/service-port":
                     require_admin(user)
                     port = valid_port(payload.get("port"))
@@ -2783,9 +2899,10 @@ class Handler(SimpleHTTPRequestHandler):
                     except OSError as exc:
                         self.send_json(500, {"error": f"端口配置写入失败：{exc}"})
                         return
+                    command = f"$env:WAREHOUSE_HOST_PORT='{port}'; docker compose -p warehouse up -d"
                     add_audit(conn, user["id"], "更新系统设置", f"服务端口改为 {port}，重启 Docker 后生效")
                     data = get_state(conn, user)
-                    data["portNotice"] = f"端口已保存为 {port}，需要重新执行 docker compose up -d 后生效。"
+                    data["portNotice"] = f"端口已保存为 {port}。请在 PowerShell 执行：\n{command}\n然后打开 http://127.0.0.1:{port}/"
                     self.send_json(200, data)
                     return
                 if parsed.path == "/api/debug/clear-files":
