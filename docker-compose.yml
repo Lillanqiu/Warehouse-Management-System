@@ -1,0 +1,17 @@
+services:
+  warehouse:
+    build: .
+    container_name: warehouse-system
+    ports:
+      - "${WAREHOUSE_HOST_PORT:-38280}:8000"
+    environment:
+      PORT: 8000
+      PUBLIC_PORT: "${WAREHOUSE_HOST_PORT:-38280}"
+      CONFIG_FILE: /data/port.env
+      DATA_DIR: /data
+    volumes:
+      - warehouse_data:/data
+    restart: unless-stopped
+
+volumes:
+  warehouse_data:

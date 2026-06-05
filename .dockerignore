@@ -1,0 +1,12 @@
+.git
+data
+*.db
+*.png
+.edge-profile
+__pycache__
+.env
+*.sqlite
+*.sqlite3
+uploads
+archives
+import_archives
