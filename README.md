@@ -48,6 +48,8 @@ Copy-Item .env.example .env
 docker compose -p warehouse up --build -d
 ```
 
+测试机从 GitHub 拉取并启动，见 [docs/TEST_MACHINE_SETUP.md](docs/TEST_MACHINE_SETUP.md)。
+
 打开：
 
 ```text
