@@ -53,7 +53,18 @@ winget install --id Git.Git -e
 winget install --id Docker.DockerDesktop -e
 ```
 
-安装完成后重启 PowerShell；Docker Desktop 第一次打开时需要等待它启动完成。
+如果 Docker Desktop 提示需要 WSL，或者测试机还没有 Ubuntu 子系统，先用管理员 PowerShell 执行：
+
+```powershell
+wsl --install
+wsl --install -d Ubuntu
+wsl --update
+wsl -l -v
+```
+
+安装完成后重启电脑或重启 PowerShell。第一次打开 Ubuntu 时会要求创建 Linux 用户名和密码，这个是 Ubuntu 子系统自己的账号，不是本系统的登录账号。
+
+然后打开 Docker Desktop，进入 `Settings` -> `Resources` -> `WSL Integration`，确认 Ubuntu 已启用。等 Docker Desktop 显示正在运行后，再执行项目启动命令。
 
 ### 新测试机第一次下载并启动
 
