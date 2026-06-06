@@ -36,6 +36,25 @@
 
 ## 快速启动
 
+### 测试机补齐环境
+
+先用 PowerShell 检查测试机有没有 Git 和 Docker：
+
+```powershell
+git --version
+docker --version
+docker compose version
+```
+
+如果提示找不到命令，可以用 Windows 自带的 `winget` 安装：
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Docker.DockerDesktop -e
+```
+
+安装完成后重启 PowerShell；Docker Desktop 第一次打开时需要等待它启动完成。
+
 ### 新测试机第一次下载并启动
 
 在测试机打开 PowerShell，执行：

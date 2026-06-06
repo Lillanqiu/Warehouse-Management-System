@@ -18,6 +18,27 @@ docker --version
 docker compose version
 ```
 
+如果提示找不到命令，可以先用 Windows 自带的 `winget` 补齐环境：
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Docker.DockerDesktop -e
+```
+
+安装完成后：
+
+1. 重启 PowerShell。
+2. 打开 Docker Desktop。
+3. 等 Docker Desktop 显示正在运行后，再执行启动命令。
+
+再次确认：
+
+```powershell
+git --version
+docker --version
+docker compose version
+```
+
 ## 先把项目下载到测试机
 
 测试机第一次使用时，必须先把 GitHub 上的项目下载到本机。推荐使用 Git 拉取，因为后续更新更方便。
