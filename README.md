@@ -36,25 +36,47 @@
 
 ## 快速启动
 
-复制本地配置模板：
+### 新测试机第一次下载并启动
+
+在测试机打开 PowerShell，执行：
 
 ```powershell
+git clone https://github.com/Lillanqiu/Warehouse-Management-System.git
+cd Warehouse-Management-System
 Copy-Item .env.example .env
-```
-
-启动：
-
-```powershell
 docker compose -p warehouse up --build -d
 ```
 
-测试机从 GitHub 拉取并启动，见 [docs/TEST_MACHINE_SETUP.md](docs/TEST_MACHINE_SETUP.md)。
-
-打开：
+启动完成后打开：
 
 ```text
 http://127.0.0.1:38280
 ```
+
+如果不方便使用 Git，也可以在 GitHub 页面点击绿色 `Code` -> `Download ZIP`，解压后进入项目目录，再执行：
+
+```powershell
+Copy-Item .env.example .env
+docker compose -p warehouse up --build -d
+```
+
+### 已经下载过项目后的启动
+
+```powershell
+cd Warehouse-Management-System
+docker compose -p warehouse up --build -d
+```
+
+### 后续更新测试机代码
+
+在项目目录执行：
+
+```powershell
+git pull origin main
+docker compose -p warehouse up --build -d
+```
+
+更详细的测试机部署说明见 [docs/TEST_MACHINE_SETUP.md](docs/TEST_MACHINE_SETUP.md)。
 
 修改端口：
 
