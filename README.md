@@ -119,7 +119,45 @@ WAREHOUSE_HOST_PORT=18080
 密码：由本地 .env 的 WAREHOUSE_ADMIN_PASSWORD 控制
 ```
 
+如果只是复制 `.env.example` 后直接启动，首次空库临时密码是：
+
+```text
+change-me-before-use
+```
+
+注意：默认不是 `admin/admin`。管理员密码只会在第一次创建空数据库时写入一次；如果数据库已经存在，后面修改 `.env` 里的 `WAREHOUSE_ADMIN_PASSWORD` 不会自动修改数据库里的旧密码。
+
 首次部署后请立即修改临时密码。不要把真实密码写入要上传 GitHub 的文件。
+
+## 登录密码不对怎么办
+
+先确认你输入的是本机 `.env` 里的 `WAREHOUSE_ADMIN_PASSWORD`。如果测试机只是复制了 `.env.example`，请用：
+
+```text
+账号：admin
+密码：change-me-before-use
+```
+
+如果这个测试库不需要保留业务数据，可以重置为空库：
+
+```powershell
+docker compose -p warehouse down
+docker volume rm warehouse_data
+docker compose -p warehouse up --build -d
+```
+
+如果要保留测试数据，只重置管理员密码，可以在项目目录执行：
+
+```powershell
+docker compose -p warehouse exec warehouse python -c "import sqlite3; c=sqlite3.connect('/data/warehouse.db'); c.execute('update users set password=?, active=1 where username=?', ('change-me-before-use','admin')); c.commit(); print('admin password reset')"
+```
+
+然后用：
+
+```text
+账号：admin
+密码：change-me-before-use
+```
 
 ## 数据库与脱敏
 

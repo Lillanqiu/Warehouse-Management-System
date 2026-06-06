@@ -107,6 +107,8 @@ Write-Host "启动完成，打开：http://127.0.0.1:38280"
 密码：change-me-before-use
 ```
 
+注意：默认不是 `admin/admin`。管理员密码只会在第一次创建空数据库时写入一次；如果数据库已经存在，后面修改 `.env` 里的 `WAREHOUSE_ADMIN_PASSWORD` 不会自动修改数据库里的旧密码。
+
 登录后请立即在系统里修改密码。正式测试前，也可以直接编辑本地 `.env`：
 
 ```text
@@ -116,6 +118,36 @@ WAREHOUSE_IMPORTED_USER_PASSWORD=请在测试机本地填写
 ```
 
 `.env` 已被 `.gitignore` 忽略，不要上传到 GitHub。
+
+## 登录密码不对怎么办
+
+先确认你输入的是本机 `.env` 里的 `WAREHOUSE_ADMIN_PASSWORD`。如果测试机只是复制了 `.env.example`，请用：
+
+```text
+账号：admin
+密码：change-me-before-use
+```
+
+如果这个测试库不需要保留业务数据，可以重置为空库：
+
+```powershell
+docker compose -p warehouse down
+docker volume rm warehouse_data
+docker compose -p warehouse up --build -d
+```
+
+如果要保留测试数据，只重置管理员密码，可以在项目目录执行：
+
+```powershell
+docker compose -p warehouse exec warehouse python -c "import sqlite3; c=sqlite3.connect('/data/warehouse.db'); c.execute('update users set password=?, active=1 where username=?', ('change-me-before-use','admin')); c.commit(); print('admin password reset')"
+```
+
+然后用：
+
+```text
+账号：admin
+密码：change-me-before-use
+```
 
 ## 修改端口启动
 
