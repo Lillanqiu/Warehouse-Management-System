@@ -1,7 +1,7 @@
 ﻿const USER_KEY = "warehouse-current-user";
 const SESSION_USER_KEY = "warehouse-session-user";
 const VIEW_MODE_KEY = "warehouse-view-mode";
-const APP_VERSION = "20260606-asset-status-groups-v71";
+const APP_VERSION = "20260606-port-command-project-dir-v72";
 
 let state = {
   currentUser: null,
@@ -1533,7 +1533,7 @@ function renderPrintTemplateSetting(kind, title, description) {
 }
 
 function portApplyCommand(port = state.settings?.servicePort || "38280") {
-  return `$env:WAREHOUSE_HOST_PORT='${port}'; docker compose -p warehouse up -d`;
+  return `if (Test-Path .\\docker-compose.yml) { } elseif (Test-Path .\\Warehouse-Management-System\\docker-compose.yml) { Set-Location .\\Warehouse-Management-System } else { Write-Host '请先进入 Warehouse-Management-System 项目目录'; exit 1 }; $env:WAREHOUSE_HOST_PORT='${port}'; docker compose -p warehouse up --build -d`;
 }
 
 function renderSettings() {

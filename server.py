@@ -28,7 +28,7 @@ PUBLIC_PORT = os.environ.get("PUBLIC_PORT") or os.environ.get("WAREHOUSE_HOST_PO
 DEFAULT_ADMIN_PASSWORD = os.environ.get("WAREHOUSE_ADMIN_PASSWORD", "change-me-before-use")
 DEFAULT_IMPORTED_USER_PASSWORD = os.environ.get("WAREHOUSE_IMPORTED_USER_PASSWORD", "change-me-before-use")
 BEIJING_TZ = timezone(timedelta(hours=8))
-APP_VERSION = "20260606-asset-status-groups-v71"
+APP_VERSION = "20260606-port-command-project-dir-v72"
 REQUEST_IP = contextvars.ContextVar("request_ip", default="")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -2943,7 +2943,7 @@ class Handler(SimpleHTTPRequestHandler):
                     except OSError as exc:
                         self.send_json(500, {"error": f"端口配置写入失败：{exc}"})
                         return
-                    command = f"$env:WAREHOUSE_HOST_PORT='{port}'; docker compose -p warehouse up -d"
+                    command = f"if (Test-Path .\\docker-compose.yml) {{ }} elseif (Test-Path .\\Warehouse-Management-System\\docker-compose.yml) {{ Set-Location .\\Warehouse-Management-System }} else {{ Write-Host '请先进入 Warehouse-Management-System 项目目录'; exit 1 }}; $env:WAREHOUSE_HOST_PORT='{port}'; docker compose -p warehouse up --build -d"
                     add_audit(conn, user["id"], "更新系统设置", f"服务端口改为 {port}，重启 Docker 后生效")
                     data = get_state(conn, user)
                     data["portNotice"] = f"端口已保存为 {port}。请在 PowerShell 执行：\n{command}\n然后打开 http://127.0.0.1:{port}/"
