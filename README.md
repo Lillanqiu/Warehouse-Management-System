@@ -72,10 +72,11 @@ WAREHOUSE_HOST_PORT=18080
 空库首次启动只创建一个管理员账号：
 
 ```text
-admin / admin123
+账号：admin
+密码：由本地 .env 的 WAREHOUSE_ADMIN_PASSWORD 控制
 ```
 
-首次部署后请立即修改默认密码。
+首次部署后请立即修改临时密码。不要把真实密码写入要上传 GitHub 的文件。
 
 ## 数据库与脱敏
 
@@ -101,6 +102,7 @@ warehouse_data
 - 截图和浏览器缓存
 
 数据库结构说明见 [docs/DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md)。
+隐私和敏感文件清单见 [docs/PRIVACY_AND_GITHUB_CHECKLIST.md](docs/PRIVACY_AND_GITHUB_CHECKLIST.md)。
 
 ## 上传 GitHub 前检查
 

@@ -896,6 +896,14 @@ textarea {
   padding: 16px 12px;
 }
 
+.mini-meta {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .drawer-backdrop {
   position: fixed;
   inset: 0;
