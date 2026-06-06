@@ -18,6 +18,53 @@ docker --version
 docker compose version
 ```
 
+## 先把项目下载到测试机
+
+测试机第一次使用时，必须先把 GitHub 上的项目下载到本机。推荐使用 Git 拉取，因为后续更新更方便。
+
+### 方式一：Git 拉取，推荐
+
+在测试机打开 PowerShell，执行：
+
+```powershell
+git clone https://github.com/Lillanqiu/Warehouse-Management-System.git
+cd Warehouse-Management-System
+Copy-Item .env.example .env
+docker compose -p warehouse up --build -d
+```
+
+启动后打开：
+
+```text
+http://127.0.0.1:38280
+```
+
+以后要更新测试机，只需要在项目目录执行：
+
+```powershell
+git pull origin main
+docker compose -p warehouse up --build -d
+```
+
+### 方式二：GitHub 网页下载 ZIP
+
+如果测试机不方便用 Git，也可以在 GitHub 页面下载压缩包：
+
+1. 打开项目页面。
+2. 点击绿色 `Code` 按钮。
+3. 点击 `Download ZIP`。
+4. 解压到测试机上的任意目录。
+5. 在解压后的项目目录打开 PowerShell。
+
+然后执行：
+
+```powershell
+Copy-Item .env.example .env
+docker compose -p warehouse up --build -d
+```
+
+ZIP 方式也能启动系统，但后续更新不如 Git 方便。需要更新时通常要重新下载新的 ZIP。
+
 ## Windows PowerShell 一键拉取启动
 
 在测试机打开 PowerShell，执行：
