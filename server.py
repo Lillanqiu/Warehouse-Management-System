@@ -25,8 +25,10 @@ CONSUMABLE_REQUEST_TEMPLATE = TEMPLATE_DIR / "consumable-request-template.docx"
 CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/config/port.env"))
 PORT = int(os.environ.get("PORT", "8000"))
 PUBLIC_PORT = os.environ.get("PUBLIC_PORT") or os.environ.get("WAREHOUSE_HOST_PORT") or os.environ.get("PORT", "8000")
+DEFAULT_ADMIN_PASSWORD = os.environ.get("WAREHOUSE_ADMIN_PASSWORD", "change-me-before-use")
+DEFAULT_IMPORTED_USER_PASSWORD = os.environ.get("WAREHOUSE_IMPORTED_USER_PASSWORD", "change-me-before-use")
 BEIJING_TZ = timezone(timedelta(hours=8))
-APP_VERSION = "20260605-template-export-clear-v67"
+APP_VERSION = "20260606-asset-status-groups-v71"
 REQUEST_IP = contextvars.ContextVar("request_ip", default="")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -869,7 +871,7 @@ def init_db():
         conn.executemany(
             "insert into users values (?, ?, ?, ?, ?, ?, ?)",
             [
-                ("u-admin", "admin", "admin123", "系统管理员", "admin", "仓储部", 1),
+                ("u-admin", "admin", DEFAULT_ADMIN_PASSWORD, "系统管理员", "admin", "仓储部", 1),
             ],
         )
         conn.executemany(
@@ -1298,6 +1300,41 @@ def parse_requisition_docx(parsed):
     return rows
 
 
+def is_blank_requisition_template(parsed):
+    if not detect_document_type(parsed.get("text", "")):
+        return False
+    invalid_labels = {"申请缘由", "领用日期", "归还日期", "项目负责人审核", "资产管理负责人审核", "备注", "领用人确认", "归还确认"}
+    serial_values = {str(index) for index in range(1, 16)}
+    for table in parsed.get("tables", []):
+        header_index = None
+        for index, row in enumerate(table):
+            joined = "".join(row)
+            if "物品名称" in joined and "数量" in joined:
+                header_index = index
+                break
+        if header_index is None:
+            continue
+        for row in table[header_index + 1:]:
+            cells = [clean_docx_text(cell) for cell in row]
+            row_text = "".join(cells)
+            if not row_text:
+                continue
+            if any(label in row_text for label in invalid_labels):
+                continue
+            meaningful = [
+                cell for cell in cells
+                if cell
+                and cell not in serial_values
+                and cell != "1"
+                and not is_invalid_field_value(cell)
+                and not all(label in cell for label in ("固定资产", "低值易耗品", "耗材", "购进软件"))
+            ]
+            if meaningful:
+                return False
+        return True
+    return False
+
+
 def table_to_dicts(rows):
     if not rows:
         return []
@@ -1441,7 +1478,7 @@ def ensure_import_user(conn, row, actor):
             return existing
         conn.execute(
             "insert into users values (?, ?, ?, ?, ?, ?, ?)",
-            ("u-import-unknown", username, "123456", "未填写", "user", department, 0),
+            ("u-import-unknown", username, DEFAULT_IMPORTED_USER_PASSWORD, "未填写", "user", department, 0),
         )
         return conn.execute("select * from users where id = 'u-import-unknown'").fetchone()
     existing = conn.execute("select * from users where name = ?", (name,)).fetchone()
@@ -1452,7 +1489,7 @@ def ensure_import_user(conn, row, actor):
     user_id = new_id("user")
     conn.execute(
         "insert into users values (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, username, "123456", name, "user", department, 1),
+        (user_id, username, DEFAULT_IMPORTED_USER_PASSWORD, name, "user", department, 1),
     )
     return conn.execute("select * from users where id = ?", (user_id,)).fetchone()
 
@@ -1565,6 +1602,11 @@ def import_word_checkout(conn, actor, file_name, content):
         tag_records_with_archive(conn, result.get("_recordIds", []), file_name, result["archiveId"])
         add_audit(conn, actor["id"], "识别Word领用申请", f"{file_name} 识别并导入 {result['imported']} 条，跳过 {len(result['skipped'])} 条")
         return {**result, "paperCreated": 0, "message": "已识别耗材/物品领用申请模板并导入出借记录"}
+    if is_blank_requisition_template(parsed):
+        result = {"imported": 0, "createdAssets": 0, "skipped": [], "paperCreated": 0, "message": "识别为空白领用申请模板，已忽略，不计入跳过"}
+        result["archiveId"] = save_import_archive(conn, actor, file_name, "docx", "空白领用模板", content, result)
+        add_audit(conn, actor["id"], "忽略空白Word模板", file_name)
+        return result
     if parsed["rows"]:
         result = import_records_from_rows(conn, actor, parsed["rows"], default_type="出库", allowed_type="出库")
         result["archiveId"] = save_import_archive(conn, actor, file_name, "docx", "出库/出借Word", content, result)
@@ -1716,6 +1758,7 @@ def get_state(conn, user, view_role=""):
             "multiDepartmentEnabled": bool(int(multi_department)),
             "developerModeEnabled": bool(int(developer_mode)),
             "adminPrefillEnabled": bool(int(admin_prefill)),
+            "adminPrefillPassword": DEFAULT_ADMIN_PASSWORD if bool(int(admin_prefill)) else "",
             "loginBackgroundImage": login_background,
             "servicePort": service_port,
             "printAssetTemplateName": print_asset_template_name,
@@ -2184,6 +2227,7 @@ class Handler(SimpleHTTPRequestHandler):
                     200,
                     {
                         "adminPrefillEnabled": bool(int(setting_value(conn, "admin_prefill_enabled", "0"))),
+                        "adminPrefillPassword": DEFAULT_ADMIN_PASSWORD if bool(int(setting_value(conn, "admin_prefill_enabled", "0"))) else "",
                         "loginBackgroundImage": setting_value(conn, "login_background_image", ""),
                         "appVersion": APP_VERSION,
                     },

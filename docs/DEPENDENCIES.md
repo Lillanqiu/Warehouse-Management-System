@@ -46,3 +46,12 @@ WAREHOUSE_HOST_PORT=38280
 ```
 
 `.env` 是本地配置文件，已加入 `.gitignore`，不要提交到 GitHub。
+
+本地 `.env` 还可以设置首次空库管理员临时密码和导入用户临时密码：
+
+```text
+WAREHOUSE_ADMIN_PASSWORD=请在本机填写
+WAREHOUSE_IMPORTED_USER_PASSWORD=请在本机填写
+```
+
+更多上传前检查规则见 [PRIVACY_AND_GITHUB_CHECKLIST.md](PRIVACY_AND_GITHUB_CHECKLIST.md)。

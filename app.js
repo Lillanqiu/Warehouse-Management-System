@@ -1,7 +1,7 @@
 ﻿const USER_KEY = "warehouse-current-user";
 const SESSION_USER_KEY = "warehouse-session-user";
 const VIEW_MODE_KEY = "warehouse-view-mode";
-const APP_VERSION = "20260605-template-export-clear-v67";
+const APP_VERSION = "20260606-asset-status-groups-v71";
 
 let state = {
   currentUser: null,
@@ -16,7 +16,7 @@ let state = {
   purchaseWishes: [],
   settings: { departments: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, loginBackgroundImage: "", servicePort: "", printAssetTemplateName: "", printAssetTemplateCustom: false, printConsumableTemplateName: "", printConsumableTemplateCustom: false }
 };
-let loginSettings = { adminPrefillEnabled: false, loginBackgroundImage: "", appVersion: APP_VERSION };
+let loginSettings = { adminPrefillEnabled: false, adminPrefillPassword: "", loginBackgroundImage: "", appVersion: APP_VERSION };
 let view = "dashboard";
 let assetFilter = "";
 let selectedAssetId = "";
@@ -78,7 +78,7 @@ async function loadLoginSettings() {
     loginSettings = await api("/api/login-settings");
     ensureFreshVersion({ settings: loginSettings });
   } catch {
-    loginSettings = { adminPrefillEnabled: false, loginBackgroundImage: "", appVersion: APP_VERSION };
+    loginSettings = { adminPrefillEnabled: false, adminPrefillPassword: "", loginBackgroundImage: "", appVersion: APP_VERSION };
   }
 }
 
@@ -168,6 +168,128 @@ function activeUsersByDepartment() {
 function assetName(assetId) {
   const asset = state.assets.find((item) => item.id === assetId);
   return asset ? `${asset.name}（${asset.code}）` : "未知资产";
+}
+
+function assetModelText(asset) {
+  const name = String(asset?.name || "").trim();
+  const spec = String(asset?.spec || "").trim();
+  return [name, spec].filter(Boolean).join(" · ") || "未命名资产";
+}
+
+function assetGroupKey(asset) {
+  return assetModelText(asset).toLowerCase();
+}
+
+function assetGroups() {
+  const groups = new Map();
+  for (const asset of state.assets) {
+    const key = assetGroupKey(asset);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        id: asset.id,
+        name: asset.name || "未命名资产",
+        spec: asset.spec || "",
+        model: assetModelText(asset),
+        category: asset.category || "-",
+        quantity: 0,
+        count: 0,
+        assets: []
+      });
+    }
+    const group = groups.get(key);
+    group.quantity += Number(asset.quantity || 0);
+    group.count += 1;
+    group.assets.push(asset);
+    if ((!group.category || group.category === "-") && asset.category) group.category = asset.category;
+  }
+  return [...groups.values()].sort((a, b) => a.model.localeCompare(b.model, "zh-Hans-CN"));
+}
+
+function assetGroupById(assetId) {
+  const asset = state.assets.find((item) => item.id === assetId);
+  if (!asset) return null;
+  return assetGroups().find((group) => group.key === assetGroupKey(asset)) || null;
+}
+
+function assetGroupStatus(group) {
+  const statuses = [...new Set(group.assets.map((asset) => asset.status || "in_stock"))];
+  if (statuses.length === 1) return statusBadge(statuses[0]);
+  const checkedOut = group.assets.filter((asset) => asset.status === "checked_out").length;
+  const inStock = group.assets.filter((asset) => asset.status === "in_stock").length;
+  return `<span class="badge warn">混合</span><span class="mini-meta">在库 ${inStock} / 出库 ${checkedOut}</span>`;
+}
+
+function assetGroupLocations(group) {
+  return blank([...new Set(group.assets.map((asset) => blank(asset.location)).filter((item) => item !== "-"))].join("；"));
+}
+
+function assetGroupPeople(group) {
+  const people = group.assets
+    .map((asset) => {
+      const flow = assetFlow(asset);
+      return flow.borrowerName !== "-" ? flow.borrowerName : userName(asset.keeperId);
+    })
+    .filter((name) => name && name !== "未知用户");
+  return blank([...new Set(people)].join("；"));
+}
+
+function latestGroupRecord(group, type) {
+  return group.assets
+    .flatMap((asset) => state.records.filter((record) => record.assetId === asset.id && record.type === type))
+    .sort((a, b) => recordMillis(b) - recordMillis(a))[0];
+}
+
+function assetGroupRecordDetail(group, type, mode = "html") {
+  const record = latestGroupRecord(group, type);
+  if (!record) return "-";
+  const time = type === "入库" ? fmt(record.inTime) : fmt(record.outTime);
+  const actorLabel = type === "入库" ? "经办" : "使用";
+  const parts = [
+    `${type}：${time}`,
+    `${actorLabel}人：${userName(record.userId)}`,
+    `数量：${record.quantity || "-"}`,
+    `单号：${record.paperNo || "-"}`
+  ];
+  if (mode === "text") return parts.join("；");
+  return `<div class="flow-detail">${parts.map((item) => `<span>${item}</span>`).join("")}</div>`;
+}
+
+function assetGroupSourceFiles(group) {
+  const files = group.assets.flatMap((asset) => {
+    const fromAsset = sourceFilesFromText(asset.remark);
+    const fromRecords = state.records
+      .filter((record) => record.assetId === asset.id)
+      .flatMap((record) => sourceFilesFromText(record.note));
+    return [...fromAsset, ...fromRecords];
+  });
+  return blank([...new Set(files)].join("；"));
+}
+
+function assetGroupMatches(group, query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return includesQuery([
+    group.model,
+    group.name,
+    group.spec,
+    group.category,
+    group.quantity,
+    assetGroupLocations(group),
+    assetGroupPeople(group),
+    assetGroupRecordDetail(group, "入库", "text"),
+    assetGroupRecordDetail(group, "出库", "text"),
+    assetGroupSourceFiles(group)
+  ], q);
+}
+
+function filteredAssetGroups() {
+  return assetGroups().filter((group) => {
+    if (selectedAssetId && !group.assets.some((asset) => asset.id === selectedAssetId)) return false;
+    if (assetStatusFilter !== "all" && !group.assets.some((asset) => asset.status === assetStatusFilter)) return false;
+    if (assetKeeperFilter !== "all" && !group.assets.some((asset) => asset.keeperId === assetKeeperFilter || assetFlow(asset).borrowerId === assetKeeperFilter)) return false;
+    return assetGroupMatches(group, assetFilter);
+  });
 }
 
 function recordDocumentType(record) {
@@ -457,7 +579,7 @@ function bindSearchInput(selector, updateValue) {
 
 function renderLogin() {
   const defaultUser = loginSettings.adminPrefillEnabled ? "admin" : "";
-  const defaultPassword = loginSettings.adminPrefillEnabled ? "admin123" : "";
+  const defaultPassword = loginSettings.adminPrefillEnabled ? loginSettings.adminPrefillPassword || "" : "";
   return `
     <section class="login-shell" ${loginBackgroundStyle()}>
       <div class="login-copy">
@@ -767,20 +889,13 @@ function renderAssetCards(items, emptyText) {
 }
 
 function renderAssets() {
-  const assets = state.assets.filter((asset) => {
-    if (selectedAssetId && asset.id !== selectedAssetId) return false;
-    if (assetStatusFilter !== "all" && asset.status !== assetStatusFilter) return false;
-    if (assetKeeperFilter !== "all" && asset.keeperId !== assetKeeperFilter) return false;
-    const q = assetFilter.trim().toLowerCase();
-    if (!q) return true;
-    const flow = assetFlow(asset);
-    return [asset.code, asset.name, asset.category, asset.location, userName(asset.keeperId), flow.borrowerName, assetRecordDetail(asset, "入库", "text"), assetRecordDetail(asset, "出库", "text"), assetSourceFiles(asset), isMultiDepartment() ? flow.borrowDepartment : ""].some((value) => String(value).toLowerCase().includes(q));
-  });
+  const groups = filteredAssetGroups();
+  const printableAssets = filteredAssets();
   const keeperOptions = selectableUsers().map((user) => `<option value="${user.id}" ${assetKeeperFilter === user.id ? "selected" : ""}>${user.name}</option>`).join("");
   return `
     <section class="asset-workspace">
       <div class="asset-filter-bar no-print">
-        <input id="assetSearch" placeholder="搜索编号 / 名称 / 类别" value="${assetFilter}" />
+        <input id="assetSearch" placeholder="搜索型号 / 规格 / 类别 / 使用人 / 出入库详情" value="${assetFilter}" />
         <select id="assetStatusFilter">
           <option value="all" ${assetStatusFilter === "all" ? "selected" : ""}>状态：全部</option>
           <option value="in_stock" ${assetStatusFilter === "in_stock" ? "selected" : ""}>状态：在库</option>
@@ -797,28 +912,36 @@ function renderAssets() {
       <div class="asset-list-panel">
         <div class="asset-list-title">
           <h3>资产列表</h3>
-          <span>共 ${assets.length} 条</span>
+          <span>共 ${groups.length} 类 / ${printableAssets.length} 条明细</span>
         </div>
       <div class="table-wrap asset-table-wrap">
         <table>
           <thead>
             <tr>
-              <th>资产编号</th><th>资产名称</th><th>类别</th><th>数量</th><th>位置</th><th>状态</th><th>保管人</th>${isAdmin() ? "<th>操作</th>" : ""}
+              <th>型号/规格</th><th>类别</th><th>数量</th><th>位置</th><th>状态</th><th>当前使用/保管</th><th>入库详情</th><th>出库详情</th><th>文件来源</th>${isAdmin() ? "<th>操作</th>" : ""}
             </tr>
           </thead>
           <tbody>
-            ${assets.map((asset) => `
+            ${groups.map((group) => `
               <tr>
-                <td>${asset.code}</td><td>${asset.name}</td><td>${asset.category}</td><td>${asset.quantity}</td><td>${blank(asset.location)}</td><td>${statusBadge(asset.status)}</td><td>${userName(asset.keeperId)}</td>
-                ${isAdmin() ? `<td><div class="row-actions"><button class="ghost small" data-edit-asset="${asset.id}" type="button">编辑</button><button class="danger small" data-delete-asset="${asset.id}" type="button">删除</button></div></td>` : ""}
+                <td><strong>${group.model}</strong><div class="mini-meta">合并 ${group.count} 条资产明细</div></td>
+                <td>${group.category}</td>
+                <td>${group.quantity}</td>
+                <td>${assetGroupLocations(group)}</td>
+                <td>${assetGroupStatus(group)}</td>
+                <td>${assetGroupPeople(group)}</td>
+                <td>${assetGroupRecordDetail(group, "入库")}</td>
+                <td>${assetGroupRecordDetail(group, "出库")}</td>
+                <td>${assetGroupSourceFiles(group)}</td>
+                ${isAdmin() ? `<td><div class="row-actions">${group.count === 1 ? `<button class="ghost small" data-edit-asset="${group.id}" type="button">编辑</button><button class="danger small" data-delete-asset="${group.id}" type="button">删除</button>` : `<span class="mini-meta">已按型号归类</span>`}</div></td>` : ""}
               </tr>
-            `).join("") || `<tr><td colspan="${isAdmin() ? 8 : 7}" class="empty">暂无资产</td></tr>`}
+            `).join("") || `<tr><td colspan="${isAdmin() ? 10 : 9}" class="empty">暂无资产</td></tr>`}
           </tbody>
         </table>
       </div>
       </div>
     </section>
-    ${renderPrintableAssetSheets(assets)}
+    ${renderPrintableAssetSheets(printableAssets)}
     ${isAdmin() && assetDrawerOpen ? renderAssetDrawer() : ""}
   `;
 }
@@ -1047,19 +1170,19 @@ function renderRecordFormInner() {
     .concat(departments().map((department) => `<option value="${department}" ${selectedDepartment === department ? "selected" : ""}>${department}</option>`))
     .join("");
   const userOptions = activeUsersByDepartment().map((u) => `<option value="${u.id}">${u.name} · ${u.department}</option>`).join("");
-  const defaultAsset = state.assets[0] || {};
-  const defaultFlow = defaultAsset.id ? assetFlow(defaultAsset) : {};
+  const groups = assetGroups();
+  const defaultGroup = groups[0] || {};
   return `
     <form id="recordForm" class="manual-flow">
       <div class="manual-main">
         <div class="section-title manual-title"><h2>登记出入库</h2><button class="ghost small" type="reset">清空选择</button></div>
         <section class="manual-step">
           <div class="step-head"><span class="step-index">1</span><h3>资产信息</h3></div>
-          <div class="field"><label>资产</label><select name="assetId">${state.assets.map((a) => `<option value="${a.id}">${a.name} · ${a.code}</option>`).join("")}</select></div>
+          <div class="field"><label>资产</label><select name="assetId">${groups.map((group) => `<option value="${group.id}">${group.model} · 共 ${group.quantity || 0} 台</option>`).join("")}</select></div>
           <div class="asset-info-grid">
-            <div><span>资产编号</span><strong id="assetCodePreview">${defaultAsset.code || "-"}</strong></div>
-            <div><span>分类</span><strong id="assetCategoryPreview">${defaultAsset.category || "-"}</strong></div>
-            <div><span>当前库存</span><strong id="assetQuantityPreview">${defaultAsset.quantity || 0} 台</strong></div>
+            <div><span>型号/规格</span><strong id="assetCodePreview">${defaultGroup.model || "-"}</strong></div>
+            <div><span>分类</span><strong id="assetCategoryPreview">${defaultGroup.category || "-"}</strong></div>
+            <div><span>当前库存</span><strong id="assetQuantityPreview">${defaultGroup.quantity || 0} 台</strong></div>
           </div>
         </section>
         <section class="manual-step">
@@ -1269,7 +1392,7 @@ function renderUsers() {
       <form id="userForm" class="form-grid">
         <div class="field"><label>账号自动生成</label><input disabled placeholder="保存后按姓名缩写生成，如 张三 -> zs" /></div>
         <div class="field"><label>姓名</label><input name="name" required /></div>
-        <div class="field"><label>初始密码</label><input name="password" required value="123456" /></div>
+        <div class="field"><label>初始密码</label><input name="password" required placeholder="请填写临时密码" /></div>
         ${isMultiDepartment() ? `<div class="field"><label>部门选项</label><select name="department" required>${departmentOptions}</select></div>` : `<input type="hidden" name="department" value="${state.currentUser.department}" />`}
         <div class="field"><label>角色</label><select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></div>
         <div class="field"><label>状态</label><select name="active"><option value="true">启用</option><option value="false">停用</option></select></div>
@@ -1605,12 +1728,13 @@ function updateManualRecordPreview() {
   const form = document.querySelector("#recordForm");
   if (!form) return;
   const asset = state.assets.find((item) => item.id === form.assetId?.value) || {};
+  const group = assetGroupById(form.assetId?.value);
   const user = state.users.find((item) => item.id === form.userId?.value) || {};
   const activeType = form.querySelector("[data-record-type].active");
   const typeText = activeType?.textContent?.trim() || form.type?.value || "-";
-  document.querySelector("#assetCodePreview").textContent = asset.code || "-";
-  document.querySelector("#assetCategoryPreview").textContent = asset.category || "-";
-  document.querySelector("#assetQuantityPreview").textContent = `${asset.quantity || 0} 台`;
+  document.querySelector("#assetCodePreview").textContent = group?.model || assetModelText(asset) || "-";
+  document.querySelector("#assetCategoryPreview").textContent = group?.category || asset.category || "-";
+  document.querySelector("#assetQuantityPreview").textContent = `${group?.quantity ?? asset.quantity ?? 0} 台`;
   document.querySelector("#summaryType").textContent = typeText;
   document.querySelector("#summaryQuantity").textContent = form.quantity?.value || "1";
   document.querySelector("#summaryUser").textContent = user.name ? `${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}` : "-";
@@ -1841,15 +1965,7 @@ async function downloadAssetPrintTemplates() {
 }
 
 function filteredAssets() {
-  return state.assets.filter((asset) => {
-    if (selectedAssetId && asset.id !== selectedAssetId) return false;
-    if (assetStatusFilter !== "all" && asset.status !== assetStatusFilter) return false;
-    if (assetKeeperFilter !== "all" && asset.keeperId !== assetKeeperFilter) return false;
-    const q = assetFilter.trim().toLowerCase();
-    if (!q) return true;
-    const flow = assetFlow(asset);
-    return [asset.code, asset.name, asset.category, asset.location, userName(asset.keeperId), flow.borrowerName, assetRecordDetail(asset, "入库", "text"), assetRecordDetail(asset, "出库", "text"), assetSourceFiles(asset), isMultiDepartment() ? flow.borrowDepartment : ""].some((value) => String(value).toLowerCase().includes(q));
-  });
+  return filteredAssetGroups().flatMap((group) => group.assets);
 }
 
 function downloadAssetsTable() {
@@ -2297,7 +2413,7 @@ async function toggleViewMode() {
 async function resetUserPassword(userId) {
   const target = state.users.find((user) => user.id === userId);
   const label = target ? `${target.name}（${target.username}）` : "该用户";
-  const newPassword = prompt(`请输入 ${label} 的新密码（至少 4 位）`, "123456");
+  const newPassword = prompt(`请输入 ${label} 的新密码（至少 4 位）`, "");
   if (newPassword === null) return;
   if (newPassword.length < 4) {
     alert("新密码至少需要 4 位。");
