@@ -1,7 +1,7 @@
 ﻿const USER_KEY = "warehouse-current-user";
 const SESSION_USER_KEY = "warehouse-session-user";
 const VIEW_MODE_KEY = "warehouse-view-mode";
-const APP_VERSION = "20260606-port-command-project-dir-v72";
+const APP_VERSION = "20260607-asset-category-manager-v73";
 
 let state = {
   currentUser: null,
@@ -14,7 +14,7 @@ let state = {
   adminRequests: [],
   assetRequests: [],
   purchaseWishes: [],
-  settings: { departments: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, loginBackgroundImage: "", servicePort: "", printAssetTemplateName: "", printAssetTemplateCustom: false, printConsumableTemplateName: "", printConsumableTemplateCustom: false }
+  settings: { departments: [], assetCategories: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, loginBackgroundImage: "", servicePort: "", printAssetTemplateName: "", printAssetTemplateCustom: false, printConsumableTemplateName: "", printConsumableTemplateCustom: false }
 };
 let loginSettings = { adminPrefillEnabled: false, adminPrefillPassword: "", loginBackgroundImage: "", appVersion: APP_VERSION };
 let view = "dashboard";
@@ -22,6 +22,7 @@ let assetFilter = "";
 let selectedAssetId = "";
 let assetStatusFilter = "all";
 let assetKeeperFilter = "all";
+let assetCategoryManagerOpen = false;
 let assetDrawerOpen = false;
 let editingAssetId = "";
 let dashboardSearch = "";
@@ -154,6 +155,13 @@ function departments() {
   const configured = state.settings?.departments || [];
   if (configured.length) return configured;
   return [...new Set(selectableUsers().map((user) => user.department))].sort();
+}
+
+function assetCategories() {
+  const configured = state.settings?.assetCategories || [];
+  if (configured.length) return configured;
+  const fromAssets = [...new Set(state.assets.map((asset) => String(asset.category || "").trim()).filter(Boolean))].sort();
+  return fromAssets.length ? fromAssets : ["固定资产", "低值易耗品", "耗材", "购进软件"];
 }
 
 function selectableUsers() {
@@ -907,8 +915,10 @@ function renderAssets() {
           <option value="all" ${assetKeeperFilter === "all" ? "selected" : ""}>保管人：全部</option>
           ${keeperOptions}
         </select>
+        ${isAdmin() ? `<button class="secondary" id="toggleCategoryManager" type="button">${assetCategoryManagerOpen ? "收起类别管理" : "类别管理"}</button>` : ""}
         <button class="secondary" id="clearAssetSelection" type="button">重置</button>
       </div>
+      ${isAdmin() && assetCategoryManagerOpen ? renderAssetCategoryManager() : ""}
       <div class="asset-list-panel">
         <div class="asset-list-title">
           <h3>资产列表</h3>
@@ -946,9 +956,39 @@ function renderAssets() {
   `;
 }
 
+function renderAssetCategoryManager() {
+  const categories = assetCategories();
+  return `
+    <section class="asset-category-manager no-print">
+      <div class="section-title">
+        <h2>类别管理</h2>
+        <span class="hint">用于新增资产、资产状态归类和打印类别选择。</span>
+      </div>
+      <form id="assetCategoryForm" class="category-form">
+        <div class="field">
+          <label>类别列表</label>
+          <textarea name="categories" required>${categories.join("\n")}</textarea>
+        </div>
+        <div class="setting-actions">
+          <button class="primary" type="submit">保存类别</button>
+        </div>
+      </form>
+      <div class="department-tags">
+        ${categories.map((category) => `<button class="department-tag" data-category-name="${category}" title="删除未使用类别" type="button">${category}</button>`).join("")}
+      </div>
+      <p class="hint">每行一个类别。已被资产使用的类别不能直接删除，需要先把相关资产调整到其他类别。</p>
+    </section>
+  `;
+}
+
 function renderAssetDrawer() {
   const asset = state.assets.find((item) => item.id === editingAssetId) || {};
   const isEdit = Boolean(asset.id);
+  const categories = assetCategories();
+  const categoryOptions = [
+    ...(asset.category && !categories.includes(asset.category) ? [asset.category] : []),
+    ...categories
+  ].map((category) => `<option value="${category}" ${asset.category === category ? "selected" : ""}>${category}</option>`).join("");
   return `
     <div class="drawer-backdrop no-print" id="assetDrawerBackdrop"></div>
     <aside class="asset-drawer no-print" aria-label="${isEdit ? "编辑资产" : "新增资产"}">
@@ -961,7 +1001,7 @@ function renderAssetDrawer() {
         <div class="drawer-body">
           <div class="field"><label>资产编号</label><input name="code" value="${asset.code || ""}" placeholder="自动生成" /></div>
           <div class="field"><label><b>*</b> 资产名称</label><input name="name" required value="${asset.name || ""}" placeholder="请输入资产名称" /></div>
-          <div class="field"><label><b>*</b> 类别</label><input name="category" required value="${asset.category || ""}" placeholder="请选择类别" /></div>
+          <div class="field"><label><b>*</b> 类别</label><select name="category" required>${categoryOptions}</select></div>
           <div class="field"><label>规格</label><input name="spec" value="${asset.spec || ""}" placeholder="请输入规格型号" /></div>
           <div class="field"><label><b>*</b> 数量</label><input name="quantity" type="number" min="1" value="${asset.quantity || 1}" required placeholder="请输入数量" /></div>
           <div class="field"><label><b>*</b> 位置</label><input name="location" required value="${asset.location || ""}" placeholder="请输入位置" /></div>
@@ -2574,6 +2614,44 @@ function bindEvents() {
     assetStatusFilter = "all";
     assetKeeperFilter = "all";
     render();
+  });
+
+  document.querySelector("#toggleCategoryManager")?.addEventListener("click", () => {
+    assetCategoryManagerOpen = !assetCategoryManagerOpen;
+    render();
+  });
+
+  document.querySelector("#assetCategoryForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const categories = event.target.categories.value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    try {
+      state = await api("/api/assets/categories", {
+        method: "POST",
+        body: JSON.stringify(withActor({ categories }))
+      });
+      render();
+    } catch (exc) {
+      alert(exc.message);
+    }
+  });
+
+  document.querySelectorAll("[data-category-name]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const category = button.dataset.categoryName;
+      if (!confirm(`确定删除类别“${category}”吗？已被资产使用的类别不能删除。`)) return;
+      try {
+        state = await api("/api/assets/categories/delete", {
+          method: "POST",
+          body: JSON.stringify(withActor({ category }))
+        });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
   });
 
   document.querySelector("#openAssetDrawer")?.addEventListener("click", () => {

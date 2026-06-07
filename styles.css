@@ -868,6 +868,22 @@ textarea {
   padding: 22px 24px;
 }
 
+.asset-category-manager {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 18px;
+  margin-bottom: 16px;
+}
+
+.category-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: end;
+}
+
 .asset-list-title {
   display: flex;
   align-items: center;

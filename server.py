@@ -28,7 +28,7 @@ PUBLIC_PORT = os.environ.get("PUBLIC_PORT") or os.environ.get("WAREHOUSE_HOST_PO
 DEFAULT_ADMIN_PASSWORD = os.environ.get("WAREHOUSE_ADMIN_PASSWORD", "change-me-before-use")
 DEFAULT_IMPORTED_USER_PASSWORD = os.environ.get("WAREHOUSE_IMPORTED_USER_PASSWORD", "change-me-before-use")
 BEIJING_TZ = timezone(timedelta(hours=8))
-APP_VERSION = "20260606-port-command-project-dir-v72"
+APP_VERSION = "20260607-asset-category-manager-v73"
 REQUEST_IP = contextvars.ContextVar("request_ip", default="")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -765,6 +765,12 @@ def init_db():
               active integer not null default 1
             );
 
+            create table if not exists asset_categories (
+              id text primary key,
+              name text unique not null,
+              active integer not null default 1
+            );
+
             create table if not exists import_archives (
               id text primary key,
               file_name text not null,
@@ -863,6 +869,14 @@ def init_db():
             conn.executemany(
                 "insert or ignore into departments values (?, ?, ?)",
                 [(new_id("dept"), name, 1) for name in seed_departments],
+            )
+        existing_categories = conn.execute("select count(*) from asset_categories").fetchone()[0]
+        if not existing_categories:
+            asset_categories = rows_to_list(conn.execute("select distinct category as name from assets where category <> ''"))
+            seed_categories = [item["name"] for item in asset_categories] or ["固定资产", "低值易耗品", "耗材", "购进软件"]
+            conn.executemany(
+                "insert or ignore into asset_categories values (?, ?, ?)",
+                [(new_id("cat"), name, 1) for name in seed_categories],
             )
         count = conn.execute("select count(*) from users").fetchone()[0]
         if count:
@@ -1004,6 +1018,16 @@ def ensure_department(conn, name):
     conn.execute(
         "insert into departments values (?, ?, 1) on conflict(name) do update set active = 1",
         (new_id("dept"), clean),
+    )
+
+
+def ensure_asset_category(conn, name):
+    clean = str(name or "").strip()
+    if not clean:
+        return
+    conn.execute(
+        "insert into asset_categories values (?, ?, 1) on conflict(name) do update set active = 1",
+        (new_id("cat"), clean),
     )
 
 
@@ -1642,6 +1666,7 @@ def get_state(conn, user, view_role=""):
     users = rows_to_list(conn.execute("select * from users order by active desc, role, username, name"))
     safe_users = [public_user(item) for item in users]
     departments = rows_to_list(conn.execute("select name from departments where active = 1 order by name"))
+    asset_categories = rows_to_list(conn.execute("select name from asset_categories where active = 1 order by name"))
     multi_department = setting_value(conn, "multi_department_enabled", "0")
     developer_mode = setting_value(conn, "developer_mode_enabled", "0")
     admin_prefill = setting_value(conn, "admin_prefill_enabled", "0")
@@ -1755,6 +1780,7 @@ def get_state(conn, user, view_role=""):
         "purchaseWishes": [normalize_purchase_wish(item) for item in purchase_wishes],
         "settings": {
             "departments": [item["name"] for item in departments],
+            "assetCategories": [item["name"] for item in asset_categories],
             "multiDepartmentEnabled": bool(int(multi_department)),
             "developerModeEnabled": bool(int(developer_mode)),
             "adminPrefillEnabled": bool(int(admin_prefill)),
@@ -2338,6 +2364,7 @@ class Handler(SimpleHTTPRequestHandler):
                     require_admin(user)
                     asset_id = new_id("asset")
                     asset_code = str(payload.get("code") or "").strip() or next_asset_code(conn)
+                    ensure_asset_category(conn, payload["category"])
                     conn.execute(
                         "insert into assets values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
@@ -2368,6 +2395,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if duplicate:
                         self.send_json(400, {"error": "资产编号已存在"})
                         return
+                    ensure_asset_category(conn, payload["category"])
                     conn.execute(
                         """
                         update assets
@@ -2843,6 +2871,25 @@ class Handler(SimpleHTTPRequestHandler):
                     add_audit(conn, user["id"], "更新系统设置", f"部门设置：{'、'.join(names)}")
                     self.send_json(200, get_state(conn, user))
                     return
+                if parsed.path == "/api/assets/categories":
+                    require_admin(user)
+                    names = []
+                    for name in payload.get("categories", []):
+                        clean = str(name).strip()
+                        if clean and clean not in names:
+                            names.append(clean)
+                    if not names:
+                        self.send_json(400, {"error": "至少保留一个类别"})
+                        return
+                    conn.execute("update asset_categories set active = 0")
+                    for name in names:
+                        conn.execute(
+                            "insert into asset_categories values (?, ?, 1) on conflict(name) do update set active = 1",
+                            (new_id("cat"), name),
+                        )
+                    add_audit(conn, user["id"], "更新资产类别", f"类别设置：{'、'.join(names)}")
+                    self.send_json(200, get_state(conn, user))
+                    return
                 if parsed.path == "/api/settings/multi-department":
                     require_admin(user)
                     enabled = "1" if payload.get("enabled") else "0"
@@ -2989,6 +3036,20 @@ class Handler(SimpleHTTPRequestHandler):
                         return
                     conn.execute("update departments set active = 0 where name = ?", (name,))
                     add_audit(conn, user["id"], "删除部门", name)
+                    self.send_json(200, get_state(conn, user))
+                    return
+                if parsed.path == "/api/assets/categories/delete":
+                    require_admin(user)
+                    name = str(payload.get("category", "")).strip()
+                    if not name:
+                        self.send_json(400, {"error": "缺少类别名称"})
+                        return
+                    count = conn.execute("select count(*) from assets where category = ?", (name,)).fetchone()[0]
+                    if count:
+                        self.send_json(400, {"error": f"类别“{name}”下还有 {count} 个资产，请先调整资产类别"})
+                        return
+                    conn.execute("update asset_categories set active = 0 where name = ?", (name,))
+                    add_audit(conn, user["id"], "删除资产类别", name)
                     self.send_json(200, get_state(conn, user))
                     return
         except sqlite3.IntegrityError as exc:
