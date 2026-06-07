@@ -1,7 +1,7 @@
 ﻿const USER_KEY = "warehouse-current-user";
 const SESSION_USER_KEY = "warehouse-session-user";
 const VIEW_MODE_KEY = "warehouse-view-mode";
-const APP_VERSION = "20260607-base-data-category-crud-v74";
+const APP_VERSION = "20260607-asset-list-sort-v75";
 
 let state = {
   currentUser: null,
@@ -22,6 +22,8 @@ let assetFilter = "";
 let selectedAssetId = "";
 let assetStatusFilter = "all";
 let assetKeeperFilter = "all";
+let assetSortField = "model";
+let assetSortDir = "asc";
 let assetDrawerOpen = false;
 let editingAssetId = "";
 let dashboardSearch = "";
@@ -296,7 +298,35 @@ function filteredAssetGroups() {
     if (assetStatusFilter !== "all" && !group.assets.some((asset) => asset.status === assetStatusFilter)) return false;
     if (assetKeeperFilter !== "all" && !group.assets.some((asset) => asset.keeperId === assetKeeperFilter || assetFlow(asset).borrowerId === assetKeeperFilter)) return false;
     return assetGroupMatches(group, assetFilter);
-  });
+  }).sort(compareAssetGroups);
+}
+
+function assetGroupSortValue(group, field) {
+  const latestIn = latestGroupRecord(group, "入库");
+  const latestOut = latestGroupRecord(group, "出库");
+  const values = {
+    model: group.model,
+    category: group.category,
+    quantity: Number(group.quantity || 0),
+    location: assetGroupLocations(group),
+    status: [...new Set(group.assets.map((asset) => asset.status || "in_stock"))].join("；"),
+    people: assetGroupPeople(group),
+    inTime: latestIn?.inTime || "",
+    outTime: latestOut?.outTime || "",
+    source: assetGroupSourceFiles(group)
+  };
+  return values[field] ?? values.model;
+}
+
+function compareAssetGroups(left, right) {
+  const leftValue = assetGroupSortValue(left, assetSortField);
+  const rightValue = assetGroupSortValue(right, assetSortField);
+  const direction = assetSortDir === "desc" ? -1 : 1;
+  if (typeof leftValue === "number" || typeof rightValue === "number") {
+    return (Number(leftValue || 0) - Number(rightValue || 0)) * direction || left.model.localeCompare(right.model, "zh-Hans-CN", { numeric: true });
+  }
+  return String(leftValue || "").localeCompare(String(rightValue || ""), "zh-Hans-CN", { numeric: true, sensitivity: "base" }) * direction
+    || left.model.localeCompare(right.model, "zh-Hans-CN", { numeric: true, sensitivity: "base" });
 }
 
 function recordDocumentType(record) {
@@ -916,6 +946,21 @@ function renderAssets() {
         <select id="assetKeeperFilter">
           <option value="all" ${assetKeeperFilter === "all" ? "selected" : ""}>保管人：全部</option>
           ${keeperOptions}
+        </select>
+        <select id="assetSortField">
+          <option value="model" ${assetSortField === "model" ? "selected" : ""}>排序：型号/规格</option>
+          <option value="category" ${assetSortField === "category" ? "selected" : ""}>排序：类别</option>
+          <option value="quantity" ${assetSortField === "quantity" ? "selected" : ""}>排序：数量</option>
+          <option value="location" ${assetSortField === "location" ? "selected" : ""}>排序：位置</option>
+          <option value="status" ${assetSortField === "status" ? "selected" : ""}>排序：状态</option>
+          <option value="people" ${assetSortField === "people" ? "selected" : ""}>排序：使用/保管人</option>
+          <option value="inTime" ${assetSortField === "inTime" ? "selected" : ""}>排序：最近入库</option>
+          <option value="outTime" ${assetSortField === "outTime" ? "selected" : ""}>排序：最近出库</option>
+          <option value="source" ${assetSortField === "source" ? "selected" : ""}>排序：文件来源</option>
+        </select>
+        <select id="assetSortDir">
+          <option value="asc" ${assetSortDir === "asc" ? "selected" : ""}>升序</option>
+          <option value="desc" ${assetSortDir === "desc" ? "selected" : ""}>降序</option>
         </select>
         <button class="secondary" id="clearAssetSelection" type="button">重置</button>
       </div>
@@ -2631,11 +2676,23 @@ function bindEvents() {
     render();
   });
 
+  document.querySelector("#assetSortField")?.addEventListener("change", (event) => {
+    assetSortField = event.target.value;
+    render();
+  });
+
+  document.querySelector("#assetSortDir")?.addEventListener("change", (event) => {
+    assetSortDir = event.target.value;
+    render();
+  });
+
   document.querySelector("#clearAssetSelection")?.addEventListener("click", () => {
     selectedAssetId = "";
     assetFilter = "";
     assetStatusFilter = "all";
     assetKeeperFilter = "all";
+    assetSortField = "model";
+    assetSortDir = "asc";
     render();
   });
 
