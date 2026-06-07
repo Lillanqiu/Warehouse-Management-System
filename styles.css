@@ -884,6 +884,28 @@ textarea {
   align-items: end;
 }
 
+.category-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.category-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.category-item strong,
+.category-item span {
+  display: block;
+}
+
 .asset-list-title {
   display: flex;
   align-items: center;

@@ -1,7 +1,7 @@
 ﻿const USER_KEY = "warehouse-current-user";
 const SESSION_USER_KEY = "warehouse-session-user";
 const VIEW_MODE_KEY = "warehouse-view-mode";
-const APP_VERSION = "20260607-asset-category-manager-v73";
+const APP_VERSION = "20260607-base-data-category-crud-v74";
 
 let state = {
   currentUser: null,
@@ -22,7 +22,6 @@ let assetFilter = "";
 let selectedAssetId = "";
 let assetStatusFilter = "all";
 let assetKeeperFilter = "all";
-let assetCategoryManagerOpen = false;
 let assetDrawerOpen = false;
 let editingAssetId = "";
 let dashboardSearch = "";
@@ -627,7 +626,7 @@ function renderShell() {
     ["assetRequests", isAdmin() ? "资产申请" : "申请资产", "□"],
     ["purchaseWishes", "需求清单", "☆"],
     ["paper", "纸质单据方案", "▤"],
-    ...(isAdmin() ? [["users", pendingAdminRequests ? `用户管理(${pendingAdminRequests})` : "用户管理", "◉"], ["settings", "设置", "⚙"], ["audit", "操作记录", "◎"]] : [])
+    ...(isAdmin() ? [["users", pendingAdminRequests ? `用户管理(${pendingAdminRequests})` : "用户管理", "◉"], ["baseData", "基础数据", "▣"], ["settings", "设置", "⚙"], ["audit", "操作记录", "◎"]] : [])
   ];
   return `
     <section class="layout">
@@ -738,6 +737,7 @@ function pageTitle() {
     records: isAdmin() ? "出入库登记" : "我的出入库状态",
     paper: "纸质单据电子化方案",
     users: "用户管理",
+    baseData: "基础数据",
     settings: "系统设置",
     audit: "后台操作记录"
   }[view];
@@ -752,6 +752,7 @@ function pageSubtitle() {
     records: "登记入库时间、出库时间、经办人和纸质单据编号。",
     paper: "把手写材料通过拍照、编号、复核和电子台账串起来。",
     users: "维护多用户架构和角色权限。",
+    baseData: "维护资产类别等基础数据。",
     settings: "维护系统基础配置。",
     audit: "追踪登录、登记、修改、纸质单据处理等动作。"
   }[view];
@@ -766,6 +767,7 @@ function renderView() {
     records: renderRecords,
     paper: renderPaper,
     users: renderUsers,
+    baseData: renderBaseData,
     settings: renderSettings,
     audit: renderAudit
   }[view]();
@@ -915,10 +917,8 @@ function renderAssets() {
           <option value="all" ${assetKeeperFilter === "all" ? "selected" : ""}>保管人：全部</option>
           ${keeperOptions}
         </select>
-        ${isAdmin() ? `<button class="secondary" id="toggleCategoryManager" type="button">${assetCategoryManagerOpen ? "收起类别管理" : "类别管理"}</button>` : ""}
         <button class="secondary" id="clearAssetSelection" type="button">重置</button>
       </div>
-      ${isAdmin() && assetCategoryManagerOpen ? renderAssetCategoryManager() : ""}
       <div class="asset-list-panel">
         <div class="asset-list-title">
           <h3>资产列表</h3>
@@ -956,28 +956,51 @@ function renderAssets() {
   `;
 }
 
+function renderBaseData() {
+  if (!isAdmin()) return "";
+  return `
+    <section class="panel">
+      <div class="section-title">
+        <h2>资产类别管理</h2>
+        <span class="hint">新增、编辑、删除资产类别；新增资产时会从这里选择类别。</span>
+      </div>
+      ${renderAssetCategoryManager()}
+    </section>
+  `;
+}
+
 function renderAssetCategoryManager() {
   const categories = assetCategories();
   return `
-    <section class="asset-category-manager no-print">
-      <div class="section-title">
-        <h2>类别管理</h2>
-        <span class="hint">用于新增资产、资产状态归类和打印类别选择。</span>
-      </div>
-      <form id="assetCategoryForm" class="category-form">
+    <div class="asset-category-manager no-print">
+      <form id="addAssetCategoryForm" class="category-form">
         <div class="field">
-          <label>类别列表</label>
-          <textarea name="categories" required>${categories.join("\n")}</textarea>
+          <label>新增类别</label>
+          <input name="category" required placeholder="例如：网络设备 / 办公设备 / 工具" />
         </div>
         <div class="setting-actions">
-          <button class="primary" type="submit">保存类别</button>
+          <button class="primary" type="submit">添加类别</button>
         </div>
       </form>
-      <div class="department-tags">
-        ${categories.map((category) => `<button class="department-tag" data-category-name="${category}" title="删除未使用类别" type="button">${category}</button>`).join("")}
+      <div class="category-list">
+        ${categories.map((category) => {
+          const count = state.assets.filter((asset) => asset.category === category).length;
+          return `
+            <article class="category-item">
+              <div>
+                <strong>${category}</strong>
+                <span class="hint">${count} 个资产使用</span>
+              </div>
+              <div class="row-actions">
+                <button class="ghost small" data-category-edit="${category}" type="button">编辑</button>
+                <button class="danger small" data-category-delete="${category}" type="button">删除</button>
+              </div>
+            </article>
+          `;
+        }).join("")}
       </div>
-      <p class="hint">每行一个类别。已被资产使用的类别不能直接删除，需要先把相关资产调整到其他类别。</p>
-    </section>
+      <p class="hint">删除类别前需要确保没有资产使用该类别；编辑类别会同步更新已有资产、资产申请和采购需求中的类别。</p>
+    </div>
   `;
 }
 
@@ -2439,7 +2462,7 @@ async function changeMyPassword() {
 async function toggleViewMode() {
   if (!isRealAdmin()) return;
   const nextMode = isUserViewMode() ? "admin" : "user";
-  if (nextMode === "user" && ["users", "settings", "audit"].includes(view)) {
+  if (nextMode === "user" && ["users", "baseData", "settings", "audit"].includes(view)) {
     view = "dashboard";
   }
   if (nextMode === "user") {
@@ -2616,21 +2639,14 @@ function bindEvents() {
     render();
   });
 
-  document.querySelector("#toggleCategoryManager")?.addEventListener("click", () => {
-    assetCategoryManagerOpen = !assetCategoryManagerOpen;
-    render();
-  });
-
-  document.querySelector("#assetCategoryForm")?.addEventListener("submit", async (event) => {
+  document.querySelector("#addAssetCategoryForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const categories = event.target.categories.value
-      .split(/\r?\n/)
-      .map((item) => item.trim())
-      .filter(Boolean);
+    const category = event.target.category.value.trim();
+    if (!category) return;
     try {
-      state = await api("/api/assets/categories", {
+      state = await api("/api/assets/categories/add", {
         method: "POST",
-        body: JSON.stringify(withActor({ categories }))
+        body: JSON.stringify(withActor({ category }))
       });
       render();
     } catch (exc) {
@@ -2638,9 +2654,28 @@ function bindEvents() {
     }
   });
 
-  document.querySelectorAll("[data-category-name]").forEach((button) => {
+  document.querySelectorAll("[data-category-edit]").forEach((button) => {
     button.addEventListener("click", async () => {
-      const category = button.dataset.categoryName;
+      const oldName = button.dataset.categoryEdit;
+      const newName = prompt(`请输入“${oldName}”的新类别名称`, oldName);
+      if (newName === null) return;
+      const cleanName = newName.trim();
+      if (!cleanName || cleanName === oldName) return;
+      try {
+        state = await api("/api/assets/categories/rename", {
+          method: "POST",
+          body: JSON.stringify(withActor({ oldName, newName: cleanName }))
+        });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-category-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const category = button.dataset.categoryDelete;
       if (!confirm(`确定删除类别“${category}”吗？已被资产使用的类别不能删除。`)) return;
       try {
         state = await api("/api/assets/categories/delete", {

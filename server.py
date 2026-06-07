@@ -28,7 +28,7 @@ PUBLIC_PORT = os.environ.get("PUBLIC_PORT") or os.environ.get("WAREHOUSE_HOST_PO
 DEFAULT_ADMIN_PASSWORD = os.environ.get("WAREHOUSE_ADMIN_PASSWORD", "change-me-before-use")
 DEFAULT_IMPORTED_USER_PASSWORD = os.environ.get("WAREHOUSE_IMPORTED_USER_PASSWORD", "change-me-before-use")
 BEIJING_TZ = timezone(timedelta(hours=8))
-APP_VERSION = "20260607-asset-category-manager-v73"
+APP_VERSION = "20260607-base-data-category-crud-v74"
 REQUEST_IP = contextvars.ContextVar("request_ip", default="")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -2888,6 +2888,44 @@ class Handler(SimpleHTTPRequestHandler):
                             (new_id("cat"), name),
                         )
                     add_audit(conn, user["id"], "更新资产类别", f"类别设置：{'、'.join(names)}")
+                    self.send_json(200, get_state(conn, user))
+                    return
+                if parsed.path == "/api/assets/categories/add":
+                    require_admin(user)
+                    name = str(payload.get("category", "")).strip()
+                    if not name:
+                        self.send_json(400, {"error": "类别名称不能为空"})
+                        return
+                    ensure_asset_category(conn, name)
+                    add_audit(conn, user["id"], "新增资产类别", name)
+                    self.send_json(200, get_state(conn, user))
+                    return
+                if parsed.path == "/api/assets/categories/rename":
+                    require_admin(user)
+                    old_name = str(payload.get("oldName", "")).strip()
+                    new_name = str(payload.get("newName", "")).strip()
+                    if not old_name or not new_name:
+                        self.send_json(400, {"error": "类别名称不能为空"})
+                        return
+                    if old_name == new_name:
+                        self.send_json(200, get_state(conn, user))
+                        return
+                    duplicate = conn.execute(
+                        "select id from asset_categories where name = ? and active = 1",
+                        (new_name,),
+                    ).fetchone()
+                    if duplicate:
+                        self.send_json(400, {"error": f"类别“{new_name}”已存在"})
+                        return
+                    existing = conn.execute("select id from asset_categories where name = ?", (old_name,)).fetchone()
+                    if existing:
+                        conn.execute("update asset_categories set name = ?, active = 1 where name = ?", (new_name, old_name))
+                    else:
+                        ensure_asset_category(conn, new_name)
+                    conn.execute("update assets set category = ? where category = ?", (new_name, old_name))
+                    conn.execute("update asset_requests set category = ? where category = ?", (new_name, old_name))
+                    conn.execute("update purchase_wishes set category = ? where category = ?", (new_name, old_name))
+                    add_audit(conn, user["id"], "编辑资产类别", f"{old_name} -> {new_name}")
                     self.send_json(200, get_state(conn, user))
                     return
                 if parsed.path == "/api/settings/multi-department":
