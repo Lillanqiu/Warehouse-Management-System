@@ -153,9 +153,55 @@ docker compose -p warehouse down
 
 ```powershell
 docker compose -p warehouse down
-docker volume rm warehouse_data
+docker volume rm warehouse_warehouse_data
 docker compose -p warehouse up --build -d
 ```
+
+## 查看容器和数据卷位置
+
+查看当前容器状态和端口：
+
+```powershell
+docker compose -p warehouse ps
+```
+
+查看容器详细信息：
+
+```powershell
+docker inspect warehouse-system
+```
+
+查看容器挂载了哪些数据卷，以及数据卷在宿主机上的位置。输出顺序是：容器路径、数据卷名、宿主机位置。
+
+```powershell
+docker inspect warehouse-system --format '{{range .Mounts}}{{.Destination}} {{.Name}} {{.Source}}{{println}}{{end}}'
+```
+
+查看所有 Docker 数据卷：
+
+```powershell
+docker volume ls
+```
+
+查看本系统数据卷详情。使用 `-p warehouse` 启动时，数据卷通常叫 `warehouse_warehouse_data`：
+
+```powershell
+docker volume inspect warehouse_warehouse_data
+```
+
+如果本机之前没有使用 `-p warehouse` 启动过，也可以先用 `docker volume ls` 找到名字里带 `warehouse_data` 的数据卷，再执行：
+
+```powershell
+docker volume inspect 数据卷名称
+```
+
+系统数据库在容器内部的位置是：
+
+```text
+/data/warehouse.db
+```
+
+在 Windows Docker Desktop 里，`docker volume inspect` 显示的 `Mountpoint` 通常是 Docker Linux 虚拟机内部路径，不一定能像普通 Windows 文件夹一样直接打开。日常备份或排查优先用 Docker 命令查看。
 
 ## 数据与隐私
 
@@ -168,7 +214,7 @@ SQLite 数据库位于容器内：
 Docker Compose 使用命名卷持久化数据：
 
 ```text
-warehouse_data
+warehouse_warehouse_data
 ```
 
 不要提交真实业务数据、导入原始文件、截图、`.env`、数据库文件或包含人员/资产/价格信息的导出文件。
@@ -178,5 +224,3 @@ warehouse_data
 - [依赖说明](docs/DEPENDENCIES.md)
 - [测试机部署说明](docs/TEST_MACHINE_SETUP.md)
 - [数据库结构说明](docs/DATABASE_SCHEMA.md)
-- [隐私与 GitHub 检查清单](docs/PRIVACY_AND_GITHUB_CHECKLIST.md)
-- [学校资产功能补缺计划](docs/school_asset_gap_plan.md)
