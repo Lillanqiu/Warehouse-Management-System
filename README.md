@@ -1,78 +1,40 @@
-# 厂库出入库管理系统
+# 学校资产与厂库出入库管理系统
 
-一个 Docker 化的厂库出入库管理系统，包含浏览器前端、Python 标准库后端 API 和 SQLite 数据库。适合做资产、耗材、出入库、出借、归还、导入留档和操作记录管理。
+一个 Docker 化的资产、耗材、出入库和盘点管理系统。项目使用原生 HTML/CSS/JavaScript 前端、Python 标准库后端 API 和 SQLite 数据库，不需要 npm 打包流程。
+
+默认访问地址：
+
+```text
+http://127.0.0.1:38280
+```
+
+默认登录：
+
+```text
+账号：admin
+密码：admin
+```
 
 ## 功能概览
 
-- 多用户登录：管理员和普通用户
-- 管理员查看全部资产、耗材、出入库记录、用户、操作记录
-- 普通用户查看自己的出入库状态，并可提交资产申请和采购需求
-- 资产/耗材区分管理
-- 入库、出库/出借、归还记录
-- Excel 入库导入
-- Word 出库/出借单导入
-- 导入电子档留档
-- 浏览器内资产表打印
-- 按模板生成资产/耗材申请确认单
-- 纸质/手写材料电子化待复核队列
-- 后台操作记录和请求 IP 记录
-- 开发者模式下可清空业务数据，用户保留
-
-## 依赖
-
-运行依赖：
-
-- Docker Engine
-- Docker Compose
-- 浏览器
-
-容器内使用：
-
-- Python 3.12 slim
-- SQLite
-- Python 标准库
-
-项目无 npm 依赖，无前端构建步骤。详细说明见 [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md)。
+- 用户与权限：支持管理员、资产管理员、部门负责人、普通教师、普通用户等角色，包含角色表、权限表和菜单权限控制。
+- 资产台账：支持资产编号、名称、分类、规格、品牌、单位、数量、单价、总金额、购置日期、入库日期、供应商、使用部门、使用人、资产来源、创建人、更新时间、资产图片等字段。
+- 资产状态：按资产/耗材归类展示，支持状态筛选、分类筛选、责任人/出借人筛选、分页、排序、资产详情抽屉和独立详情链接。
+- 二维码与标签：资产详情页可生成二维码标签，扫码/链接可进入资产详情；资产状况里的标签显示可在“设置 -> 实验室功能”里单独开关。
+- 出入库与出借：支持手动登记、Excel 入库导入、Word 出库/出借单导入、按人员查看领取资产和耗材；导入记录优先使用文档里的业务时间，导入时间只作为留档信息。
+- 库存管理：耗材库存支持安全库存、库存预警、入库/出库流水、库存调整；库存调整可以输入耗材名称、编号、规格或资产详情链接，不需要长列表滚动选择。
+- 盘点管理：支持创建盘点任务、录入明细、自动识别数量差异、位置异常和状态异常。
+- 业务单据：支持资产申请、领用/借用、调拨、维修、报废等流程雏形，部分流程已接入审批状态和资产流转日志。
+- 纸质单据：纸质/手写材料电子化待复核队列可在“设置 -> 实验室功能”里单独开关。
+- 疑似重复档：导入内容接近或文档内容接近时，会归纳到“疑似重复档”，并支持展开、收起、隐藏三个挡位。
+- 报表与导出：支持资产总账、分类/部门/位置/责任人统计、出入库明细、盘点差异等 CSV 导出能力。
+- 操作日志：记录操作人、时间、IP、对象、业务单号和操作详情。
 
 ## 快速启动
 
-### 测试机补齐环境
-
-先用 PowerShell 检查测试机有没有 Git 和 Docker：
+确认本机已安装 Docker Desktop 或 Docker Engine，然后在项目目录执行：
 
 ```powershell
-git --version
-docker --version
-docker compose version
-```
-
-如果提示找不到命令，可以用 Windows 自带的 `winget` 安装：
-
-```powershell
-winget install --id Git.Git -e
-winget install --id Docker.DockerDesktop -e
-```
-
-如果 Docker Desktop 提示需要 WSL，或者测试机还没有 Ubuntu 子系统，先用管理员 PowerShell 执行：
-
-```powershell
-wsl --install
-wsl --install -d Ubuntu
-wsl --update
-wsl -l -v
-```
-
-安装完成后重启电脑或重启 PowerShell。第一次打开 Ubuntu 时会要求创建 Linux 用户名和密码，这个是 Ubuntu 子系统自己的账号，不是本系统的登录账号。
-
-然后打开 Docker Desktop，进入 `Settings` -> `Resources` -> `WSL Integration`，确认 Ubuntu 已启用。等 Docker Desktop 显示正在运行后，再执行项目启动命令。
-
-### 新测试机第一次下载并启动
-
-在测试机打开 PowerShell，执行：
-
-```powershell
-git clone https://github.com/Lillanqiu/Warehouse-Management-System.git
-cd Warehouse-Management-System
 Copy-Item .env.example .env
 docker compose -p warehouse up --build -d
 ```
@@ -83,135 +45,83 @@ docker compose -p warehouse up --build -d
 http://127.0.0.1:38280
 ```
 
-如果不方便使用 Git，也可以在 GitHub 页面点击绿色 `Code` -> `Download ZIP`，解压后进入项目目录，再执行：
+如果是第一次从 GitHub 拉取：
 
 ```powershell
+git clone https://github.com/Lillanqiu/Warehouse-Management-System.git
+cd Warehouse-Management-System
 Copy-Item .env.example .env
 docker compose -p warehouse up --build -d
 ```
 
-### 已经下载过项目后的启动
-
-```powershell
-cd Warehouse-Management-System
-docker compose -p warehouse up --build -d
-```
-
-### 后续更新测试机代码
-
-在项目目录执行：
+如果已经下载过项目，后续更新代码后执行：
 
 ```powershell
 git pull origin main
 docker compose -p warehouse up --build -d
 ```
 
-更详细的测试机部署说明见 [docs/TEST_MACHINE_SETUP.md](docs/TEST_MACHINE_SETUP.md)。
+## 更新容器命令
 
-修改端口：
+已经在项目目录里时，直接执行：
 
 ```powershell
-$env:WAREHOUSE_HOST_PORT='18080'
+git pull origin main
 docker compose -p warehouse up --build -d
+docker compose -p warehouse ps
 ```
 
-或修改本地 `.env`：
+如果只是改了本地文件，不需要拉取 GitHub 代码，只执行：
+
+```powershell
+docker compose -p warehouse up --build -d
+docker compose -p warehouse ps
+```
+
+更新后打开：
+
+```text
+http://127.0.0.1:38280
+```
+
+## 默认账号
+
+系统默认管理员为：
+
+```text
+账号：admin
+密码：admin
+```
+
+`docker-compose.yml` 和 `.env.example` 已将 `WAREHOUSE_ADMIN_PASSWORD` 默认设为 `admin`。后端启动时会同步校正 `admin` 账号的登录密码，所以旧数据库重启后也会跟随当前环境变量生效。
+
+正式部署或共享给他人使用前，建议把本地 `.env` 里的管理员密码改成自己的强密码：
+
+```text
+WAREHOUSE_ADMIN_PASSWORD=请在本机填写强密码
+```
+
+`.env` 是本地配置文件，已被 `.gitignore` 忽略，不要提交到 GitHub。
+
+## 修改端口
+
+默认端口是 `38280`。如果端口被占用，可以修改本地 `.env`：
 
 ```text
 WAREHOUSE_HOST_PORT=18080
 ```
 
-## 默认账号
-
-空库首次启动只创建一个管理员账号：
-
-```text
-账号：admin
-密码：由本地 .env 的 WAREHOUSE_ADMIN_PASSWORD 控制
-```
-
-如果只是复制 `.env.example` 后直接启动，首次空库临时密码是：
-
-```text
-change-me-before-use
-```
-
-注意：默认不是 `admin/admin`。管理员密码只会在第一次创建空数据库时写入一次；如果数据库已经存在，后面修改 `.env` 里的 `WAREHOUSE_ADMIN_PASSWORD` 不会自动修改数据库里的旧密码。
-
-首次部署后请立即修改临时密码。不要把真实密码写入要上传 GitHub 的文件。
-
-## 登录密码不对怎么办
-
-先确认你输入的是本机 `.env` 里的 `WAREHOUSE_ADMIN_PASSWORD`。如果测试机只是复制了 `.env.example`，请用：
-
-```text
-账号：admin
-密码：change-me-before-use
-```
-
-如果这个测试库不需要保留业务数据，可以重置为空库：
+然后重启：
 
 ```powershell
-docker compose -p warehouse down
-docker volume rm warehouse_data
 docker compose -p warehouse up --build -d
 ```
 
-如果要保留测试数据，只重置管理员密码，可以在项目目录执行：
-
-```powershell
-docker compose -p warehouse exec warehouse python -c "import sqlite3; c=sqlite3.connect('/data/warehouse.db'); c.execute('update users set password=?, active=1 where username=?', ('change-me-before-use','admin')); c.commit(); print('admin password reset')"
-```
-
-然后用：
+访问地址会变成：
 
 ```text
-账号：admin
-密码：change-me-before-use
+http://127.0.0.1:18080
 ```
-
-## 数据库与脱敏
-
-SQLite 数据库位于容器内：
-
-```text
-/data/warehouse.db
-```
-
-Docker Compose 使用命名卷持久化：
-
-```text
-warehouse_data
-```
-
-本仓库不提交真实业务数据库。已通过 `.gitignore` 排除：
-
-- `.env`
-- `data/`
-- `*.db`
-- `*.sqlite`
-- 导入留档目录
-- 截图和浏览器缓存
-
-数据库结构说明见 [docs/DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md)。
-隐私和敏感文件清单见 [docs/PRIVACY_AND_GITHUB_CHECKLIST.md](docs/PRIVACY_AND_GITHUB_CHECKLIST.md)。
-
-## 上传 GitHub 前检查
-
-运行：
-
-```powershell
-git status --short --ignored
-```
-
-确保没有提交以下内容：
-
-- 真实 SQLite 数据库
-- 导入的 Word/Excel 原始业务文件
-- 包含人员、资产、价格、内网地址的截图
-- 本地 `.env`
-
-如果需要完全空库运行，直接使用新的 Docker volume 启动即可；后端会自动建表并只创建默认管理员账号。
 
 ## 常用命令
 
@@ -227,14 +137,46 @@ docker compose -p warehouse ps
 docker compose -p warehouse logs --tail 50
 ```
 
-停止：
+重新构建并启动：
+
+```powershell
+docker compose -p warehouse up --build -d
+```
+
+停止服务：
 
 ```powershell
 docker compose -p warehouse down
 ```
 
-重新构建：
+如果测试环境需要清空业务数据，可以删除 Docker volume 后重新启动：
 
 ```powershell
+docker compose -p warehouse down
+docker volume rm warehouse_data
 docker compose -p warehouse up --build -d
 ```
+
+## 数据与隐私
+
+SQLite 数据库位于容器内：
+
+```text
+/data/warehouse.db
+```
+
+Docker Compose 使用命名卷持久化数据：
+
+```text
+warehouse_data
+```
+
+不要提交真实业务数据、导入原始文件、截图、`.env`、数据库文件或包含人员/资产/价格信息的导出文件。
+
+更多说明：
+
+- [依赖说明](docs/DEPENDENCIES.md)
+- [测试机部署说明](docs/TEST_MACHINE_SETUP.md)
+- [数据库结构说明](docs/DATABASE_SCHEMA.md)
+- [隐私与 GitHub 检查清单](docs/PRIVACY_AND_GITHUB_CHECKLIST.md)
+- [学校资产功能补缺计划](docs/school_asset_gap_plan.md)
