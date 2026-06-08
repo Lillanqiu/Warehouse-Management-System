@@ -1,7 +1,8 @@
 ﻿const USER_KEY = "warehouse-current-user";
 const SESSION_USER_KEY = "warehouse-session-user";
 const VIEW_MODE_KEY = "warehouse-view-mode";
-const APP_VERSION = "20260607-asset-list-sort-v75";
+const SUSPECT_DUPLICATE_MODE_KEY = "warehouse-suspect-duplicate-mode";
+const APP_VERSION = "20260608-school-rbac-flow-v92";
 
 let state = {
   currentUser: null,
@@ -14,7 +15,18 @@ let state = {
   adminRequests: [],
   assetRequests: [],
   purchaseWishes: [],
-  settings: { departments: [], assetCategories: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, loginBackgroundImage: "", servicePort: "", printAssetTemplateName: "", printAssetTemplateCustom: false, printConsumableTemplateName: "", printConsumableTemplateCustom: false }
+  inventoryCheckTasks: [],
+  inventoryCheckItems: [],
+  stockRecords: [],
+  assetFlowLogs: [],
+  borrowOrders: [],
+  transferOrders: [],
+  repairOrders: [],
+  scrapOrders: [],
+  roles: [],
+  permissions: [],
+  menuPermissions: [],
+  settings: { departments: [], assetCategories: [], assetCategoryItems: [], locations: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, assetDetailLabelEnabled: true, paperModuleEnabled: true, loginBackgroundImage: "", servicePort: "", printAssetTemplateName: "", printAssetTemplateCustom: false, printConsumableTemplateName: "", printConsumableTemplateCustom: false }
 };
 let loginSettings = { adminPrefillEnabled: false, adminPrefillPassword: "", loginBackgroundImage: "", appVersion: APP_VERSION };
 let view = "dashboard";
@@ -22,10 +34,13 @@ let assetFilter = "";
 let selectedAssetId = "";
 let assetStatusFilter = "all";
 let assetKeeperFilter = "all";
+let assetBorrowerFilter = "all";
 let assetSortField = "model";
 let assetSortDir = "asc";
+let inventoryFilter = "";
 let assetDrawerOpen = false;
 let editingAssetId = "";
+let selectedAssetDetailId = "";
 let dashboardSearch = "";
 let recordFilter = "all";
 let recordKindFilter = "all";
@@ -38,8 +53,11 @@ let auditFilterField = "all";
 let auditFilterQuery = "";
 let auditStartTime = "";
 let auditEndTime = "";
+let orderType = "claim";
+let reportType = "ledger";
 let searchRenderTimer = null;
 let messagePanelOpen = false;
+let suspectDuplicateMode = localStorage.getItem(SUSPECT_DUPLICATE_MODE_KEY) || "expanded";
 let composingInputs = new Set();
 
 function viewRoleParam() {
@@ -47,10 +65,15 @@ function viewRoleParam() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options
-  });
+  let response;
+  try {
+    response = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      ...options
+    });
+  } catch (exc) {
+    throw new Error(exc?.message === "Failed to fetch" ? "网络请求中断：文件可能较大、服务正在重启，或浏览器连接被断开，请稍后重试。" : exc.message || "网络请求失败");
+  }
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "请求失败");
   return data;
@@ -67,6 +90,7 @@ async function loadState() {
     const data = await api(`/api/state?userId=${encodeURIComponent(saved)}${viewRoleParam()}`);
     ensureFreshVersion(data);
     state = data;
+    applyAssetUrlSelection();
   } catch {
     localStorage.removeItem(USER_KEY);
     sessionStorage.removeItem(SESSION_USER_KEY);
@@ -88,7 +112,18 @@ async function refresh() {
   if (!state.currentUser) return render();
   state = await api(`/api/state?userId=${encodeURIComponent(state.currentUser.id)}${viewRoleParam()}`);
   ensureFreshVersion(state);
+  applyAssetUrlSelection();
   render();
+}
+
+function applyAssetUrlSelection() {
+  const assetId = new URLSearchParams(window.location.search).get("asset");
+  if (!assetId || selectedAssetDetailId) return;
+  const asset = state.assets.find((item) => item.id === assetId || item.code === assetId);
+  if (asset) {
+    view = "assets";
+    selectedAssetDetailId = asset.id;
+  }
 }
 
 function ensureFreshVersion(data) {
@@ -115,15 +150,39 @@ function blank(value) {
 }
 
 function isAdmin() {
-  return state.currentUser?.role === "admin";
+  return can("assets.view.all") || state.currentUser?.role === "admin";
 }
 
 function isRealAdmin() {
-  return state.currentUser?.actualRole === "admin" || state.currentUser?.role === "admin";
+  return state.currentUser?.actualRole === "admin" || state.currentUser?.role === "admin" || state.currentUser?.roleId === "admin";
 }
 
 function isUserViewMode() {
-  return isRealAdmin() && state.currentUser?.role !== "admin";
+  return isRealAdmin() && state.currentUser?.viewMode === "user";
+}
+
+function permissions() {
+  return new Set(state.currentUser?.permissions || []);
+}
+
+function can(permission) {
+  return permissions().has(permission) || state.currentUser?.role === "admin" || state.currentUser?.roleId === "admin";
+}
+
+function canMenu(menuKey) {
+  if (menuKey === "paper" && !isPaperModuleEnabled()) return false;
+  const menus = state.currentUser?.menus || [];
+  return menus.includes(menuKey) || can("system.admin");
+}
+
+function roleLabel(roleId) {
+  return {
+    admin: "系统管理员",
+    asset_manager: "资产管理员",
+    department_head: "部门负责人",
+    teacher: "普通教师",
+    user: "普通用户"
+  }[roleId] || roleId || "普通教师";
 }
 
 function isMultiDepartment() {
@@ -136,6 +195,14 @@ function isDeveloperMode() {
 
 function isAdminPrefillEnabled() {
   return Boolean(state.settings?.adminPrefillEnabled);
+}
+
+function isAssetDetailLabelEnabled() {
+  return state.settings?.assetDetailLabelEnabled !== false;
+}
+
+function isPaperModuleEnabled() {
+  return state.settings?.paperModuleEnabled !== false;
 }
 
 function loginBackgroundStyle() {
@@ -159,10 +226,52 @@ function departments() {
 }
 
 function assetCategories() {
+  const items = assetCategoryItems();
+  if (items.length) return items.map((item) => item.name);
   const configured = state.settings?.assetCategories || [];
   if (configured.length) return configured;
   const fromAssets = [...new Set(state.assets.map((asset) => String(asset.category || "").trim()).filter(Boolean))].sort();
   return fromAssets.length ? fromAssets : ["固定资产", "低值易耗品", "耗材", "购进软件"];
+}
+
+function assetCategoryItems() {
+  const configured = state.settings?.assetCategoryItems || [];
+  if (configured.length) return configured;
+  const names = (state.settings?.assetCategories || []).length
+    ? state.settings.assetCategories
+    : [...new Set(state.assets.map((asset) => String(asset.category || "").trim()).filter(Boolean))].sort();
+  return (names.length ? names : ["固定资产", "低值易耗品", "耗材", "购进软件"])
+    .map((name) => ({ id: name, name, parent_id: "", code: "", category_type: isConsumableCategoryName(name) ? "耗材" : "固定资产" }));
+}
+
+function isConsumableCategoryName(name) {
+  return String(name || "").includes("耗材") || String(name || "").includes("易耗");
+}
+
+function categoryName(categoryId) {
+  return assetCategoryItems().find((item) => item.id === categoryId)?.name || "-";
+}
+
+function locations() {
+  const configured = state.settings?.locations || [];
+  if (configured.length) return configured;
+  const fromAssets = [...new Set(state.assets.map((asset) => String(asset.location || "").trim()).filter(Boolean))]
+    .sort()
+    .map((name) => ({ id: name, name, type: "仓库", code: "", manager_id: "", remark: "" }));
+  return fromAssets.length ? fromAssets : [{ id: "default-location", name: "总仓库", type: "仓库", code: "", manager_id: "", remark: "" }];
+}
+
+function treeDepth(items, item, parentKey = "parent_id", depth = 0, seen = new Set()) {
+  const parentId = item?.[parentKey];
+  if (!parentId || seen.has(parentId)) return depth;
+  const parent = items.find((entry) => entry.id === parentId);
+  if (!parent) return depth;
+  seen.add(parentId);
+  return treeDepth(items, parent, parentKey, depth + 1, seen);
+}
+
+function treeLabel(items, item, parentKey = "parent_id") {
+  return `${"　".repeat(treeDepth(items, item, parentKey))}${item.name}`;
 }
 
 function selectableUsers() {
@@ -221,6 +330,238 @@ function assetGroupById(assetId) {
   return assetGroups().find((group) => group.key === assetGroupKey(asset)) || null;
 }
 
+function assetRecords(assetIds) {
+  const ids = new Set(Array.isArray(assetIds) ? assetIds : [assetIds]);
+  return state.records
+    .filter((record) => ids.has(record.assetId))
+    .sort((a, b) => recordMillis(b) - recordMillis(a));
+}
+
+function assetDetailUrl(asset) {
+  const base = `${window.location.origin}${window.location.pathname}`;
+  return `${base}?asset=${encodeURIComponent(asset.id)}`;
+}
+
+function clearAssetUrlParam() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("asset")) return;
+  url.searchParams.delete("asset");
+  window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function qrSeed(text) {
+  let seed = 0;
+  for (const char of String(text || "")) {
+    seed = (seed * 31 + char.charCodeAt(0)) >>> 0;
+  }
+  return seed || 1;
+}
+
+function qrLikeSvg(text) {
+  try {
+    return standardQrSvg(text);
+  } catch {
+    // Fallback keeps labels printable if an unexpected input exceeds the compact QR profile.
+  }
+  const size = 21;
+  let seed = qrSeed(text);
+  const hasFinder = (x, y, ox, oy) => x >= ox && x < ox + 7 && y >= oy && y < oy + 7;
+  const finderCell = (x, y, ox, oy) => {
+    const dx = x - ox;
+    const dy = y - oy;
+    return dx === 0 || dy === 0 || dx === 6 || dy === 6 || (dx >= 2 && dx <= 4 && dy >= 2 && dy <= 4);
+  };
+  const cells = [];
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      let dark = false;
+      if (hasFinder(x, y, 0, 0)) dark = finderCell(x, y, 0, 0);
+      else if (hasFinder(x, y, 14, 0)) dark = finderCell(x, y, 14, 0);
+      else if (hasFinder(x, y, 0, 14)) dark = finderCell(x, y, 0, 14);
+      else {
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        dark = ((seed >>> ((x + y) % 13)) & 1) === 1;
+      }
+      if (dark) cells.push(`<rect x="${x}" y="${y}" width="1" height="1" />`);
+    }
+  }
+  return `<svg class="qr-code" viewBox="0 0 ${size} ${size}" role="img" aria-label="资产二维码">${cells.join("")}</svg>`;
+}
+
+function qrGfTables() {
+  const exp = new Array(512).fill(0);
+  const log = new Array(256).fill(0);
+  let value = 1;
+  for (let index = 0; index < 255; index += 1) {
+    exp[index] = value;
+    log[value] = index;
+    value <<= 1;
+    if (value & 0x100) value ^= 0x11d;
+  }
+  for (let index = 255; index < 512; index += 1) exp[index] = exp[index - 255];
+  return { exp, log };
+}
+
+function qrGfMul(left, right, tables) {
+  if (!left || !right) return 0;
+  return tables.exp[tables.log[left] + tables.log[right]];
+}
+
+function qrRsDivisor(degree, tables) {
+  const result = new Array(degree).fill(0);
+  result[degree - 1] = 1;
+  let root = 1;
+  for (let index = 0; index < degree; index += 1) {
+    for (let pos = 0; pos < degree; pos += 1) {
+      result[pos] = qrGfMul(result[pos], root, tables);
+      if (pos + 1 < degree) result[pos] ^= result[pos + 1];
+    }
+    root = qrGfMul(root, 2, tables);
+  }
+  return result;
+}
+
+function qrRsRemainder(data, degree, tables) {
+  const divisor = qrRsDivisor(degree, tables);
+  const result = new Array(degree).fill(0);
+  for (const byte of data) {
+    const factor = byte ^ result.shift();
+    result.push(0);
+    for (let index = 0; index < degree; index += 1) {
+      result[index] ^= qrGfMul(divisor[index], factor, tables);
+    }
+  }
+  return result;
+}
+
+function qrAppendBits(bits, value, length) {
+  for (let index = length - 1; index >= 0; index -= 1) {
+    bits.push((value >>> index) & 1);
+  }
+}
+
+function qrEncodeCodewords(text) {
+  const bytes = [...new TextEncoder().encode(String(text || ""))];
+  const version = 5;
+  const dataCodewords = 108;
+  const ecCodewords = 26;
+  if (bytes.length > 106) {
+    throw new Error("二维码内容过长");
+  }
+  const bits = [];
+  qrAppendBits(bits, 0b0100, 4);
+  qrAppendBits(bits, bytes.length, 8);
+  bytes.forEach((byte) => qrAppendBits(bits, byte, 8));
+  const capacityBits = dataCodewords * 8;
+  qrAppendBits(bits, 0, Math.min(4, capacityBits - bits.length));
+  while (bits.length % 8) bits.push(0);
+  const data = [];
+  for (let index = 0; index < bits.length; index += 8) {
+    data.push(bits.slice(index, index + 8).reduce((sum, bit) => (sum << 1) | bit, 0));
+  }
+  for (let pad = 0xec; data.length < dataCodewords; pad ^= 0xfd) data.push(pad);
+  const ecc = qrRsRemainder(data, ecCodewords, qrGfTables());
+  return { version, codewords: [...data, ...ecc] };
+}
+
+function qrFormatBits(mask = 0) {
+  let data = (0b01 << 3) | mask;
+  let bits = data << 10;
+  const generator = 0x537;
+  for (let index = 14; index >= 10; index -= 1) {
+    if ((bits >>> index) & 1) bits ^= generator << (index - 10);
+  }
+  return ((data << 10) | bits) ^ 0x5412;
+}
+
+function standardQrSvg(text) {
+  const { version, codewords } = qrEncodeCodewords(text);
+  const size = 17 + version * 4;
+  const matrix = Array.from({ length: size }, () => new Array(size).fill(false));
+  const reserved = Array.from({ length: size }, () => new Array(size).fill(false));
+  const set = (x, y, dark, reserve = true) => {
+    if (x < 0 || y < 0 || x >= size || y >= size) return;
+    matrix[y][x] = Boolean(dark);
+    if (reserve) reserved[y][x] = true;
+  };
+  const finder = (left, top) => {
+    for (let y = -1; y <= 7; y += 1) {
+      for (let x = -1; x <= 7; x += 1) {
+        const xx = left + x;
+        const yy = top + y;
+        const inCore = x >= 0 && x <= 6 && y >= 0 && y <= 6;
+        const dark = inCore && (x === 0 || y === 0 || x === 6 || y === 6 || (x >= 2 && x <= 4 && y >= 2 && y <= 4));
+        set(xx, yy, dark);
+      }
+    }
+  };
+  finder(0, 0);
+  finder(size - 7, 0);
+  finder(0, size - 7);
+  for (let index = 8; index < size - 8; index += 1) {
+    set(index, 6, index % 2 === 0);
+    set(6, index, index % 2 === 0);
+  }
+  const centers = version === 5 ? [6, 30] : [6, 24, 42];
+  for (const cx of centers) {
+    for (const cy of centers) {
+      const overlapsFinder = (cx === 6 && cy === 6) || (cx === 6 && cy === size - 7) || (cx === size - 7 && cy === 6);
+      if (overlapsFinder) continue;
+      for (let y = -2; y <= 2; y += 1) {
+        for (let x = -2; x <= 2; x += 1) {
+          set(cx + x, cy + y, Math.max(Math.abs(x), Math.abs(y)) !== 1);
+        }
+      }
+    }
+  }
+  set(8, size - 8, true);
+  const reserveFormat = () => {
+    for (let index = 0; index < 9; index += 1) {
+      if (index !== 6) {
+        reserved[8][index] = true;
+        reserved[index][8] = true;
+      }
+    }
+    for (let index = 0; index < 8; index += 1) {
+      reserved[8][size - 1 - index] = true;
+      reserved[size - 1 - index][8] = true;
+    }
+  };
+  reserveFormat();
+  const dataBits = codewords.flatMap((byte) => Array.from({ length: 8 }, (_, index) => (byte >>> (7 - index)) & 1));
+  let bitIndex = 0;
+  let upward = true;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right -= 1;
+    for (let vert = 0; vert < size; vert += 1) {
+      const y = upward ? size - 1 - vert : vert;
+      for (let dx = 0; dx < 2; dx += 1) {
+        const x = right - dx;
+        if (reserved[y][x]) continue;
+        const mask = (x + y) % 2 === 0;
+        set(x, y, Boolean((dataBits[bitIndex] || 0) ^ (mask ? 1 : 0)), false);
+        bitIndex += 1;
+      }
+    }
+    upward = !upward;
+  }
+  const format = qrFormatBits(0);
+  for (let index = 0; index <= 5; index += 1) set(8, index, (format >>> index) & 1);
+  set(8, 7, (format >>> 6) & 1);
+  set(8, 8, (format >>> 7) & 1);
+  set(7, 8, (format >>> 8) & 1);
+  for (let index = 9; index < 15; index += 1) set(14 - index, 8, (format >>> index) & 1);
+  for (let index = 0; index < 8; index += 1) set(size - 1 - index, 8, (format >>> index) & 1);
+  for (let index = 8; index < 15; index += 1) set(8, size - 15 + index, (format >>> index) & 1);
+  const cells = [];
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      if (matrix[y][x]) cells.push(`<rect x="${x}" y="${y}" width="1" height="1" />`);
+    }
+  }
+  return `<svg class="qr-code" viewBox="0 0 ${size} ${size}" role="img" aria-label="资产二维码">${cells.join("")}</svg>`;
+}
+
 function assetGroupStatus(group) {
   const statuses = [...new Set(group.assets.map((asset) => asset.status || "in_stock"))];
   if (statuses.length === 1) return statusBadge(statuses[0]);
@@ -264,6 +605,85 @@ function assetGroupRecordDetail(group, type, mode = "html") {
   return `<div class="flow-detail">${parts.map((item) => `<span>${item}</span>`).join("")}</div>`;
 }
 
+function borrowerRecordsForUser(userId) {
+  if (!userId || userId === "all") return [];
+  return state.records
+    .filter((record) => record.type === "出库" && record.userId === userId)
+    .sort((a, b) => recordMillis(b) - recordMillis(a));
+}
+
+function borrowerAssetsForUser(userId) {
+  if (!userId || userId === "all") return [];
+  const recordAssetIds = new Set(borrowerRecordsForUser(userId).map((record) => record.assetId));
+  return state.assets
+    .filter((asset) => asset.keeperId === userId || asset.useUserId === userId || assetFlow(asset).borrowerId === userId || recordAssetIds.has(asset.id))
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh-Hans-CN", { numeric: true, sensitivity: "base" }));
+}
+
+function borrowerDetailRows(userId, kind) {
+  const assets = borrowerAssetsForUser(userId).filter((asset) => assetKind(asset) === kind);
+  return assets.map((asset) => {
+    const records = state.records
+      .filter((record) => record.assetId === asset.id && record.userId === userId && record.type === "出库")
+      .sort((a, b) => recordMillis(b) - recordMillis(a));
+    const latest = records[0] || {};
+    return { asset, latest, records };
+  });
+}
+
+function renderBorrowerDetailTable(rows, emptyText) {
+  if (!rows.length) return `<div class="empty compact-empty">${emptyText}</div>`;
+  return `
+    <div class="table-wrap compact-table">
+      <table>
+        <thead><tr><th>名称</th><th>规格/类别</th><th>数量</th><th>领取/出借时间</th><th>单号</th><th>来源</th><th>状态</th></tr></thead>
+        <tbody>
+          ${rows.map(({ asset, latest }) => `
+            <tr>
+              <td><strong>${asset.name}</strong><div class="mini-meta">${asset.code}</div></td>
+              <td>${blank(asset.spec || asset.category)}</td>
+              <td>${latest.quantity || asset.quantity || 1}</td>
+              <td>${fmt(latest.outTime)}</td>
+              <td>${blank(latest.paperNo)}</td>
+              <td>${blank(sourceFilesFromText(`${asset.remark || ""}；${latest.note || ""}`).join("；"))}</td>
+              <td>${statusBadge(asset.status)}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderBorrowerDetailPanel() {
+  if (!assetBorrowerFilter || assetBorrowerFilter === "all") return "";
+  const person = state.users.find((user) => user.id === assetBorrowerFilter);
+  const assetRows = borrowerDetailRows(assetBorrowerFilter, "资产");
+  const consumableRows = borrowerDetailRows(assetBorrowerFilter, "耗材");
+  const records = borrowerRecordsForUser(assetBorrowerFilter);
+  return `
+    <section class="borrower-detail-panel no-print">
+      <div class="asset-list-title">
+        <div>
+          <h3>${userName(assetBorrowerFilter)}的出借详情</h3>
+          <span>${person?.department ? `${person.department} · ` : ""}资产 ${assetRows.length} 项 / 耗材 ${consumableRows.length} 项 / 出库记录 ${records.length} 条</span>
+        </div>
+        <button class="ghost small" id="clearBorrowerDetail" type="button">关闭详情</button>
+      </div>
+      <div class="borrower-detail-grid">
+        <section>
+          <div class="section-title compact-title"><h2>领取 / 借用资产</h2><span class="hint">${assetRows.length} 项</span></div>
+          ${renderBorrowerDetailTable(assetRows, "这个人暂无资产领取或借用记录")}
+        </section>
+        <section>
+          <div class="section-title compact-title"><h2>耗材领用</h2><span class="hint">${consumableRows.length} 项</span></div>
+          ${renderBorrowerDetailTable(consumableRows, "这个人暂无耗材领用记录")}
+        </section>
+      </div>
+    </section>
+  `;
+}
+
 function assetGroupSourceFiles(group) {
   const files = group.assets.flatMap((asset) => {
     const fromAsset = sourceFilesFromText(asset.remark);
@@ -297,6 +717,13 @@ function filteredAssetGroups() {
     if (selectedAssetId && !group.assets.some((asset) => asset.id === selectedAssetId)) return false;
     if (assetStatusFilter !== "all" && !group.assets.some((asset) => asset.status === assetStatusFilter)) return false;
     if (assetKeeperFilter !== "all" && !group.assets.some((asset) => asset.keeperId === assetKeeperFilter || assetFlow(asset).borrowerId === assetKeeperFilter)) return false;
+    if (assetBorrowerFilter !== "all" && !group.assets.some((asset) => {
+      const flow = assetFlow(asset);
+      return asset.keeperId === assetBorrowerFilter
+        || asset.useUserId === assetBorrowerFilter
+        || flow.borrowerId === assetBorrowerFilter
+        || state.records.some((record) => record.assetId === asset.id && record.userId === assetBorrowerFilter && record.type === "出库");
+    })) return false;
     return assetGroupMatches(group, assetFilter);
   }).sort(compareAssetGroups);
 }
@@ -362,6 +789,120 @@ function recordDisplayNote(record) {
   return record.displayNote || "-";
 }
 
+function suspectText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, "")
+    .replace(/import-[a-z0-9]+/gi, "")
+    .replace(/[0-9a-z]+(?:-[0-9a-z]+){2,}/gi, "")
+    .replace(/[^\u4e00-\u9fa5a-z0-9]/gi, "");
+}
+
+function suspectDate(record) {
+  return String(record.outTime || record.inTime || "").slice(0, 10);
+}
+
+function suspectRecordText(record) {
+  return suspectText([
+    assetName(record.assetId),
+    recordDocumentType(record),
+    recordDisplayNote(record)
+  ].join(" "));
+}
+
+function suspectSimilarity(left, right) {
+  const a = suspectText(left);
+  const b = suspectText(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return Math.min(a.length, b.length) / Math.max(a.length, b.length);
+  const grams = (text) => {
+    const set = new Set();
+    for (let index = 0; index < text.length - 1; index += 1) set.add(text.slice(index, index + 2));
+    return set.size ? set : new Set([text]);
+  };
+  const leftGrams = grams(a);
+  const rightGrams = grams(b);
+  let overlap = 0;
+  leftGrams.forEach((item) => {
+    if (rightGrams.has(item)) overlap += 1;
+  });
+  return overlap / Math.max(leftGrams.size, rightGrams.size);
+}
+
+function suspectedDuplicateRecordGroups(records) {
+  const candidates = records.filter((record) => record.paperNo || record.note?.includes("导入文件：") || record.note?.includes("Word领用单导入"));
+  const groups = [];
+  candidates.forEach((record) => {
+    const keyDate = suspectDate(record);
+    const keyPaper = String(record.paperNo || "").trim();
+    const keyText = suspectRecordText(record);
+    if (!keyText) return;
+    const group = groups.find((item) => {
+      const sample = item.records[0];
+      const samePaper = keyPaper && sample.paperNo && keyPaper === sample.paperNo;
+      const sameDate = keyDate && suspectDate(sample) && keyDate === suspectDate(sample);
+      const closeText = suspectSimilarity(keyText, item.text) >= 0.72;
+      const sameDocumentContext = samePaper || sameDate || recordDocumentType(record) === recordDocumentType(sample);
+      return record.type === sample.type && sameDocumentContext && closeText;
+    });
+    if (group) {
+      group.records.push(record);
+      group.text = group.records.map(suspectRecordText).sort((a, b) => b.length - a.length)[0] || group.text;
+    } else {
+      groups.push({ text: keyText, records: [record] });
+    }
+  });
+  return groups.filter((group) => group.records.length > 1);
+}
+
+function renderSuspectedDuplicateRecords(records) {
+  const groups = suspectedDuplicateRecordGroups(records);
+  if (!groups.length) return "";
+  const total = groups.reduce((sum, group) => sum + group.records.length, 0);
+  const modeButtons = `
+    <div class="suspect-duplicate-actions" role="group" aria-label="疑似重复档显示挡位">
+      ${["expanded", "compact", "hidden"].map((mode) => {
+        const label = { expanded: "展开", compact: "收起", hidden: "隐藏" }[mode];
+        return `<button class="${suspectDuplicateMode === mode ? "active" : ""}" data-suspect-duplicate-mode="${mode}" type="button">${label}</button>`;
+      }).join("")}
+    </div>
+  `;
+  if (suspectDuplicateMode === "hidden") {
+    return `
+      <div class="suspect-duplicate-box is-hidden">
+        <div class="section-title"><h2>疑似重复档</h2><span class="hint">已隐藏 ${groups.length} 组 / ${total} 条</span>${modeButtons}</div>
+      </div>
+    `;
+  }
+  if (suspectDuplicateMode === "compact") {
+    return `
+      <div class="suspect-duplicate-box is-compact">
+        <div class="section-title"><h2>疑似重复档</h2><span class="hint">${groups.length} 组 / ${total} 条，当前收起</span>${modeButtons}</div>
+      </div>
+    `;
+  }
+  return `
+    <div class="suspect-duplicate-box">
+      <div class="section-title"><h2>疑似重复档</h2><span class="hint">${groups.length} 组 / ${total} 条，先归档待确认，不自动删除</span>${modeButtons}</div>
+      <div class="suspect-duplicate-grid">
+        ${groups.map((group) => {
+          const sample = group.records[0];
+          const names = [...new Set(group.records.map((record) => assetName(record.assetId)))].slice(0, 5);
+          const dates = [...new Set(group.records.map(suspectDate).filter(Boolean))].slice(0, 4);
+          return `
+            <article class="suspect-duplicate-card">
+              <div class="card-head"><strong>${recordDocumentType(sample)} · ${sample.type === "出库" ? "出库/出借" : sample.type}</strong><span class="badge warn">疑似重复 ${group.records.length} 条</span></div>
+              <p>单号：${blank(sample.paperNo)}，时间：${dates.join(" / ") || "-"}</p>
+              <p>内容：${names.join("；")}</p>
+            </article>
+          `;
+        }).join("")}
+      </div>
+    </div>
+  `;
+}
+
 function recordPhoto(record) {
   if (!record.photo) return "-";
   return `<a class="photo-thumb" href="${record.photo}" target="_blank" rel="noopener"><img src="${record.photo}" alt="现场照片" /></a>`;
@@ -417,8 +958,12 @@ function assetSourceFiles(asset) {
 
 function statusBadge(status) {
   const cls = status === "in_stock" || status === "已入库" || status === "已归档" ? "ok" : status === "checked_out" || status === "使用中" || status === "待复核" ? "warn" : "bad";
-  const text = { in_stock: "在库", checked_out: "出库/出借", repair: "维修中", retired: "报废" }[status] || status;
+  const text = statusText(status);
   return `<span class="badge ${cls}">${text}</span>`;
+}
+
+function statusText(status) {
+  return { in_stock: "在库", checked_out: "出库/出借", repair: "维修中", retired: "报废" }[status] || status || "-";
 }
 
 function kindBadge(kind) {
@@ -573,6 +1118,7 @@ function auditFilterOptions(field) {
 }
 
 function render() {
+  if (view === "paper" && !isPaperModuleEnabled()) view = "dashboard";
   const app = document.querySelector("#app");
   app.innerHTML = state.currentUser ? renderShell() : renderLogin();
   bindEvents();
@@ -652,12 +1198,19 @@ function renderShell() {
   const navItems = [
     ["dashboard", "总览", "⌂"],
     ["assets", "资产状态", "▦"],
-    ["records", isAdmin() ? "出入库登记" : "我的出入库", "⇄"],
-    ["assetRequests", isAdmin() ? "资产申请" : "申请资产", "□"],
+    ["inventory", "库存管理", "▥"],
+    ["records", can("records.manage") ? "出入库登记" : "我的出入库", "⇄"],
+    ["checks", "盘点管理", "☑"],
+    ["orders", "业务单据", "▧"],
+    ["reports", "报表统计", "▨"],
+    ["assetRequests", can("asset_requests.manage") ? "资产申请" : "申请资产", "□"],
     ["purchaseWishes", "需求清单", "☆"],
     ["paper", "纸质单据方案", "▤"],
-    ...(isAdmin() ? [["users", pendingAdminRequests ? `用户管理(${pendingAdminRequests})` : "用户管理", "◉"], ["baseData", "基础数据", "▣"], ["settings", "设置", "⚙"], ["audit", "操作记录", "◎"]] : [])
-  ];
+    ["users", pendingAdminRequests ? `用户管理(${pendingAdminRequests})` : "用户管理", "◉"],
+    ["baseData", "基础数据", "▣"],
+    ["settings", "设置", "⚙"],
+    ["audit", "操作记录", "◎"]
+  ].filter(([key]) => canMenu(key));
   return `
     <section class="layout">
       <aside class="sidebar">
@@ -678,7 +1231,7 @@ function renderShell() {
             <span class="avatar">${user.name.slice(0, 1).toUpperCase()}</span>
             <div>
               <strong>${user.name}</strong>
-              <span>${isUserViewMode() ? "普通用户视角" : user.role === "admin" ? "管理员" : "普通用户"}${isMultiDepartment() ? ` · ${user.department}` : ""}</span>
+              <span>${isUserViewMode() ? "普通用户视角" : user.roleName || roleLabel(user.roleId || user.role)}${isMultiDepartment() ? ` · ${user.department}` : ""}</span>
             </div>
           </div>
           ${!isAdmin() ? renderAdminRequestControl() : ""}
@@ -695,7 +1248,7 @@ function renderShell() {
           </div>
           <div class="topbar-actions">
             ${view === "assets" ? renderAssetTopbarActions() : ""}
-            ${isAdmin() ? renderMessageCenter() : ""}
+            ${can("asset_requests.manage") || can("users.manage") ? renderMessageCenter() : ""}
           </div>
         </header>
         ${renderView()}
@@ -711,7 +1264,7 @@ function renderAssetTopbarActions() {
       <button class="secondary" id="downloadAssets" type="button">下载资产表</button>
       <button class="secondary" id="printAssets" type="button">打印资产表</button>
       <button class="secondary" id="exportPrintTemplates" type="button">导出模板单</button>
-      ${isAdmin() ? `<button class="primary" id="openAssetDrawer" type="button">+ 新增资产</button>` : ""}
+      ${can("assets.manage") ? `<button class="primary" id="openAssetDrawer" type="button">+ 新增资产</button>` : ""}
     </div>
   `;
 }
@@ -762,6 +1315,10 @@ function pageTitle() {
   return {
     dashboard: "业务总览",
     assets: "资产状态",
+    inventory: "库存管理",
+    checks: "盘点管理",
+    orders: "业务单据",
+    reports: "报表统计",
     assetRequests: isAdmin() ? "资产申请管理" : "申请资产",
     purchaseWishes: isAdmin() ? "采购需求清单" : "我的需求清单",
     records: isAdmin() ? "出入库登记" : "我的出入库状态",
@@ -777,6 +1334,10 @@ function pageSubtitle() {
   return {
     dashboard: "从数据库读取库存、出库、纸质单据和近期操作。",
     assets: "管理员可打印资产表，普通用户仅看与自己相关资产。",
+    inventory: "针对易耗品查看当前库存、安全库存、流水、预警和库存调整。",
+    checks: "按位置、分类、责任人或状态生成盘点任务，录入实际结果并生成差异。",
+    orders: "办理正式领用、借用归还、调拨、维修和报废流程。",
+    reports: "按资产总账、分类、部门、位置、责任人、流水和盘点差异导出报表。",
     assetRequests: isAdmin() ? "处理普通用户提交的资产领用申请。" : "填写需要领用的资产、数量和用途，等待管理员处理。",
     purchaseWishes: isAdmin() ? "汇总每个人下一年度想要或需要的设备，为预算和采购提供参考。" : "写下自己希望采购或补充的设备，管理员会用于预算和采购参考。",
     records: "登记入库时间、出库时间、经办人和纸质单据编号。",
@@ -792,6 +1353,10 @@ function renderView() {
   return {
     dashboard: renderDashboard,
     assets: renderAssets,
+    inventory: renderInventory,
+    checks: renderInventoryChecks,
+    orders: renderOrders,
+    reports: renderReports,
     assetRequests: renderAssetRequests,
     purchaseWishes: renderPurchaseWishes,
     records: renderRecords,
@@ -932,6 +1497,7 @@ function renderAssets() {
   const groups = filteredAssetGroups();
   const printableAssets = filteredAssets();
   const keeperOptions = selectableUsers().map((user) => `<option value="${user.id}" ${assetKeeperFilter === user.id ? "selected" : ""}>${user.name}</option>`).join("");
+  const borrowerOptions = selectableUsers().map((user) => `<option value="${user.id}" ${assetBorrowerFilter === user.id ? "selected" : ""}>${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("");
   return `
     <section class="asset-workspace">
       <div class="asset-filter-bar no-print">
@@ -946,6 +1512,10 @@ function renderAssets() {
         <select id="assetKeeperFilter">
           <option value="all" ${assetKeeperFilter === "all" ? "selected" : ""}>保管人：全部</option>
           ${keeperOptions}
+        </select>
+        <select id="assetBorrowerFilter">
+          <option value="all" ${assetBorrowerFilter === "all" ? "selected" : ""}>查看出借详情：全部人员</option>
+          ${borrowerOptions}
         </select>
         <select id="assetSortField">
           <option value="model" ${assetSortField === "model" ? "selected" : ""}>排序：型号/规格</option>
@@ -964,6 +1534,7 @@ function renderAssets() {
         </select>
         <button class="secondary" id="clearAssetSelection" type="button">重置</button>
       </div>
+      ${renderBorrowerDetailPanel()}
       <div class="asset-list-panel">
         <div class="asset-list-title">
           <h3>资产列表</h3>
@@ -973,7 +1544,7 @@ function renderAssets() {
         <table>
           <thead>
             <tr>
-              <th>型号/规格</th><th>类别</th><th>数量</th><th>位置</th><th>状态</th><th>当前使用/保管</th><th>入库详情</th><th>出库详情</th><th>文件来源</th>${isAdmin() ? "<th>操作</th>" : ""}
+              <th>型号/规格</th><th>类别</th><th>数量</th><th>位置</th><th>状态</th><th>当前使用/保管</th><th>入库详情</th><th>出库详情</th><th>文件来源</th><th>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -988,21 +1559,534 @@ function renderAssets() {
                 <td>${assetGroupRecordDetail(group, "入库")}</td>
                 <td>${assetGroupRecordDetail(group, "出库")}</td>
                 <td>${assetGroupSourceFiles(group)}</td>
-                ${isAdmin() ? `<td><div class="row-actions">${group.count === 1 ? `<button class="ghost small" data-edit-asset="${group.id}" type="button">编辑</button><button class="danger small" data-delete-asset="${group.id}" type="button">删除</button>` : `<span class="mini-meta">已按型号归类</span>`}</div></td>` : ""}
+                ${can("assets.manage") ? `<td><div class="row-actions"><button class="ghost small" data-view-asset="${group.id}" type="button">详情</button>${group.count === 1 ? `<button class="ghost small" data-edit-asset="${group.id}" type="button">编辑</button><button class="danger small" data-delete-asset="${group.id}" type="button">删除</button>` : `<span class="mini-meta">已按型号归类</span>`}</div></td>` : `<td><button class="ghost small" data-view-asset="${group.id}" type="button">详情</button></td>`}
               </tr>
-            `).join("") || `<tr><td colspan="${isAdmin() ? 10 : 9}" class="empty">暂无资产</td></tr>`}
+            `).join("") || `<tr><td colspan="10" class="empty">暂无资产</td></tr>`}
           </tbody>
         </table>
       </div>
       </div>
     </section>
     ${renderPrintableAssetSheets(printableAssets)}
-    ${isAdmin() && assetDrawerOpen ? renderAssetDrawer() : ""}
+    ${can("assets.manage") && assetDrawerOpen ? renderAssetDrawer() : ""}
+    ${selectedAssetDetailId ? renderAssetDetailDrawer() : ""}
+  `;
+}
+
+function inventoryItems() {
+  return state.assets
+    .filter((asset) => assetKind(asset) === "耗材")
+    .filter((asset) => assetMatches(asset, inventoryFilter))
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh-Hans-CN", { numeric: true, sensitivity: "base" }));
+}
+
+function inventoryRecords(type = "") {
+  const consumableIds = new Set(state.assets.filter((asset) => assetKind(asset) === "耗材").map((asset) => asset.id));
+  return state.records
+    .filter((record) => consumableIds.has(record.assetId))
+    .filter((record) => !type || record.type === type)
+    .filter((record) => recordMatches(record, inventoryFilter))
+    .sort((a, b) => recordMillis(b) - recordMillis(a));
+}
+
+function stockLevel(asset) {
+  const quantity = Number(asset.quantity || 0);
+  const safeStock = Number(asset.safeStock || 0);
+  if (safeStock > 0 && quantity <= safeStock) return "warn";
+  if (quantity <= 0) return "bad";
+  return "ok";
+}
+
+function stockLevelText(asset) {
+  const level = stockLevel(asset);
+  if (level === "bad") return `<span class="badge bad">无库存</span>`;
+  if (level === "warn") return `<span class="badge warn">低于安全库存</span>`;
+  return `<span class="badge ok">正常</span>`;
+}
+
+function lendableStatusBadge(asset) {
+  if (asset.status === "retired") return `<span class="badge bad">不可出借</span>`;
+  if (asset.status === "repair") return `<span class="badge warn">维修中</span>`;
+  return `<span class="badge ok">可出借</span>`;
+}
+
+function renderInventoryFlow(records, emptyText) {
+  return `
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>耗材</th><th>数量</th><th>经办/领用人</th><th>单号</th><th>备注</th></tr></thead>
+        <tbody>
+          ${records.map((record) => `
+            <tr>
+              <td>${fmt(record.type === "入库" ? record.inTime : record.outTime)}</td>
+              <td>${assetName(record.assetId)}</td>
+              <td>${record.quantity}</td>
+              <td>${userName(record.userId)}</td>
+              <td>${blank(record.paperNo)}</td>
+              <td>${recordDisplayNote(record)}</td>
+            </tr>
+          `).join("") || `<tr><td colspan="6" class="empty">${emptyText}</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderInventory() {
+  const items = inventoryItems();
+  const blockedItems = items.filter((asset) => asset.status === "retired" || asset.status === "repair");
+  const inboundRecords = inventoryRecords("入库");
+  const outboundRecords = inventoryRecords("出库");
+  const lendableCount = items.length - blockedItems.length;
+  const itemOptions = items.map((asset) => `<option value="${asset.id}">${asset.name}${asset.spec ? ` · ${asset.spec}` : ""}（可出借）</option>`).join("");
+  return `
+    <section class="asset-workspace">
+      <div class="asset-filter-bar no-print">
+        <input id="inventorySearch" placeholder="搜索耗材名称 / 类别 / 规格 / 流水备注" value="${inventoryFilter}" />
+        <button class="secondary" id="clearInventorySearch" type="button">重置</button>
+      </div>
+      <div class="stats">
+        <div class="stat"><span>物品种类</span><strong>${items.length}</strong><em>当前纳入出借管理</em></div>
+        <div class="stat"><span>当前库存</span><strong>-</strong><em>不按仓库数量汇总</em></div>
+        <div class="stat"><span>可出借</span><strong>${lendableCount}</strong><em>维修/报废除外</em></div>
+        <div class="stat"><span>流水记录</span><strong>${inboundRecords.length + outboundRecords.length}</strong><em>入库 + 出库</em></div>
+      </div>
+      ${can("inventory.manage") ? `
+        <section class="panel">
+          <div class="section-title"><h2>库存调整</h2><span class="hint">用于盘点修正、损耗、补录等场景，会同步生成流水。</span></div>
+          <form id="inventoryAdjustForm" class="form-grid">
+            <div class="field"><label>耗材</label><select name="assetId" required>${itemOptions}</select></div>
+            <div class="field"><label>调整类型</label><select name="mode"><option value="increase">增加库存</option><option value="decrease">减少库存</option></select></div>
+            <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
+            <div class="field"><label>经办/领用人</label><select name="userId">${selectableUsers().map((user) => `<option value="${user.id}">${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("")}</select></div>
+            <div class="field"><label>单号</label><input name="paperNo" placeholder="可选" /></div>
+            <div class="field"><label>原因</label><input name="reason" placeholder="盘点调整 / 损耗 / 补录" /></div>
+            <div class="actions form-grid wide"><button class="primary" type="submit">保存调整</button></div>
+          </form>
+        </section>
+      ` : ""}
+      <section class="panel">
+        <div class="section-title"><h2>当前库存</h2><span class="hint">此处不统计仓库数量，只判断是否可出借。</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>耗材</th><th>类别</th><th>规格</th><th>当前库存</th><th>安全库存</th><th>位置</th><th>状态</th>${can("inventory.manage") ? "<th>操作</th>" : ""}</tr></thead>
+            <tbody>
+              ${items.map((asset) => `
+                <tr>
+                  <td><strong>${asset.name}</strong><div class="mini-meta">${asset.code}</div></td>
+                  <td>${blank(asset.category)}</td>
+                  <td>${blank(asset.spec)}</td>
+                  <td>-</td>
+                  <td>-</td>
+                  <td>-</td>
+                  <td>${lendableStatusBadge(asset)}</td>
+                  ${can("inventory.manage") ? `<td><span class="mini-meta">按出借管理</span></td>` : ""}
+                </tr>
+              `).join("") || `<tr><td colspan="${can("inventory.manage") ? 8 : 7}" class="empty">暂无耗材库存</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="section-title"><h2>不可出借清单</h2><span class="hint">只显示维修中或已报废的物品。</span></div>
+        <div class="record-list">
+          ${blockedItems.map((asset) => `
+            <article class="record-card">
+              <div class="card-head"><strong>${asset.name}</strong>${lendableStatusBadge(asset)}</div>
+              <p>当前库存：-，安全库存：-，位置：-</p>
+            </article>
+          `).join("") || `<div class="empty">暂无不可出借物品</div>`}
+        </div>
+      </section>
+      <section class="grid">
+        <div class="panel">
+          <div class="section-title"><h2>入库流水</h2><span class="hint">${inboundRecords.length} 条</span></div>
+          ${renderInventoryFlow(inboundRecords, "暂无入库流水")}
+        </div>
+        <div class="panel">
+          <div class="section-title"><h2>出库流水</h2><span class="hint">${outboundRecords.length} 条</span></div>
+          ${renderInventoryFlow(outboundRecords, "暂无出库流水")}
+        </div>
+      </section>
+    </section>
+  `;
+}
+
+function checkTaskItems(taskId) {
+  return (state.inventoryCheckItems || []).filter((item) => item.taskId === taskId);
+}
+
+function checkDiffBadge(diffType) {
+  const text = diffType || "未盘点";
+  const cls = text === "正常" ? "ok" : text === "未盘点" ? "warn" : "bad";
+  return `<span class="badge ${cls}">${text}</span>`;
+}
+
+function statusSelectOptions(selected) {
+  return [
+    ["in_stock", "在库"],
+    ["checked_out", "借出/出库"],
+    ["repair", "维修中"],
+    ["retired", "报废"]
+  ].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
+}
+
+function renderInventoryChecks() {
+  if (!can("checks.view")) return "";
+  const tasks = state.inventoryCheckTasks || [];
+  const activeTask = tasks[0];
+  const locationOptions = locations().map((location) => `<option value="${location.name}">${location.name}</option>`).join("");
+  const categoryOptions = assetCategories().map((category) => `<option value="${category}">${category}</option>`).join("");
+  const keeperOptions = selectableUsers().map((user) => `<option value="${user.id}">${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("");
+  const statusOptions = statusSelectOptions("");
+  const items = activeTask ? checkTaskItems(activeTask.id) : [];
+  const checked = items.filter((item) => item.checked).length;
+  const abnormal = items.filter((item) => item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点").length;
+  return `
+    <section class="panel">
+      <div class="section-title"><h2>创建盘点任务</h2><span class="hint">一期先支持按范围生成资产清单，再人工录入实际结果。</span></div>
+      <form id="inventoryCheckForm" class="form-grid">
+        <div class="field"><label>盘点范围</label><select name="scopeType" id="checkScopeType"><option value="all">全部资产</option><option value="location">按位置</option><option value="category">按分类</option><option value="keeper">按责任人</option><option value="status">按状态</option></select></div>
+        <div class="field"><label>范围值</label><select name="scopeValue" id="checkScopeValue"><option value="">全部</option>${locationOptions}</select></div>
+        <div class="field"><label>负责人</label><select name="ownerId">${keeperOptions}</select></div>
+        <div class="field wide"><label>备注</label><input name="remark" placeholder="例如：2026 春季实验室资产盘点" /></div>
+        <button class="primary" type="submit">生成盘点任务</button>
+      </form>
+      <template id="checkScopeOptions">
+        <select data-scope="location"><option value="">全部位置</option>${locationOptions}</select>
+        <select data-scope="category"><option value="">全部分类</option>${categoryOptions}</select>
+        <select data-scope="keeper"><option value="">全部责任人</option>${keeperOptions}</select>
+        <select data-scope="status"><option value="">全部状态</option>${statusOptions}</select>
+        <select data-scope="all"><option value="">全部</option></select>
+      </template>
+    </section>
+    <section class="panel">
+      <div class="section-title">
+        <h2>盘点任务</h2>
+        <span class="hint">共 ${tasks.length} 个任务</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>盘点单号</th><th>范围</th><th>负责人</th><th>开始</th><th>结束</th><th>状态</th><th>进度</th><th>异常</th><th>操作</th></tr></thead>
+          <tbody>
+            ${tasks.map((task) => {
+              const taskItems = checkTaskItems(task.id);
+              const taskChecked = taskItems.filter((item) => item.checked).length;
+              const taskAbnormal = taskItems.filter((item) => item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点").length;
+              return `
+                <tr>
+                  <td>${task.checkNo}</td>
+                  <td>${task.scopeType} ${task.scopeValue || "全部"}</td>
+                  <td>${userName(task.ownerId)}</td>
+                  <td>${fmt(task.startTime)}</td>
+                  <td>${fmt(task.endTime)}</td>
+                  <td>${requestStatusBadge(task.status)}</td>
+                  <td>${taskChecked}/${taskItems.length}</td>
+                  <td>${taskAbnormal}</td>
+                  <td><div class="row-actions">${task.status !== "已完成" && can("checks.manage") ? `<button class="secondary small" data-complete-check="${task.id}" type="button">完成</button>` : ""}${can("reports.export") ? `<button class="ghost small" data-export-check="${task.id}" type="button">导出</button>` : ""}</div></td>
+                </tr>
+              `;
+            }).join("") || `<tr><td colspan="9" class="empty">暂无盘点任务</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    ${activeTask ? `
+      ${can("checks.manage") ? `
+      <section class="panel">
+        <div class="section-title"><h2>扫码盘点 / 盘盈录入</h2><span class="hint">扫码内容可以是资产二维码链接或资产编号。</span></div>
+        <form id="checkScanForm" class="form-grid">
+          <div class="field wide"><label>扫码内容</label><input name="scanText" required placeholder="粘贴资产二维码内容或资产编号" /></div>
+          <input type="hidden" name="taskId" value="${activeTask.id}" />
+          <div class="field"><label>实际位置</label><select name="actualLocation">${locationOptions()}</select></div>
+          <div class="field"><label>实际状态</label><select name="actualStatus">${statusSelectOptions("")}</select></div>
+          <div class="field"><label>实际责任人</label><select name="actualKeeperId">${userOptions()}</select></div>
+          <div class="field"><label>备注</label><input name="remark" placeholder="扫码盘点" /></div>
+          <div class="setting-actions"><button class="primary" type="submit">提交扫码结果</button><button class="secondary" id="startCheckQrScanner" type="button">摄像头扫码</button></div>
+        </form>
+        <form id="checkSurplusForm" class="form-grid">
+          <input type="hidden" name="taskId" value="${activeTask.id}" />
+          <div class="field"><label>盘盈资产名称</label><input name="name" required placeholder="现场发现但系统无记录的资产" /></div>
+          <div class="field"><label>编号</label><input name="code" placeholder="留空自动生成" /></div>
+          <div class="field"><label>分类</label><select name="category">${assetCategories().map((category) => `<option value="${category}">${category}</option>`).join("")}</select></div>
+          <div class="field"><label>位置</label><select name="location">${locationOptions()}</select></div>
+          <div class="field"><label>责任人</label><select name="keeperId">${userOptions()}</select></div>
+          <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" /></div>
+          <div class="field wide"><label>备注</label><input name="remark" placeholder="盘盈说明" /></div>
+          <button class="secondary" type="submit">录入盘盈</button>
+        </form>
+      </section>` : ""}
+      <section class="panel">
+        <div class="section-title"><h2>最新任务明细：${activeTask.checkNo}</h2><span class="hint">已盘 ${checked}/${items.length}，异常 ${abnormal}</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>资产</th><th>系统位置</th><th>实际位置</th><th>系统状态</th><th>实际状态</th><th>系统责任人</th><th>实际责任人</th><th>差异</th><th>备注</th><th>操作</th></tr></thead>
+            <tbody>
+              ${items.map((item) => {
+                const asset = state.assets.find((entry) => entry.id === item.assetId) || {};
+                return `
+                  <tr>
+                    <td><strong>${asset.name || "未知资产"}</strong><div class="mini-meta">${asset.code || item.assetId}</div></td>
+                    <td>${blank(item.systemLocation)}</td>
+                    <td><select data-check-location="${item.id}">${locations().map((location) => `<option value="${location.name}" ${(item.actualLocation || item.systemLocation) === location.name ? "selected" : ""}>${location.name}</option>`).join("")}</select></td>
+                    <td>${statusBadge(item.systemStatus)}</td>
+                    <td><select data-check-status="${item.id}">${statusSelectOptions(item.actualStatus || item.systemStatus)}</select></td>
+                    <td>${userName(item.systemKeeperId)}</td>
+                    <td><select data-check-keeper="${item.id}">${selectableUsers().map((user) => `<option value="${user.id}" ${(item.actualKeeperId || item.systemKeeperId) === user.id ? "selected" : ""}>${user.name}</option>`).join("")}</select></td>
+                    <td>${checkDiffBadge(item.diffType)}</td>
+                    <td><input data-check-remark="${item.id}" value="${item.remark || ""}" placeholder="备注" /></td>
+                    <td><button class="secondary small" data-save-check-item="${item.id}" type="button">保存</button></td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    ` : ""}
+  `;
+}
+
+function availableOrderAssets() {
+  return state.assets.filter((asset) => asset.status !== "retired");
+}
+
+function assetOptions(selected = "") {
+  return availableOrderAssets().map((asset) => `<option value="${asset.id}" ${selected === asset.id ? "selected" : ""}>${asset.name} · ${asset.code} · ${statusText(asset.status)}</option>`).join("");
+}
+
+function userOptions(selected = "") {
+  return selectableUsers().map((user) => `<option value="${user.id}" ${selected === user.id ? "selected" : ""}>${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("");
+}
+
+function locationOptions(selected = "") {
+  return locations().map((location) => `<option value="${location.name}" ${selected === location.name ? "selected" : ""}>${location.name}</option>`).join("");
+}
+
+function departmentOptions(selected = "") {
+  return departments().map((department) => `<option value="${department}" ${selected === department ? "selected" : ""}>${department}</option>`).join("");
+}
+
+function renderOrders() {
+  const canManage = can("orders.manage");
+  return `
+    ${canManage ? `
+      <section class="panel">
+        <div class="mode-tabs" role="tablist" aria-label="业务单据类型">
+          ${[
+            ["claim", "领用单"],
+            ["borrow", "借用单"],
+            ["transfer", "调拨单"],
+            ["repair", "维修单"],
+            ["scrap", "报废单"]
+          ].map(([key, label]) => `<button class="${orderType === key ? "active" : ""}" data-order-type="${key}" type="button">${label}</button>`).join("")}
+        </div>
+        ${renderOrderForm()}
+      </section>
+    ` : ""}
+    <section class="grid">
+      ${renderBorrowOrderList()}
+      ${renderTransferOrderList()}
+      ${renderRepairOrderList()}
+      ${renderScrapOrderList()}
+    </section>
+  `;
+}
+
+function renderReports() {
+  if (!can("reports.view")) return "";
+  const reportItems = [
+    ["ledger", "资产总账", "完整台账字段"],
+    ["category", "分类统计", "按分类汇总数量和金额"],
+    ["department", "部门统计", "按使用部门汇总"],
+    ["location", "位置统计", "按存放位置汇总"],
+    ["responsible", "责任人统计", "按使用人汇总"],
+    ["claim", "领用明细", "领用/出库明细"],
+    ["borrow", "借还明细", "借出与归还记录"],
+    ["inbound", "入库明细", "入库记录"],
+    ["outbound", "出库明细", "出库记录"],
+    ["scrap", "报废资产清单", "已报废资产"],
+    ["consumable-warning", "耗材库存预警", "低于安全库存的耗材"]
+  ];
+  const latestTask = (state.inventoryCheckTasks || [])[0];
+  return `
+    <section class="panel">
+      <div class="section-title"><h2>报表导出</h2><span class="hint">导出 CSV，可直接用 Excel 打开。</span></div>
+      <div class="report-grid">
+        ${reportItems.map(([key, title, desc]) => `
+          <article class="report-card">
+            <div><strong>${title}</strong><p class="hint">${desc}</p></div>
+            <button class="secondary small" data-export-report="${key}" type="button">导出</button>
+          </article>
+        `).join("")}
+        <article class="report-card">
+          <div><strong>盘点差异报告</strong><p class="hint">${latestTask ? `最新任务 ${latestTask.checkNo}` : "暂无盘点任务"}</p></div>
+          ${latestTask ? `<button class="secondary small" data-export-check="${latestTask.id}" type="button">导出</button>` : `<span class="hint">无任务</span>`}
+        </article>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="section-title"><h2>当前统计预览</h2></div>
+      <div class="stats compact">
+        ${dashboardStatCard("资产总数", state.assets.length, "台账条目", "▦")}
+        ${dashboardStatCard("总金额", state.assets.reduce((sum, item) => sum + Number(item.totalAmount || 0), 0).toFixed(2), "按台账总金额", "￥")}
+        ${dashboardStatCard("报废资产", state.assets.filter((item) => item.status === "retired").length, "禁止领用/借用/调拨", "×")}
+        ${dashboardStatCard("耗材预警", inventoryItems().filter((asset) => stockLevel(asset) !== "ok").length, "低于安全库存", "!")}
+      </div>
+    </section>
+  `;
+}
+
+function renderOrderForm() {
+  const assets = assetOptions();
+  if (!assets) return `<div class="empty">暂无可办理业务的资产</div>`;
+  if (orderType === "claim") {
+    return `
+      <form id="claimOrderForm" class="form-grid">
+        <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+        <div class="field"><label>领用人</label><select name="userId" required>${userOptions()}</select></div>
+        <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
+        <div class="field"><label>领用后位置</label><select name="location">${locationOptions()}</select></div>
+        <label class="check-line field-check"><input name="skipQuantity" type="checkbox" /><span>不统计数量</span></label>
+        <div class="field wide"><label>用途 / 备注</label><input name="note" placeholder="领用用途、审批意见或验收说明" /></div>
+        <button class="primary" type="submit">办理领用</button>
+      </form>
+    `;
+  }
+  if (orderType === "borrow") {
+    return `
+      <form id="borrowOrderForm" class="form-grid">
+        <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+        <div class="field"><label>借用人</label><select name="borrowerId" required>${userOptions()}</select></div>
+        <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
+        <div class="field"><label>预计归还日期</label><input name="expectedReturnDate" type="date" /></div>
+        <div class="field"><label>借用位置</label><select name="location">${locationOptions()}</select></div>
+        <label class="check-line field-check"><input name="skipQuantity" type="checkbox" /><span>不统计数量</span></label>
+        <div class="field wide"><label>借用说明</label><input name="note" placeholder="用途、审批意见或注意事项" /></div>
+        <button class="primary" type="submit">办理借用</button>
+      </form>
+    `;
+  }
+  if (orderType === "transfer") {
+    return `
+      <form id="transferOrderForm" class="form-grid">
+        <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+        <div class="field"><label>新部门</label><select name="newDepartment" required>${departmentOptions()}</select></div>
+        <div class="field"><label>新位置</label><select name="newLocation" required>${locationOptions()}</select></div>
+        <div class="field"><label>新责任人</label><select name="newKeeperId" required>${userOptions()}</select></div>
+        <div class="field"><label>调拨日期</label><input name="transferDate" type="date" value="${new Date().toISOString().slice(0, 10)}" /></div>
+        <div class="field wide"><label>调拨原因</label><input name="reason" placeholder="部门调整、位置调整、项目需要等" /></div>
+        <button class="primary" type="submit">办理调拨</button>
+      </form>
+    `;
+  }
+  if (orderType === "repair") {
+    return `
+      <form id="repairOrderForm" class="form-grid">
+        <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+        <div class="field"><label>报修人</label><select name="reporterId" required>${userOptions(state.currentUser.id)}</select></div>
+        <div class="field"><label>维修人 / 单位</label><input name="repairer" placeholder="内部维修人或外部维修单位" /></div>
+        <div class="field"><label>预计费用</label><input name="cost" type="number" min="0" step="0.01" value="0" /></div>
+        <div class="field wide"><label>故障描述</label><input name="faultDesc" required placeholder="故障现象、报修原因" /></div>
+        <button class="primary" type="submit">创建维修单</button>
+      </form>
+    `;
+  }
+  return `
+    <form id="scrapOrderForm" class="form-grid">
+      <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+      <div class="field"><label>申请人</label><select name="applicantId" required>${userOptions(state.currentUser.id)}</select></div>
+      <div class="field"><label>残值</label><input name="residualValue" type="number" min="0" step="0.01" value="0" /></div>
+      <div class="field"><label>报废日期</label><input name="scrapDate" type="date" value="${new Date().toISOString().slice(0, 10)}" /></div>
+      <div class="field wide"><label>报废原因</label><input name="reason" required placeholder="损坏无法维修、超过使用年限等" /></div>
+      <button class="danger" type="submit">办理报废</button>
+    </form>
+  `;
+}
+
+function overdueBadge(order) {
+  if (order.status === "已归还") return requestStatusBadge("已归还");
+  if (order.expectedReturnDate && new Date(order.expectedReturnDate).getTime() < Date.now()) {
+    return `<span class="badge bad">逾期</span>`;
+  }
+  return requestStatusBadge(order.status);
+}
+
+function renderBorrowOrderList() {
+  const orders = state.borrowOrders || [];
+  return `
+    <section class="panel">
+      <div class="section-title"><h2>领用 / 借用单</h2><span class="hint">${orders.length} 条</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>单号</th><th>资产</th><th>人员</th><th>数量</th><th>预计归还</th><th>实际归还</th><th>状态</th><th>验收</th><th>操作</th></tr></thead>
+          <tbody>
+            ${orders.map((item) => `
+              <tr>
+                <td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${userName(item.borrowerId)}</td><td>${item.quantity || 1}${item.countQuantity === false ? `<div class="mini-meta">不计数</div>` : ""}</td><td>${blank(item.expectedReturnDate)}</td><td>${blank(item.actualReturnDate)}</td><td>${overdueBadge(item)}</td><td>${blank(item.returnCheck)}</td>
+                <td>${can("orders.manage") && item.status !== "已归还" ? `<button class="secondary small" data-return-borrow="${item.id}" type="button">归还验收</button>` : "-"}</td>
+              </tr>
+            `).join("") || `<tr><td colspan="9" class="empty">暂无领用或借用单</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderTransferOrderList() {
+  const orders = state.transferOrders || [];
+  return `
+    <section class="panel">
+      <div class="section-title"><h2>调拨单</h2><span class="hint">${orders.length} 条</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>单号</th><th>资产</th><th>原部门/位置</th><th>新部门/位置</th><th>新责任人</th><th>原因</th><th>状态</th></tr></thead>
+          <tbody>
+            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${blank(item.oldDepartment)} / ${blank(item.oldLocation)}</td><td>${blank(item.newDepartment)} / ${blank(item.newLocation)}</td><td>${userName(item.newKeeperId)}</td><td>${blank(item.reason)}</td><td>${requestStatusBadge(item.status)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无调拨单</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderRepairOrderList() {
+  const orders = state.repairOrders || [];
+  return `
+    <section class="panel">
+      <div class="section-title"><h2>维修单</h2><span class="hint">${orders.length} 条</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>单号</th><th>资产</th><th>状态</th><th>维修人</th><th>费用</th><th>故障/结果</th><th>操作</th></tr></thead>
+          <tbody>
+            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.repairer)}</td><td>${Number(item.cost || 0).toFixed(2)}</td><td>${blank(item.result || item.faultDesc)}</td><td>${can("orders.manage") && item.status !== "已完成" ? `<button class="secondary small" data-finish-repair="${item.id}" type="button">完成</button>` : "-"}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无维修单</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderScrapOrderList() {
+  const orders = state.scrapOrders || [];
+  return `
+    <section class="panel">
+      <div class="section-title"><h2>报废单</h2><span class="hint">${orders.length} 条</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>单号</th><th>资产</th><th>申请人</th><th>报废日期</th><th>残值</th><th>状态</th><th>原因</th></tr></thead>
+          <tbody>
+            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${userName(item.applicantId)}</td><td>${blank(item.scrapDate)}</td><td>${Number(item.residualValue || 0).toFixed(2)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.reason)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无报废单</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
   `;
 }
 
 function renderBaseData() {
-  if (!isAdmin()) return "";
+  if (!can("base_data.view")) return "";
   return `
     <section class="panel">
       <div class="section-title">
@@ -1011,40 +2095,100 @@ function renderBaseData() {
       </div>
       ${renderAssetCategoryManager()}
     </section>
+    <section class="panel">
+      <div class="section-title">
+        <h2>位置管理</h2>
+        <span class="hint">维护校区、楼栋、教室、办公室、实验室、仓库等资产存放位置。</span>
+      </div>
+      ${renderLocationManager()}
+    </section>
   `;
 }
 
 function renderAssetCategoryManager() {
-  const categories = assetCategories();
+  const categories = assetCategoryItems();
+  const parentOptions = [`<option value="">无父级（一级分类）</option>`]
+    .concat(categories.map((category) => `<option value="${category.id}">${treeLabel(categories, category)}</option>`))
+    .join("");
   return `
     <div class="asset-category-manager no-print">
-      <form id="addAssetCategoryForm" class="category-form">
-        <div class="field">
-          <label>新增类别</label>
-          <input name="category" required placeholder="例如：网络设备 / 办公设备 / 工具" />
-        </div>
-        <div class="setting-actions">
-          <button class="primary" type="submit">添加类别</button>
-        </div>
+      <form id="assetCategoryForm" class="form-grid">
+        <input type="hidden" name="categoryId" />
+        <div class="field"><label>分类名称</label><input name="name" required placeholder="例如：电脑设备 / 打印耗材" /></div>
+        <div class="field"><label>分类编码</label><input name="code" placeholder="例如：DN / HC" /></div>
+        <div class="field"><label>分类类型</label><select name="categoryType"><option value="固定资产">固定资产</option><option value="低值品">低值品</option><option value="耗材">耗材</option></select></div>
+        <div class="field"><label>父级分类</label><select name="parentId">${parentOptions}</select></div>
+        <div class="setting-actions"><button class="primary" type="submit">保存分类</button><button class="ghost" id="resetCategoryForm" type="button">清空</button></div>
       </form>
-      <div class="category-list">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>分类名称</th><th>父级</th><th>编码</th><th>类型</th><th>资产数量</th><th>操作</th></tr></thead>
+          <tbody>
         ${categories.map((category) => {
-          const count = state.assets.filter((asset) => asset.category === category).length;
+          const count = state.assets.filter((asset) => asset.category === category.name).length;
           return `
-            <article class="category-item">
-              <div>
-                <strong>${category}</strong>
-                <span class="hint">${count} 个资产使用</span>
-              </div>
-              <div class="row-actions">
-                <button class="ghost small" data-category-edit="${category}" type="button">编辑</button>
-                <button class="danger small" data-category-delete="${category}" type="button">删除</button>
-              </div>
-            </article>
+            <tr>
+              <td><strong>${treeLabel(categories, category)}</strong></td>
+              <td>${category.parent_id ? categoryName(category.parent_id) : "-"}</td>
+              <td>${blank(category.code)}</td>
+              <td>${blank(category.category_type)}</td>
+              <td>${count}</td>
+              <td><div class="row-actions"><button class="ghost small" data-category-edit="${category.id}" type="button">编辑</button><button class="danger small" data-category-delete="${category.id}" type="button">删除</button></div></td>
+            </tr>
           `;
-        }).join("")}
+        }).join("") || `<tr><td colspan="6" class="empty">暂无分类</td></tr>`}
+          </tbody>
+        </table>
       </div>
-      <p class="hint">删除类别前需要确保没有资产使用该类别；编辑类别会同步更新已有资产、资产申请和采购需求中的类别。</p>
+      <p class="hint">分类编码用于自动生成资产编号，例如：XXZX-DN-2026-0001。删除分类前需要确保没有资产或子分类使用。</p>
+    </div>
+  `;
+}
+
+function renderLocationManager() {
+  const items = locations();
+  const parentOptions = [`<option value="">无父级（校区/独立位置）</option>`]
+    .concat(items.map((location) => `<option value="${location.id}">${treeLabel(items, location)}</option>`))
+    .join("");
+  const managerOptions = [`<option value="">未指定</option>`]
+    .concat(selectableUsers().map((user) => `<option value="${user.id}">${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`))
+    .join("");
+  const typeOptions = ["校区", "楼栋", "楼层", "教室", "办公室", "实验室", "仓库", "图书室", "体育器材室"];
+  return `
+    <div class="asset-category-manager no-print">
+      <form id="locationForm" class="form-grid">
+        <input type="hidden" name="locationId" />
+        <div class="field"><label>位置名称</label><input name="name" required placeholder="例如：总仓库 / 实验楼 301" /></div>
+        <div class="field"><label>父级位置</label><select name="parentId">${parentOptions}</select></div>
+        <div class="field"><label>位置类型</label><select name="type">${typeOptions.map((type) => `<option value="${type}">${type}</option>`).join("")}</select></div>
+        <div class="field"><label>位置编码</label><input name="code" placeholder="例如：LAB-301" /></div>
+        <div class="field"><label>负责人</label><select name="managerId">${managerOptions}</select></div>
+        <div class="field"><label>备注</label><input name="remark" placeholder="可选" /></div>
+        <div class="setting-actions"><button class="primary" type="submit">保存位置</button><button class="ghost" id="resetLocationForm" type="button">清空</button></div>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>位置名称</th><th>父级</th><th>类型</th><th>编码</th><th>负责人</th><th>资产数量</th><th>备注</th><th>操作</th></tr></thead>
+          <tbody>
+            ${items.map((location) => {
+              const count = state.assets.filter((asset) => asset.location === location.name).length;
+              return `
+                <tr>
+                  <td><strong>${treeLabel(items, location)}</strong></td>
+                  <td>${location.parent_id ? locations().find((item) => item.id === location.parent_id)?.name || "-" : "-"}</td>
+                  <td>${blank(location.type)}</td>
+                  <td>${blank(location.code)}</td>
+                  <td>${location.manager_id ? userName(location.manager_id) : "-"}</td>
+                  <td>${count}</td>
+                  <td>${blank(location.remark)}</td>
+                  <td><div class="row-actions"><button class="ghost small" data-location-edit="${location.id}" type="button">编辑</button><button class="danger small" data-location-delete="${location.id}" type="button">删除</button></div></td>
+                </tr>
+              `;
+            }).join("") || `<tr><td colspan="8" class="empty">暂无位置</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      <p class="hint">删除位置前需要确保没有资产正在使用该位置；编辑位置名称会同步更新资产台账。</p>
     </div>
   `;
 }
@@ -1057,6 +2201,14 @@ function renderAssetDrawer() {
     ...(asset.category && !categories.includes(asset.category) ? [asset.category] : []),
     ...categories
   ].map((category) => `<option value="${category}" ${asset.category === category ? "selected" : ""}>${category}</option>`).join("");
+  const locationNames = locations().map((location) => location.name);
+  const locationOptions = [
+    ...(asset.location && !locationNames.includes(asset.location) ? [asset.location] : []),
+    ...locationNames
+  ].map((location) => `<option value="${location}" ${asset.location === location ? "selected" : ""}>${location}</option>`).join("");
+  const userOptions = selectableUsers().map((u) => `<option value="${u.id}" ${(asset.useUserId || asset.keeperId) === u.id ? "selected" : ""}>${u.name}${isMultiDepartment() ? ` · ${u.department}` : ""}</option>`).join("");
+  const keeperOptions = selectableUsers().map((u) => `<option value="${u.id}" ${asset.keeperId === u.id ? "selected" : ""}>${u.name}${isMultiDepartment() ? ` · ${u.department}` : ""}</option>`).join("");
+  const departmentOptions = departments().map((department) => `<option value="${department}" ${(asset.useDepartment || state.currentUser.department) === department ? "selected" : ""}>${department}</option>`).join("");
   return `
     <div class="drawer-backdrop no-print" id="assetDrawerBackdrop"></div>
     <aside class="asset-drawer no-print" aria-label="${isEdit ? "编辑资产" : "新增资产"}">
@@ -1069,11 +2221,22 @@ function renderAssetDrawer() {
         <div class="drawer-body">
           <div class="field"><label>资产编号</label><input name="code" value="${asset.code || ""}" placeholder="自动生成" /></div>
           <div class="field"><label><b>*</b> 资产名称</label><input name="name" required value="${asset.name || ""}" placeholder="请输入资产名称" /></div>
+          <div class="field"><label>品牌</label><input name="brand" value="${asset.brand || ""}" placeholder="品牌 / 厂商" /></div>
           <div class="field"><label><b>*</b> 类别</label><select name="category" required>${categoryOptions}</select></div>
           <div class="field"><label>规格</label><input name="spec" value="${asset.spec || ""}" placeholder="请输入规格型号" /></div>
+          <div class="field"><label>单位</label><input name="unit" value="${asset.unit || "件"}" placeholder="件 / 台 / 套 / 个" /></div>
           <div class="field"><label><b>*</b> 数量</label><input name="quantity" type="number" min="1" value="${asset.quantity || 1}" required placeholder="请输入数量" /></div>
-          <div class="field"><label><b>*</b> 位置</label><input name="location" required value="${asset.location || ""}" placeholder="请输入位置" /></div>
-          <div class="field"><label><b>*</b> 保管人</label><select name="keeperId">${selectableUsers().map((u) => `<option value="${u.id}" ${asset.keeperId === u.id ? "selected" : ""}>${u.name}</option>`).join("")}</select></div>
+          <div class="field"><label>单价</label><input name="unitPrice" type="number" min="0" step="0.01" value="${asset.unitPrice || 0}" /></div>
+          <div class="field"><label>总金额</label><input name="totalAmount" type="number" min="0" step="0.01" value="${asset.totalAmount || 0}" placeholder="留空按数量×单价" /></div>
+          <div class="field"><label>安全库存</label><input name="safeStock" type="number" min="0" value="${asset.safeStock || 0}" placeholder="耗材低于此数量时预警" /></div>
+          <div class="field"><label>购置日期</label><input name="purchaseDate" type="date" value="${asset.purchaseDate || ""}" /></div>
+          <div class="field"><label>入库日期</label><input name="inboundDate" type="date" value="${asset.inboundDate || ""}" /></div>
+          <div class="field"><label>供应商</label><input name="supplier" value="${asset.supplier || ""}" placeholder="供应商 / 供货商" /></div>
+          <div class="field"><label>使用部门</label><select name="useDepartment">${departmentOptions}</select></div>
+          <div class="field"><label>使用人</label><select name="useUserId">${userOptions}</select></div>
+          <div class="field"><label>资产来源</label><select name="source"><option value="" ${!asset.source ? "selected" : ""}>未填写</option><option value="购置" ${asset.source === "购置" ? "selected" : ""}>购置</option><option value="调拨" ${asset.source === "调拨" ? "selected" : ""}>调拨</option><option value="捐赠" ${asset.source === "捐赠" ? "selected" : ""}>捐赠</option><option value="自建" ${asset.source === "自建" ? "selected" : ""}>自建</option><option value="盘盈入账" ${asset.source === "盘盈入账" ? "selected" : ""}>盘盈入账</option></select></div>
+          <div class="field"><label><b>*</b> 位置</label><select name="location" required>${locationOptions}</select></div>
+          <div class="field"><label><b>*</b> 保管人</label><select name="keeperId">${keeperOptions}</select></div>
           <div class="field"><label><b>*</b> 状态</label><select name="status"><option value="in_stock" ${asset.status === "in_stock" || !asset.status ? "selected" : ""}>在库</option><option value="checked_out" ${asset.status === "checked_out" ? "selected" : ""}>出库/出借</option><option value="repair" ${asset.status === "repair" ? "selected" : ""}>维修中</option><option value="retired" ${asset.status === "retired" ? "selected" : ""}>报废</option></select></div>
           <div class="field"><label>备注</label><textarea name="remark" maxlength="200" placeholder="请输入备注（选填）">${asset.remark || ""}</textarea></div>
         </div>
@@ -1086,6 +2249,123 @@ function renderAssetDrawer() {
   `;
 }
 
+function renderAssetLabel(asset) {
+  const url = assetDetailUrl(asset);
+  return `
+    <section class="asset-label-card">
+      <div class="asset-label-info">
+        <strong>学校资产标签</strong>
+        <span>资产编号：${asset.code}</span>
+        <span>资产名称：${asset.name}</span>
+        <span>分类：${asset.category}</span>
+        <span>责任人：${userName(asset.keeperId)}</span>
+        <span>位置：${blank(asset.location)}</span>
+      </div>
+      <div class="asset-label-qr">
+        ${qrLikeSvg(url)}
+        <small>${url}</small>
+      </div>
+    </section>
+  `;
+}
+
+function renderAssetDetailDrawer() {
+  const asset = state.assets.find((item) => item.id === selectedAssetDetailId);
+  if (!asset) return "";
+  const group = assetGroupById(asset.id);
+  const groupAssets = group?.assets || [asset];
+  const records = assetRecords(groupAssets.map((item) => item.id));
+  const assetIds = new Set(groupAssets.map((item) => item.id));
+  const repairRows = (state.repairOrders || []).filter((item) => assetIds.has(item.assetId));
+  const checkRows = (state.inventoryCheckItems || []).filter((item) => assetIds.has(item.assetId));
+  const scrapRows = (state.scrapOrders || []).filter((item) => assetIds.has(item.assetId));
+  const transferRows = (state.transferOrders || []).filter((item) => assetIds.has(item.assetId));
+  const borrowRows = (state.borrowOrders || []).filter((item) => assetIds.has(item.assetId));
+  const flowRows = (state.assetFlowLogs || []).filter((item) => assetIds.has(item.assetId));
+  const flow = assetFlow(asset);
+  const showAssetDetailLabel = isAssetDetailLabelEnabled();
+  return `
+    <div class="drawer-backdrop no-print" id="assetDetailBackdrop"></div>
+    <aside class="asset-drawer asset-detail-drawer no-print" aria-label="资产详情">
+      <div class="drawer-head">
+        <h2>资产详情</h2>
+        <button class="ghost icon-button" id="closeAssetDetail" type="button">×</button>
+      </div>
+      <div class="drawer-body">
+        <section class="detail-hero">
+          <div>
+            <span class="hint">${asset.code}</span>
+            <h3>${asset.name}</h3>
+            <p>${asset.spec || "未填写规格"} · ${asset.category}</p>
+          </div>
+          ${statusBadge(asset.status)}
+        </section>
+        <section class="detail-grid">
+          <div><span>资产/耗材</span><strong>${assetKind(asset)}</strong></div>
+          <div><span>品牌</span><strong>${blank(asset.brand)}</strong></div>
+          <div><span>数量</span><strong>${group?.quantity ?? asset.quantity ?? 0}</strong></div>
+          <div><span>单位</span><strong>${blank(asset.unit || "件")}</strong></div>
+          <div><span>单价</span><strong>${Number(asset.unitPrice || 0).toFixed(2)}</strong></div>
+          <div><span>总金额</span><strong>${Number(asset.totalAmount || 0).toFixed(2)}</strong></div>
+          <div><span>购置日期</span><strong>${blank(asset.purchaseDate)}</strong></div>
+          <div><span>入库日期</span><strong>${blank(asset.inboundDate)}</strong></div>
+          <div><span>供应商</span><strong>${blank(asset.supplier)}</strong></div>
+          <div><span>使用部门</span><strong>${blank(asset.useDepartment)}</strong></div>
+          <div><span>位置</span><strong>${blank(asset.location)}</strong></div>
+          <div><span>保管人</span><strong>${userName(asset.keeperId)}</strong></div>
+          <div><span>使用人</span><strong>${asset.useUserId ? userName(asset.useUserId) : userName(asset.keeperId)}</strong></div>
+          <div><span>当前使用人</span><strong>${flow.borrowerName}</strong></div>
+          <div><span>最近借出</span><strong>${flow.borrowTime}</strong></div>
+          <div><span>最近归还</span><strong>${flow.returnTime}</strong></div>
+          <div><span>安全库存</span><strong>${asset.safeStock || 0}</strong></div>
+          <div><span>资产来源</span><strong>${blank(asset.source)}</strong></div>
+          <div><span>创建人</span><strong>${asset.creatorId ? userName(asset.creatorId) : "-"}</strong></div>
+          <div><span>更新时间</span><strong>${fmt(asset.updatedAt)}</strong></div>
+          <div><span>详情链接</span><strong><button class="download-link" data-copy-asset-url="${asset.id}" type="button">复制</button></strong></div>
+        </section>
+        ${showAssetDetailLabel ? `<section class="detail-section">
+          <div class="section-title"><h2>二维码标签</h2><button class="secondary small" id="printAssetLabel" type="button">打印标签</button></div>
+          ${renderAssetLabel(asset)}
+        </section>` : ""}
+        <section class="detail-section">
+          <div class="section-title"><h2>流转记录</h2><span class="hint">${records.length} 条</span></div>
+          <div class="record-list">
+            ${records.map((record) => `
+              <article class="record-card">
+                <div class="card-head"><strong>${record.type === "出库" ? "出库/出借" : "入库/归还"} · ${record.quantity}</strong>${statusBadge(record.status)}</div>
+                <p>时间：${fmt(record.outTime || record.inTime)}，经办/使用人：${userName(record.userId)}</p>
+                <p>单号：${blank(record.paperNo)}，备注：${recordDisplayNote(record)}</p>
+              </article>
+            `).join("") || `<div class="empty">暂无流转记录</div>`}
+          </div>
+        </section>
+        ${renderDetailOrderList("借用/领用记录", borrowRows, (item) => `${item.orderNo} · ${assetName(item.assetId)} · ${userName(item.borrowerId)} · ${item.status} · 预计归还 ${blank(item.expectedReturnDate)} · 实际归还 ${blank(item.actualReturnDate)}`)}
+        ${renderDetailOrderList("调拨记录", transferRows, (item) => `${item.orderNo} · ${blank(item.oldDepartment)} / ${blank(item.oldLocation)} -> ${blank(item.newDepartment)} / ${blank(item.newLocation)} · ${item.status}`)}
+        ${renderDetailOrderList("维修记录", repairRows, (item) => `${item.orderNo} · ${item.status} · ${blank(item.repairer)} · 费用 ${Number(item.cost || 0).toFixed(2)} · ${blank(item.result || item.faultDesc)}`)}
+        ${renderDetailOrderList("盘点记录", checkRows, (item) => `${blank(item.systemLocation)} -> ${blank(item.actualLocation)} · ${checkDiffBadge(item.diffType)} · ${blank(item.remark)}`)}
+        ${renderDetailOrderList("报废记录", scrapRows, (item) => `${item.orderNo} · ${item.status} · 残值 ${Number(item.residualValue || 0).toFixed(2)} · ${blank(item.reason)}`)}
+        ${renderDetailOrderList("资产流转日志", flowRows, (item) => `${fmt(item.createdAt)} · ${blank(item.action)} · ${userName(item.operatorId)} · ${blank(item.businessNo)} · ${blank(item.note)}`)}
+        <section class="detail-section">
+          <div class="section-title"><h2>备注</h2></div>
+          <p class="hint">${displayRemark(asset.remark)}</p>
+        </section>
+      </div>
+    </aside>
+    ${showAssetDetailLabel ? `<div class="print-label-template">${renderAssetLabel(asset)}</div>` : ""}
+  `;
+}
+
+function renderDetailOrderList(title, items, formatRow) {
+  return `
+    <section class="detail-section">
+      <div class="section-title"><h2>${title}</h2><span class="hint">${items.length} 条</span></div>
+      <div class="record-list">
+        ${items.map((item) => `<article class="record-card"><p>${formatRow(item)}</p></article>`).join("") || `<div class="empty">暂无${title}</div>`}
+      </div>
+    </section>
+  `;
+}
+
 function renderRecords() {
   const records = state.records.filter((record) => {
     const typeMatched = recordFilter === "all" || record.type === recordFilter;
@@ -1095,9 +2375,9 @@ function renderRecords() {
   const assetRecordCount = state.records.filter((record) => recordKind(record) === "资产").length;
   const consumableRecordCount = state.records.filter((record) => recordKind(record) === "耗材").length;
   return `
-    ${isAdmin() ? renderRecordModePanel() : ""}
+    ${can("records.manage") ? renderRecordModePanel() : ""}
     <section class="panel">
-      <div class="section-title"><h2>${isAdmin() ? "全部出入库记录" : "我的出入库记录"}</h2></div>
+      <div class="section-title"><h2>${can("records.manage") ? "全部出入库记录" : "我的出入库记录"}</h2></div>
       <div class="toolbar">
         <div class="filters">
           <select id="recordKindFilter">
@@ -1113,6 +2393,7 @@ function renderRecords() {
         </div>
         <span class="hint">当前 ${records.length} 条，资产 ${assetRecordCount} 条 / 耗材 ${consumableRecordCount} 条</span>
       </div>
+      ${renderSuspectedDuplicateRecords(records)}
       <div class="table-wrap">
         <table>
           <thead>
@@ -1277,7 +2558,7 @@ function renderRecordFormInner() {
   const deptOptions = [`<option value="all" ${selectedDepartment === "all" ? "selected" : ""}>全部部门</option>`]
     .concat(departments().map((department) => `<option value="${department}" ${selectedDepartment === department ? "selected" : ""}>${department}</option>`))
     .join("");
-  const userOptions = activeUsersByDepartment().map((u) => `<option value="${u.id}">${u.name} · ${u.department}</option>`).join("");
+  const userOptions = activeUsersByDepartment().map((u) => `<option value="${u.id}">${u.name}${isMultiDepartment() ? ` · ${u.department}` : ""}</option>`).join("");
   const groups = assetGroups();
   const defaultGroup = groups[0] || {};
   return `
@@ -1347,6 +2628,7 @@ function renderRecordFormInner() {
 }
 
 function renderPaper() {
+  const canManagePaper = can("paper.manage");
   return `
     <div class="solution">
       <section class="panel">
@@ -1364,7 +2646,7 @@ function renderPaper() {
         <form id="paperForm">
           <div class="field"><label>纸质单号</label><input name="paperNo" required placeholder="SZ-2026-001" /></div>
           <div class="field"><label>单据来源</label><input name="source" required placeholder="手写入库单 / 出库单" /></div>
-          ${isAdmin() ? `<div class="field"><label>关联用户</label><select name="ownerId">${selectableUsers().map((u) => `<option value="${u.id}">${u.name}</option>`).join("")}</select></div>` : ""}
+          ${canManagePaper ? `<div class="field"><label>关联用户</label><select name="ownerId">${selectableUsers().map((u) => `<option value="${u.id}">${u.name}</option>`).join("")}</select></div>` : ""}
           <div class="field"><label>识别文本 / 人工摘录</label><textarea name="text" required placeholder="资产、数量、时间、经手人、用途"></textarea></div>
           <button class="primary" type="submit">加入复核队列</button>
         </form>
@@ -1374,14 +2656,14 @@ function renderPaper() {
       <div class="section-title"><h2>纸质单据队列</h2></div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>单号</th><th>来源</th><th>关联用户</th><th>状态</th><th>识别内容</th>${isAdmin() ? "<th>操作</th>" : ""}</tr></thead>
+          <thead><tr><th>单号</th><th>来源</th><th>关联用户</th><th>状态</th><th>识别内容</th>${canManagePaper ? "<th>操作</th>" : ""}</tr></thead>
           <tbody>
             ${state.paperQueue.map((item) => `
               <tr>
                 <td>${item.paperNo}</td><td>${item.source}</td><td>${userName(item.ownerId)}</td><td>${statusBadge(item.status)}</td><td>${item.text}</td>
-                ${isAdmin() ? `<td><button class="secondary" data-archive-paper="${item.id}" type="button">归档</button></td>` : ""}
+                ${canManagePaper ? `<td><button class="secondary" data-archive-paper="${item.id}" type="button">归档</button></td>` : ""}
               </tr>
-            `).join("") || `<tr><td colspan="${isAdmin() ? 6 : 5}" class="empty">暂无纸质单据</td></tr>`}
+            `).join("") || `<tr><td colspan="${canManagePaper ? 6 : 5}" class="empty">暂无纸质单据</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1396,8 +2678,9 @@ function requestStatusBadge(status) {
 
 function renderAssetRequests() {
   const requests = state.assetRequests || [];
+  const canManageRequests = can("asset_requests.manage");
   return `
-    ${!isAdmin() ? `
+    ${!canManageRequests ? `
     <section class="panel">
       <div class="section-title"><h2>提交资产申请</h2></div>
       <form id="assetRequestForm" class="form-grid">
@@ -1411,23 +2694,23 @@ function renderAssetRequests() {
     </section>` : ""}
     <section class="panel">
       <div class="section-title">
-        <h2>${isAdmin() ? "资产申请列表" : "我的资产申请"}</h2>
+        <h2>${canManageRequests ? "资产申请列表" : "我的资产申请"}</h2>
         <span class="hint">待处理 ${requests.filter((item) => item.status === "待处理").length} 条</span>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              ${isAdmin() ? "<th>申请人</th>" : ""}<th>资产名称</th><th>类别</th><th>规格</th><th>数量</th><th>用途</th><th>时间</th><th>状态</th><th>处理备注</th>${isAdmin() ? "<th>操作</th>" : ""}
+              ${canManageRequests ? "<th>申请人</th>" : ""}<th>资产名称</th><th>类别</th><th>规格</th><th>数量</th><th>用途</th><th>时间</th><th>状态</th><th>处理备注</th>${canManageRequests ? "<th>操作</th>" : ""}
             </tr>
           </thead>
           <tbody>
             ${requests.map((item) => `
               <tr>
-                ${isAdmin() ? `<td>${item.userName || userName(item.userId)}</td>` : ""}<td>${item.assetName}</td><td>${blank(item.category)}</td><td>${blank(item.spec)}</td><td>${item.quantity}</td><td>${blank(item.reason)}</td><td>${fmt(item.createdAt)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.handleNote)}</td>
-                ${isAdmin() ? `<td>${item.status === "待处理" ? `<div class="row-actions"><button class="secondary small" data-approve-asset-request="${item.id}" type="button">批准</button><button class="ghost small" data-reject-asset-request="${item.id}" type="button">驳回</button></div>` : "-"}</td>` : ""}
+                ${canManageRequests ? `<td>${item.userName || userName(item.userId)}</td>` : ""}<td>${item.assetName}</td><td>${blank(item.category)}</td><td>${blank(item.spec)}</td><td>${item.quantity}</td><td>${blank(item.reason)}</td><td>${fmt(item.createdAt)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.handleNote)}</td>
+                ${canManageRequests ? `<td>${item.status === "待处理" ? `<div class="row-actions"><button class="secondary small" data-approve-asset-request="${item.id}" type="button">批准</button><button class="ghost small" data-reject-asset-request="${item.id}" type="button">驳回</button></div>` : "-"}</td>` : ""}
               </tr>
-            `).join("") || `<tr><td colspan="${isAdmin() ? 10 : 8}" class="empty">暂无资产申请</td></tr>`}
+            `).join("") || `<tr><td colspan="${canManageRequests ? 10 : 8}" class="empty">暂无资产申请</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1442,15 +2725,16 @@ function priorityBadge(priority) {
 
 function renderPurchaseWishes() {
   const wishes = state.purchaseWishes || [];
+  const canManageWishes = can("purchase_wishes.manage");
   const pending = wishes.filter((item) => item.status === "待采购" || item.status === "已采纳").length;
   const totalQuantity = wishes.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
   return `
     <section class="panel">
       <div class="section-title">
-        <h2>${isAdmin() ? "下一年度采购需求汇总" : "提交想要的设备"}</h2>
+        <h2>${canManageWishes ? "下一年度采购需求汇总" : "提交想要的设备"}</h2>
         <span class="hint">当前 ${wishes.length} 项，数量合计 ${totalQuantity}，待跟进 ${pending} 项</span>
       </div>
-      ${!isAdmin() ? `
+      ${!canManageWishes ? `
         <form id="purchaseWishForm" class="form-grid">
           <div class="field"><label>设备名称</label><input name="itemName" required placeholder="例如 笔记本、显示器、网线、硬盘" /></div>
           <div class="field"><label>类别</label><input name="category" placeholder="设备 / 耗材 / 软件 / 工具" /></div>
@@ -1468,22 +2752,22 @@ function renderPurchaseWishes() {
       `}
     </section>
     <section class="panel">
-      <div class="section-title"><h2>${isAdmin() ? "全部需求" : "我的需求"}</h2></div>
+      <div class="section-title"><h2>${canManageWishes ? "全部需求" : "我的需求"}</h2></div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              ${isAdmin() ? `<th>提交人</th>${isMultiDepartment() ? "<th>部门</th>" : ""}` : ""}<th>设备名称</th><th>类别</th><th>规格</th><th>数量</th><th>优先级</th><th>期望时间</th><th>用途说明</th><th>状态</th><th>处理备注</th>${isAdmin() ? "<th>操作</th>" : ""}
+              ${canManageWishes ? `<th>提交人</th>${isMultiDepartment() ? "<th>部门</th>" : ""}` : ""}<th>设备名称</th><th>类别</th><th>规格</th><th>数量</th><th>优先级</th><th>期望时间</th><th>用途说明</th><th>状态</th><th>处理备注</th>${canManageWishes ? "<th>操作</th>" : ""}
             </tr>
           </thead>
           <tbody>
             ${wishes.map((item) => `
               <tr>
-                ${isAdmin() ? `<td>${item.userName || userName(item.userId)}</td>${isMultiDepartment() ? `<td>${item.userDepartment || userDepartment(item.userId)}</td>` : ""}` : ""}
+                ${canManageWishes ? `<td>${item.userName || userName(item.userId)}</td>${isMultiDepartment() ? `<td>${item.userDepartment || userDepartment(item.userId)}</td>` : ""}` : ""}
                 <td>${item.itemName}</td><td>${blank(item.category)}</td><td>${blank(item.spec)}</td><td>${item.quantity}</td><td>${priorityBadge(item.priority)}</td><td>${blank(item.expectedTime)}</td><td>${blank(item.reason)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.handleNote)}</td>
-                ${isAdmin() ? `<td><div class="row-actions"><button class="secondary small" data-update-wish="${item.id}" data-wish-status="已采纳" type="button">采纳</button><button class="secondary small" data-update-wish="${item.id}" data-wish-status="暂缓" type="button">暂缓</button><button class="secondary small" data-update-wish="${item.id}" data-wish-status="已采购" type="button">已采购</button><button class="ghost small" data-update-wish="${item.id}" data-wish-status="已关闭" type="button">关闭</button></div></td>` : ""}
+                ${canManageWishes ? `<td><div class="row-actions"><button class="secondary small" data-update-wish="${item.id}" data-wish-status="已采纳" type="button">采纳</button><button class="secondary small" data-update-wish="${item.id}" data-wish-status="暂缓" type="button">暂缓</button><button class="secondary small" data-update-wish="${item.id}" data-wish-status="已采购" type="button">已采购</button><button class="ghost small" data-update-wish="${item.id}" data-wish-status="已关闭" type="button">关闭</button></div></td>` : ""}
               </tr>
-            `).join("") || `<tr><td colspan="${isAdmin() ? (isMultiDepartment() ? 12 : 11) : 9}" class="empty">暂无采购需求</td></tr>`}
+            `).join("") || `<tr><td colspan="${canManageWishes ? (isMultiDepartment() ? 12 : 11) : 9}" class="empty">暂无采购需求</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1492,20 +2776,37 @@ function renderPurchaseWishes() {
 }
 
 function renderUsers() {
-  if (!isAdmin()) return "";
+  if (!can("users.view")) return "";
   const departmentOptions = departments().map((department) => `<option value="${department}">${department}</option>`).join("");
+  const roleOptions = [
+    ["teacher", "普通教师"],
+    ["department_head", "部门负责人"],
+    ["asset_manager", "资产管理员"],
+    ["admin", "系统管理员"]
+  ].map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
   return `
-    <section class="panel">
+    ${can("users.manage") ? `<section class="panel">
       <div class="section-title"><h2>新增用户</h2></div>
       <form id="userForm" class="form-grid">
         <div class="field"><label>账号自动生成</label><input disabled placeholder="保存后按姓名缩写生成，如 张三 -> zs" /></div>
         <div class="field"><label>姓名</label><input name="name" required /></div>
         <div class="field"><label>初始密码</label><input name="password" required placeholder="请填写临时密码" /></div>
         ${isMultiDepartment() ? `<div class="field"><label>部门选项</label><select name="department" required>${departmentOptions}</select></div>` : `<input type="hidden" name="department" value="${state.currentUser.department}" />`}
-        <div class="field"><label>角色</label><select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></div>
+        <div class="field"><label>角色</label><select name="roleId">${roleOptions}</select></div>
         <div class="field"><label>状态</label><select name="active"><option value="true">启用</option><option value="false">停用</option></select></div>
         <button class="primary" type="submit">保存用户</button>
       </form>
+    </section>` : ""}
+    <section class="panel">
+      <div class="section-title"><h2>角色权限表</h2><span class="hint">菜单和权限由后端 RBAC 表控制。</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>角色</th><th>说明</th><th>菜单</th><th>权限数</th></tr></thead>
+          <tbody>
+            ${(state.roles || []).map((role) => `<tr><td>${role.name}</td><td>${blank(role.description)}</td><td>${(role.menus || []).join(" / ")}</td><td>${(role.permissions || []).length}</td></tr>`).join("") || `<tr><td colspan="4" class="empty">暂无角色数据</td></tr>`}
+          </tbody>
+        </table>
+      </div>
     </section>
     <section class="panel">
       <div class="section-title"><h2>用户列表</h2></div>
@@ -1519,13 +2820,13 @@ function renderUsers() {
                 <td>${user.name}</td>
                 <td>
                   ${user.id === state.currentUser.id ? `<span class="hint">当前用户</span>` : user.active ? `
-                    ${user.role === "user" ? `<button class="secondary small" data-promote-user="${user.id}" type="button">设为管理员</button>` : ""}
-                    ${user.role === "admin" ? `<button class="secondary small" data-revoke-admin="${user.id}" type="button">撤销管理员</button>` : ""}
+                    ${can("users.manage") ? `<button class="secondary small" data-promote-user="${user.id}" data-role-id="asset_manager" type="button">资产管理员</button><button class="secondary small" data-promote-user="${user.id}" data-role-id="department_head" type="button">部门负责人</button><button class="secondary small" data-promote-user="${user.id}" data-role-id="admin" type="button">系统管理员</button>` : ""}
+                    ${can("users.manage") && (user.roleId === "admin" || user.role === "admin") ? `<button class="secondary small" data-revoke-admin="${user.id}" type="button">改为教师</button>` : ""}
                     <button class="secondary small" data-reset-password="${user.id}" type="button">改密码</button>
                     <button class="danger small" data-delete-user="${user.id}" type="button">删除</button>
                   ` : `<span class="hint">已停用</span>`}
                 </td>
-                <td>${user.role === "admin" ? "管理员" : "普通用户"}</td>
+                <td>${user.roleName || roleLabel(user.roleId || user.role)}</td>
                 ${isMultiDepartment() ? `<td>${user.department}</td>` : ""}
                 <td>${user.active ? "启用" : "停用"}</td>
               </tr>
@@ -1645,7 +2946,7 @@ function portApplyCommand(port = state.settings?.servicePort || "38280") {
 }
 
 function renderSettings() {
-  if (!isAdmin()) return "";
+  if (!can("settings.view")) return "";
   return `
     <section class="panel">
       <div class="section-title"><h2>基础设置</h2></div>
@@ -1714,6 +3015,10 @@ function renderSettings() {
       </div>` : ""}
     </section>
     <section class="panel">
+      <div class="section-title"><h2>实验室功能</h2><span class="hint">放置扫码、预览类等仍在逐步完善的功能。</span></div>
+      ${renderExperimentalFeatures()}
+    </section>
+    <section class="panel">
       <div class="section-title"><h2>打印设置</h2></div>
       <p class="hint">默认使用系统内置的空白无隐私 Word 模板。上传自定义 .docx 后，“导出模板单”会优先使用这里保存的模板；浏览器“打印资产表”使用网页打印样式。</p>
       <div class="print-template-grid">
@@ -1739,8 +3044,49 @@ function renderSettings() {
   `;
 }
 
+function renderExperimentalFeatures() {
+  return `
+    <form id="assetDetailLabelForm" class="setting-row">
+      <div>
+        <strong>资产详情二维码标签</strong>
+        <p class="hint">控制资产状况详情抽屉里“二维码标签”和“打印标签”区域是否显示。</p>
+      </div>
+      <label class="switch">
+        <input name="enabled" type="checkbox" ${isAssetDetailLabelEnabled() ? "checked" : ""} />
+        <span></span>
+      </label>
+    </form>
+    <form id="paperModuleForm" class="setting-row">
+      <div>
+        <strong>纸质单据方案</strong>
+        <p class="hint">控制左侧“纸质单据方案”菜单和纸质单据队列页面是否显示；关闭不会删除已有纸质单据数据。</p>
+      </div>
+      <label class="switch">
+        <input name="enabled" type="checkbox" ${isPaperModuleEnabled() ? "checked" : ""} />
+        <span></span>
+      </label>
+    </form>
+    <div class="setting-row setting-row-stack">
+      <div>
+        <strong>扫码查看资产</strong>
+        <p class="hint">用于测试二维码标签入口。支持粘贴二维码内容、资产详情链接或资产编号；摄像头扫码取决于浏览器是否支持。</p>
+      </div>
+      <div class="form-grid">
+        <div class="field wide">
+          <label>二维码内容 / 资产编号</label>
+          <input id="qrAssetLookup" placeholder="例如 XXZX-DN-2026-0001，或粘贴二维码链接" />
+        </div>
+        <div class="setting-actions">
+          <button class="primary" id="openQrAsset" type="button">打开资产详情</button>
+          <button class="secondary" id="startQrScanner" type="button">使用摄像头扫描</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderAudit() {
-  if (!isAdmin()) return "";
+  if (!can("audit.view")) return "";
   const defaultStart = defaultAuditStartTime();
   const visibleStart = auditStartTime || defaultStart;
   const fieldLabels = { all: "全部字段", time: "日期", operator: "操作人", ip: "来源IP", action: "动作", detail: "详情" };
@@ -1786,13 +3132,12 @@ function renderAudit() {
 
 function renderContextMenu() {
   if (!state.currentUser) return "";
-  const adminItems = isAdmin()
+  const adminItems = can("assets.manage") || can("records.manage") || can("users.manage") || can("settings.manage")
     ? `
-      <button data-context-action="assets" type="button">新建资产</button>
-      <button data-context-action="records" type="button">新增出入库</button>
-      <button data-context-action="records-import" type="button">批量导入记录</button>
-      <button data-context-action="users" type="button">新增用户</button>
-      <button data-context-action="settings" type="button">系统设置</button>
+      ${can("assets.manage") ? `<button data-context-action="assets" type="button">新建资产</button>` : ""}
+      ${can("records.manage") ? `<button data-context-action="records" type="button">新增出入库</button><button data-context-action="records-import" type="button">批量导入记录</button>` : ""}
+      ${can("users.manage") ? `<button data-context-action="users" type="button">新增用户</button>` : ""}
+      ${can("settings.manage") ? `<button data-context-action="settings" type="button">系统设置</button>` : ""}
     `
     : `
       <button data-context-action="records" type="button">查看我的出入库</button>
@@ -1814,6 +3159,93 @@ function renderContextMenu() {
       <button data-user-delete type="button">删除用户</button>
     </div>
   `;
+}
+
+function assetFromQrText(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  let candidates = [text];
+  try {
+    const url = new URL(text, window.location.origin);
+    const assetParam = url.searchParams.get("asset");
+    if (assetParam) candidates.push(assetParam);
+    const pathAsset = url.pathname.match(/\/assets\/([^/]+)/);
+    if (pathAsset) candidates.push(decodeURIComponent(pathAsset[1]));
+  } catch {
+    const assetParam = text.match(/[?&]asset=([^&]+)/);
+    if (assetParam) candidates.push(decodeURIComponent(assetParam[1]));
+  }
+  candidates = candidates.map((item) => String(item || "").trim()).filter(Boolean);
+  return state.assets.find((asset) => candidates.includes(asset.id) || candidates.includes(asset.code))
+    || state.assets.find((asset) => candidates.some((item) => asset.name === item));
+}
+
+function openAssetFromQrText(value) {
+  const asset = assetFromQrText(value);
+  if (!asset) {
+    alert("没有找到对应资产。请确认二维码内容、资产编号或链接是否正确。");
+    return;
+  }
+  view = "assets";
+  selectedAssetDetailId = asset.id;
+  render();
+}
+
+async function startQrScanner(onResult) {
+  if (!("BarcodeDetector" in window)) {
+    alert("当前浏览器不支持摄像头二维码识别。可以把二维码内容或资产编号粘贴到输入框后打开资产详情。");
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    alert("当前浏览器无法调用摄像头。");
+    return;
+  }
+  const overlay = document.createElement("div");
+  overlay.className = "scanner-overlay";
+  overlay.innerHTML = `
+    <div class="scanner-panel">
+      <div class="section-title"><h2>扫描资产二维码</h2><button class="ghost small" type="button" data-close-scanner>关闭</button></div>
+      <video autoplay playsinline></video>
+      <p class="hint">请将资产标签二维码放入画面中。</p>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const video = overlay.querySelector("video");
+  const close = () => {
+    video.srcObject?.getTracks?.().forEach((track) => track.stop());
+    overlay.remove();
+  };
+  overlay.querySelector("[data-close-scanner]")?.addEventListener("click", close);
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    video.srcObject = stream;
+    const detector = new BarcodeDetector({ formats: ["qr_code"] });
+    let active = true;
+    const tick = async () => {
+      if (!active || !document.body.contains(overlay)) return;
+      try {
+        const codes = await detector.detect(video);
+        if (codes.length) {
+          active = false;
+          const raw = codes[0].rawValue || "";
+          close();
+          if (typeof onResult === "function") {
+            onResult(raw);
+          } else {
+            openAssetFromQrText(raw);
+          }
+          return;
+        }
+      } catch {
+        // Some browsers throw while the video stream is warming up.
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  } catch (exc) {
+    close();
+    alert(`摄像头无法启动：${exc.message || "请检查浏览器权限"}`);
+  }
 }
 
 function renderRecordCards(records) {
@@ -1938,18 +3370,17 @@ function formatFileSize(bytes) {
 
 async function importFilesBatch(files, endpoint, resultKey) {
   const summary = { imported: 0, createdAssets: 0, paperCreated: 0, skipped: [], files: [] };
-  let latestState = state;
   for (const file of files) {
     const fileName = file.webkitRelativePath || file.name;
     try {
-      latestState = await api(endpoint, {
+      const response = await api(endpoint, {
         method: "POST",
         body: JSON.stringify(withActor({
           fileName,
           contentBase64: await fileToBase64(file)
         }))
       });
-      const result = latestState[resultKey] || { imported: 0, skipped: [] };
+      const result = response[resultKey] || { imported: 0, skipped: [] };
       summary.imported += Number(result.imported || 0);
       summary.createdAssets += Number(result.createdAssets || 0);
       summary.paperCreated += Number(result.paperCreated || 0);
@@ -1966,7 +3397,9 @@ async function importFilesBatch(files, endpoint, resultKey) {
       summary.files.push({ fileName, imported: 0, createdAssets: 0, paperCreated: 0, skipped: 1, error: exc.message });
     }
   }
-  state = latestState;
+  state = await api(`/api/state?userId=${encodeURIComponent(state.currentUser.id)}${viewRoleParam()}`);
+  ensureFreshVersion(state);
+  applyAssetUrlSelection();
   summary.message = `已处理 ${files.length} 个文件`;
   return summary;
 }
@@ -2077,14 +3510,29 @@ function filteredAssets() {
 }
 
 function downloadAssetsTable() {
-  const headers = ["序号", "物品名称", "资产编号", "配置", "数量", "类别"];
+  const headers = ["序号", "资产编号", "物品名称", "品牌", "类别", "规格", "单位", "数量", "单价", "总金额", "购置日期", "入库日期", "供应商", "使用部门", "使用人", "位置", "状态", "资产来源", "创建人", "更新时间", "备注"];
   const rows = filteredAssets().map((asset, index) => [
     index + 1,
-    asset.name,
     asset.code,
+    asset.name,
+    blank(asset.brand),
+    asset.category,
     blank(asset.spec),
+    blank(asset.unit || "件"),
     asset.quantity,
-    [asset.category, assetKind(asset)].filter(Boolean).join(" / ")
+    Number(asset.unitPrice || 0),
+    Number(asset.totalAmount || 0),
+    blank(asset.purchaseDate),
+    blank(asset.inboundDate),
+    blank(asset.supplier),
+    blank(asset.useDepartment),
+    asset.useUserId ? userName(asset.useUserId) : userName(asset.keeperId),
+    blank(asset.location),
+    statusText(asset.status),
+    blank(asset.source),
+    asset.creatorId ? userName(asset.creatorId) : "-",
+    fmt(asset.updatedAt),
+    displayRemark(asset.remark)
   ]);
   const csv = `\ufeff${[headers, ...rows].map((row) => row.map(csvCell).join(",")).join("\n")}\n`;
   downloadTextFile(`资产表-${new Date().toISOString().slice(0, 10)}.csv`, csv);
@@ -2351,14 +3799,14 @@ async function deleteUser(userId) {
   }
 }
 
-async function promoteUser(userId) {
+async function promoteUser(userId, roleId = "admin") {
   const target = state.users.find((user) => user.id === userId);
   const label = target ? `${target.name}（${target.username}）` : "该用户";
-  if (!confirm(`确定把 ${label} 设为管理员吗？管理员可以查看全部数据、删除用户和修改系统设置。`)) return;
+  if (!confirm(`确定把 ${label} 的角色调整为${roleLabel(roleId)}吗？`)) return;
   try {
     state = await api("/api/users/promote", {
       method: "POST",
-      body: JSON.stringify(withActor({ targetUserId: userId }))
+      body: JSON.stringify(withActor({ targetUserId: userId, roleId }))
     });
     render();
   } catch (exc) {
@@ -2541,7 +3989,7 @@ async function resetUserPassword(userId) {
 
 function bindUserContextMenu() {
   const menu = document.querySelector("#userContextMenu");
-  if (!menu || !isAdmin()) return;
+  if (!menu || !can("users.manage")) return;
   let selectedUserId = "";
 
   document.querySelectorAll("[data-user-row]").forEach((row) => {
@@ -2676,6 +4124,17 @@ function bindEvents() {
     render();
   });
 
+  document.querySelector("#assetBorrowerFilter")?.addEventListener("change", (event) => {
+    assetBorrowerFilter = event.target.value;
+    if (assetBorrowerFilter !== "all") assetStatusFilter = "checked_out";
+    render();
+  });
+
+  document.querySelector("#clearBorrowerDetail")?.addEventListener("click", () => {
+    assetBorrowerFilter = "all";
+    render();
+  });
+
   document.querySelector("#assetSortField")?.addEventListener("change", (event) => {
     assetSortField = event.target.value;
     render();
@@ -2691,19 +4150,29 @@ function bindEvents() {
     assetFilter = "";
     assetStatusFilter = "all";
     assetKeeperFilter = "all";
+    assetBorrowerFilter = "all";
     assetSortField = "model";
     assetSortDir = "asc";
     render();
   });
 
-  document.querySelector("#addAssetCategoryForm")?.addEventListener("submit", async (event) => {
+  bindSearchInput("#inventorySearch", (value) => {
+    inventoryFilter = value;
+  });
+
+  document.querySelector("#clearInventorySearch")?.addEventListener("click", () => {
+    inventoryFilter = "";
+    render();
+  });
+
+  document.querySelector("#inventoryAdjustForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const category = event.target.category.value.trim();
-    if (!category) return;
+    const payload = withActor(formData(event.target));
+    payload.quantity = Number(payload.quantity);
     try {
-      state = await api("/api/assets/categories/add", {
+      state = await api("/api/inventory/adjust", {
         method: "POST",
-        body: JSON.stringify(withActor({ category }))
+        body: JSON.stringify(payload)
       });
       render();
     } catch (exc) {
@@ -2711,17 +4180,16 @@ function bindEvents() {
     }
   });
 
-  document.querySelectorAll("[data-category-edit]").forEach((button) => {
+  document.querySelectorAll("[data-safe-stock]").forEach((button) => {
     button.addEventListener("click", async () => {
-      const oldName = button.dataset.categoryEdit;
-      const newName = prompt(`请输入“${oldName}”的新类别名称`, oldName);
-      if (newName === null) return;
-      const cleanName = newName.trim();
-      if (!cleanName || cleanName === oldName) return;
+      const assetId = button.dataset.safeStock;
+      const value = prompt("请输入安全库存数量", button.dataset.safeStockValue || "0");
+      if (value === null) return;
+      const safeStock = Math.max(0, Number(value || 0));
       try {
-        state = await api("/api/assets/categories/rename", {
+        state = await api("/api/inventory/safe-stock", {
           method: "POST",
-          body: JSON.stringify(withActor({ oldName, newName: cleanName }))
+          body: JSON.stringify(withActor({ assetId, safeStock }))
         });
         render();
       } catch (exc) {
@@ -2730,14 +4198,106 @@ function bindEvents() {
     });
   });
 
+  document.querySelector("#assetCategoryForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload = withActor(formData(event.target));
+    const endpoint = payload.categoryId ? "/api/assets/categories/update" : "/api/assets/categories/add";
+    try {
+      state = await api(endpoint, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      render();
+    } catch (exc) {
+      alert(exc.message);
+    }
+  });
+
+  document.querySelector("#resetCategoryForm")?.addEventListener("click", () => {
+    const form = document.querySelector("#assetCategoryForm");
+    if (!form) return;
+    form.reset();
+    form.categoryId.value = "";
+  });
+
+  document.querySelectorAll("[data-category-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const category = assetCategoryItems().find((item) => item.id === button.dataset.categoryEdit);
+      const form = document.querySelector("#assetCategoryForm");
+      if (!category || !form) return;
+      form.categoryId.value = category.id;
+      form.name.value = category.name || "";
+      form.code.value = category.code || "";
+      form.categoryType.value = category.category_type || "固定资产";
+      form.parentId.value = category.parent_id || "";
+      form.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  });
+
   document.querySelectorAll("[data-category-delete]").forEach((button) => {
     button.addEventListener("click", async () => {
-      const category = button.dataset.categoryDelete;
-      if (!confirm(`确定删除类别“${category}”吗？已被资产使用的类别不能删除。`)) return;
+      const category = assetCategoryItems().find((item) => item.id === button.dataset.categoryDelete);
+      if (!category) return;
+      if (!confirm(`确定删除类别“${category.name}”吗？已被资产或子分类使用的类别不能删除。`)) return;
       try {
         state = await api("/api/assets/categories/delete", {
           method: "POST",
-          body: JSON.stringify(withActor({ category }))
+          body: JSON.stringify(withActor({ categoryId: category.id }))
+        });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelector("#locationForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload = withActor(formData(event.target));
+    const endpoint = payload.locationId ? "/api/locations/update" : "/api/locations/add";
+    try {
+      state = await api(endpoint, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      render();
+    } catch (exc) {
+      alert(exc.message);
+    }
+  });
+
+  document.querySelector("#resetLocationForm")?.addEventListener("click", () => {
+    const form = document.querySelector("#locationForm");
+    if (!form) return;
+    form.reset();
+    form.locationId.value = "";
+  });
+
+  document.querySelectorAll("[data-location-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const location = locations().find((item) => item.id === button.dataset.locationEdit);
+      const form = document.querySelector("#locationForm");
+      if (!location || !form) return;
+      form.locationId.value = location.id;
+      form.name.value = location.name || "";
+      form.parentId.value = location.parent_id || "";
+      form.type.value = location.type || "仓库";
+      form.code.value = location.code || "";
+      form.managerId.value = location.manager_id || "";
+      form.remark.value = location.remark || "";
+      form.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  });
+
+  document.querySelectorAll("[data-location-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const location = locations().find((item) => item.id === button.dataset.locationDelete);
+      if (!location) return;
+      if (!confirm(`确定删除位置“${location.name}”吗？已被资产使用的位置不能删除。`)) return;
+      try {
+        state = await api("/api/locations/delete", {
+          method: "POST",
+          body: JSON.stringify(withActor({ locationId: location.id }))
         });
         render();
       } catch (exc) {
@@ -2778,6 +4338,50 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-view-asset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectedAssetDetailId = button.dataset.viewAsset;
+      render();
+    });
+  });
+
+  document.querySelector("#closeAssetDetail")?.addEventListener("click", () => {
+    selectedAssetDetailId = "";
+    clearAssetUrlParam();
+    render();
+  });
+
+  document.querySelector("#assetDetailBackdrop")?.addEventListener("click", () => {
+    selectedAssetDetailId = "";
+    clearAssetUrlParam();
+    render();
+  });
+
+  document.querySelectorAll("[data-copy-asset-url]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const asset = state.assets.find((item) => item.id === button.dataset.copyAssetUrl);
+      if (!asset) return;
+      const url = assetDetailUrl(asset);
+      try {
+        await navigator.clipboard.writeText(url);
+        alert("资产详情链接已复制。");
+      } catch {
+        prompt("复制资产详情链接：", url);
+      }
+    });
+  });
+
+  document.querySelector("#printAssetLabel")?.addEventListener("click", () => {
+    const oldTitle = document.title;
+    document.body.classList.add("printing-label");
+    document.title = "";
+    window.print();
+    setTimeout(() => {
+      document.body.classList.remove("printing-label");
+      document.title = oldTitle;
+    }, 1000);
+  });
+
   document.querySelectorAll("[data-delete-record]").forEach((button) => {
     button.addEventListener("click", async () => {
       if (!isDeveloperMode() && !confirm("确定删除这条出入库记录吗？")) return;
@@ -2811,6 +4415,117 @@ function bindEvents() {
   document.querySelector("#recordFilter")?.addEventListener("change", (event) => {
     recordFilter = event.target.value;
     render();
+  });
+
+  document.querySelectorAll("[data-suspect-duplicate-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      suspectDuplicateMode = button.dataset.suspectDuplicateMode || "expanded";
+      localStorage.setItem(SUSPECT_DUPLICATE_MODE_KEY, suspectDuplicateMode);
+      render();
+    });
+  });
+
+  document.querySelector("#checkScopeType")?.addEventListener("change", (event) => {
+    const target = document.querySelector("#checkScopeValue");
+    const template = document.querySelector("#checkScopeOptions");
+    const source = template?.content.querySelector(`[data-scope="${event.target.value}"]`);
+    if (target && source) target.innerHTML = source.innerHTML;
+  });
+
+  document.querySelector("#inventoryCheckForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      state = await api("/api/inventory-checks", {
+        method: "POST",
+        body: JSON.stringify(withActor(formData(event.target)))
+      });
+      render();
+    } catch (exc) {
+      alert(exc.message);
+    }
+  });
+
+  document.querySelectorAll("[data-save-check-item]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const itemId = button.dataset.saveCheckItem;
+      try {
+        state = await api("/api/inventory-checks/item", {
+          method: "POST",
+          body: JSON.stringify(withActor({
+            itemId,
+            actualLocation: document.querySelector(`[data-check-location="${itemId}"]`)?.value || "",
+            actualStatus: document.querySelector(`[data-check-status="${itemId}"]`)?.value || "",
+            actualKeeperId: document.querySelector(`[data-check-keeper="${itemId}"]`)?.value || "",
+            remark: document.querySelector(`[data-check-remark="${itemId}"]`)?.value || ""
+          }))
+        });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-complete-check]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!confirm("确定完成这个盘点任务吗？未保存的明细会按盘亏处理。")) return;
+      try {
+        state = await api("/api/inventory-checks/complete", {
+          method: "POST",
+          body: JSON.stringify(withActor({ taskId: button.dataset.completeCheck }))
+        });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelector("#checkScanForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      state = await api("/api/inventory-checks/scan", {
+        method: "POST",
+        body: JSON.stringify(withActor(formData(event.target)))
+      });
+      render();
+    } catch (exc) {
+      alert(exc.message);
+    }
+  });
+
+  document.querySelector("#checkSurplusForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload = withActor(formData(event.target));
+    payload.quantity = Number(payload.quantity || 1);
+    try {
+      state = await api("/api/inventory-checks/surplus", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      render();
+    } catch (exc) {
+      alert(exc.message);
+    }
+  });
+
+  document.querySelector("#startCheckQrScanner")?.addEventListener("click", async () => {
+    await startQrScanner((raw) => {
+      const input = document.querySelector("#checkScanForm input[name='scanText']");
+      if (input) input.value = raw;
+    });
+  });
+
+  document.querySelectorAll("[data-export-check]").forEach((button) => {
+    button.addEventListener("click", () => {
+      window.location.href = `/api/inventory-checks/export?taskId=${encodeURIComponent(button.dataset.exportCheck)}&userId=${encodeURIComponent(state.currentUser.id)}`;
+    });
+  });
+
+  document.querySelectorAll("[data-export-report]").forEach((button) => {
+    button.addEventListener("click", () => {
+      window.location.href = `/api/reports/export?type=${encodeURIComponent(button.dataset.exportReport)}&userId=${encodeURIComponent(state.currentUser.id)}`;
+    });
   });
 
   document.querySelector("#recordKindFilter")?.addEventListener("change", (event) => {
@@ -3036,7 +4751,7 @@ function bindEvents() {
 
   document.querySelectorAll("[data-promote-user]").forEach((button) => {
     button.addEventListener("click", async () => {
-      await promoteUser(button.dataset.promoteUser);
+      await promoteUser(button.dataset.promoteUser, button.dataset.roleId || "admin");
     });
   });
 
@@ -3119,6 +4834,24 @@ function bindEvents() {
       body: JSON.stringify(withActor({ enabled: event.target.checked }))
     });
     loginSettings.adminPrefillEnabled = Boolean(state.settings?.adminPrefillEnabled);
+    render();
+  });
+
+  document.querySelector("#assetDetailLabelForm")?.addEventListener("change", async (event) => {
+    if (event.target.name !== "enabled") return;
+    state = await api("/api/settings/asset-detail-label", {
+      method: "POST",
+      body: JSON.stringify(withActor({ enabled: event.target.checked }))
+    });
+    render();
+  });
+
+  document.querySelector("#paperModuleForm")?.addEventListener("change", async (event) => {
+    if (event.target.name !== "enabled") return;
+    state = await api("/api/settings/paper-module", {
+      method: "POST",
+      body: JSON.stringify(withActor({ enabled: event.target.checked }))
+    });
     render();
   });
 
@@ -3229,6 +4962,77 @@ function bindEvents() {
       prompt("复制下面的命令，在 PowerShell 里执行：", command);
     }
   });
+
+  document.querySelectorAll("[data-order-type]").forEach((button) => {
+    button.addEventListener("click", () => {
+      orderType = button.dataset.orderType;
+      render();
+    });
+  });
+
+  const orderForms = [
+    ["#claimOrderForm", "/api/claim-orders"],
+    ["#borrowOrderForm", "/api/borrow-orders"],
+    ["#transferOrderForm", "/api/transfer-orders"],
+    ["#repairOrderForm", "/api/repair-orders"],
+    ["#scrapOrderForm", "/api/scrap-orders"]
+  ];
+  orderForms.forEach(([selector, endpoint]) => {
+    document.querySelector(selector)?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        state = await api(endpoint, { method: "POST", body: JSON.stringify(withActor(formData(event.target))) });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-return-borrow]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const returnCheck = prompt("请输入归还验收结果", "外观/数量验收正常");
+      if (returnCheck === null) return;
+      try {
+        state = await api("/api/borrow-orders/return", {
+          method: "POST",
+          body: JSON.stringify(withActor({ orderId: button.dataset.returnBorrow, returnCheck }))
+        });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-finish-repair]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const result = prompt("请输入维修结果", "维修完成，可正常使用");
+      if (result === null) return;
+      try {
+        state = await api("/api/repair-orders/finish", {
+          method: "POST",
+          body: JSON.stringify(withActor({ orderId: button.dataset.finishRepair, result }))
+        });
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelector("#openQrAsset")?.addEventListener("click", () => {
+    openAssetFromQrText(document.querySelector("#qrAssetLookup")?.value || "");
+  });
+
+  document.querySelector("#qrAssetLookup")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.isComposing) {
+      event.preventDefault();
+      openAssetFromQrText(event.target.value);
+    }
+  });
+
+  document.querySelector("#startQrScanner")?.addEventListener("click", startQrScanner);
 
   document.querySelector("#clearDebugFiles")?.addEventListener("click", async () => {
     try {
