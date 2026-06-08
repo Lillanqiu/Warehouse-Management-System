@@ -7,7 +7,7 @@ services:
     environment:
       PORT: 8000
       PUBLIC_PORT: "${WAREHOUSE_HOST_PORT:-38280}"
-      WAREHOUSE_ADMIN_PASSWORD: "${WAREHOUSE_ADMIN_PASSWORD:-change-me-before-use}"
+      WAREHOUSE_ADMIN_PASSWORD: "${WAREHOUSE_ADMIN_PASSWORD:-admin}"
       WAREHOUSE_IMPORTED_USER_PASSWORD: "${WAREHOUSE_IMPORTED_USER_PASSWORD:-change-me-before-use}"
       CONFIG_FILE: /data/port.env
       DATA_DIR: /data

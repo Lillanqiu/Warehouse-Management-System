@@ -2,7 +2,7 @@
 const SESSION_USER_KEY = "warehouse-session-user";
 const VIEW_MODE_KEY = "warehouse-view-mode";
 const SUSPECT_DUPLICATE_MODE_KEY = "warehouse-suspect-duplicate-mode";
-const APP_VERSION = "20260608-school-rbac-flow-v92";
+const APP_VERSION = "20260608-school-rbac-flow-v96";
 
 let state = {
   currentUser: null,
@@ -33,11 +33,17 @@ let view = "dashboard";
 let assetFilter = "";
 let selectedAssetId = "";
 let assetStatusFilter = "all";
+let assetCategoryFilters = [];
+let assetCategoryPanelOpen = false;
+let assetAdvancedFiltersOpen = false;
 let assetKeeperFilter = "all";
 let assetBorrowerFilter = "all";
-let assetSortField = "model";
-let assetSortDir = "asc";
+let assetSortField = "outTime";
+let assetSortDir = "desc";
+let assetPage = 1;
+let assetPageSize = 10;
 let inventoryFilter = "";
+let inventoryAdjustSource = "manual";
 let assetDrawerOpen = false;
 let editingAssetId = "";
 let selectedAssetDetailId = "";
@@ -570,6 +576,20 @@ function assetGroupStatus(group) {
   return `<span class="badge warn">混合</span><span class="mini-meta">在库 ${inStock} / 出库 ${checkedOut}</span>`;
 }
 
+function assetVisual(asset, size = "normal") {
+  const image = asset?.image || "";
+  const label = assetKind(asset) === "耗材" ? "耗" : "资";
+  if (image) {
+    return `<span class="asset-thumb ${size}"><img src="${image}" alt="${asset?.name || "资产图片"}" /></span>`;
+  }
+  return `<span class="asset-thumb ${size} fallback">${label}</span>`;
+}
+
+function assetGroupVisual(group) {
+  const asset = group.assets.find((item) => item.image) || group.assets[0] || {};
+  return assetVisual(asset);
+}
+
 function assetGroupLocations(group) {
   return blank([...new Set(group.assets.map((asset) => blank(asset.location)).filter((item) => item !== "-"))].join("；"));
 }
@@ -716,6 +736,7 @@ function filteredAssetGroups() {
   return assetGroups().filter((group) => {
     if (selectedAssetId && !group.assets.some((asset) => asset.id === selectedAssetId)) return false;
     if (assetStatusFilter !== "all" && !group.assets.some((asset) => asset.status === assetStatusFilter)) return false;
+    if (assetCategoryFilters.length && !group.assets.some((asset) => assetCategoryFilters.includes(assetKind(asset)) || assetCategoryFilters.includes(asset.category))) return false;
     if (assetKeeperFilter !== "all" && !group.assets.some((asset) => asset.keeperId === assetKeeperFilter || assetFlow(asset).borrowerId === assetKeeperFilter)) return false;
     if (assetBorrowerFilter !== "all" && !group.assets.some((asset) => {
       const flow = assetFlow(asset);
@@ -963,7 +984,7 @@ function statusBadge(status) {
 }
 
 function statusText(status) {
-  return { in_stock: "在库", checked_out: "出库/出借", repair: "维修中", retired: "报废" }[status] || status || "-";
+  return { in_stock: "在库可用", checked_out: "使用中", repair: "维修中", retired: "已报废" }[status] || status || "-";
 }
 
 function kindBadge(kind) {
@@ -1161,8 +1182,8 @@ function bindSearchInput(selector, updateValue) {
 }
 
 function renderLogin() {
-  const defaultUser = loginSettings.adminPrefillEnabled ? "admin" : "";
-  const defaultPassword = loginSettings.adminPrefillEnabled ? loginSettings.adminPrefillPassword || "" : "";
+  const defaultUser = "admin";
+  const defaultPassword = loginSettings.adminPrefillPassword || "admin";
   return `
     <section class="login-shell" ${loginBackgroundStyle()}>
       <div class="login-copy">
@@ -1215,8 +1236,8 @@ function renderShell() {
     <section class="layout">
       <aside class="sidebar">
         <div class="brand">
-          <strong>厂库管理</strong>
-          <span>Docker + SQLite</span>
+          <strong>学校资产管理系统</strong>
+          <span>资产全流程管理</span>
         </div>
         <nav class="nav">
           ${navItems.map(([key, label, icon]) => `
@@ -1496,61 +1517,72 @@ function renderAssetCards(items, emptyText) {
 function renderAssets() {
   const groups = filteredAssetGroups();
   const printableAssets = filteredAssets();
+  const totalPages = Math.max(1, Math.ceil(groups.length / assetPageSize));
+  if (assetPage > totalPages) assetPage = totalPages;
+  const pagedGroups = groups.slice((assetPage - 1) * assetPageSize, assetPage * assetPageSize);
   const keeperOptions = selectableUsers().map((user) => `<option value="${user.id}" ${assetKeeperFilter === user.id ? "selected" : ""}>${user.name}</option>`).join("");
   const borrowerOptions = selectableUsers().map((user) => `<option value="${user.id}" ${assetBorrowerFilter === user.id ? "selected" : ""}>${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("");
   return `
     <section class="asset-workspace">
-      <div class="asset-filter-bar no-print">
-        <input id="assetSearch" placeholder="搜索型号 / 规格 / 类别 / 使用人 / 出入库详情" value="${assetFilter}" />
-        <select id="assetStatusFilter">
-          <option value="all" ${assetStatusFilter === "all" ? "selected" : ""}>状态：全部</option>
-          <option value="in_stock" ${assetStatusFilter === "in_stock" ? "selected" : ""}>状态：在库</option>
-          <option value="checked_out" ${assetStatusFilter === "checked_out" ? "selected" : ""}>状态：出库/出借</option>
-          <option value="repair" ${assetStatusFilter === "repair" ? "selected" : ""}>状态：维修中</option>
-          <option value="retired" ${assetStatusFilter === "retired" ? "selected" : ""}>状态：报废</option>
-        </select>
-        <select id="assetKeeperFilter">
-          <option value="all" ${assetKeeperFilter === "all" ? "selected" : ""}>保管人：全部</option>
-          ${keeperOptions}
-        </select>
-        <select id="assetBorrowerFilter">
-          <option value="all" ${assetBorrowerFilter === "all" ? "selected" : ""}>查看出借详情：全部人员</option>
-          ${borrowerOptions}
-        </select>
-        <select id="assetSortField">
-          <option value="model" ${assetSortField === "model" ? "selected" : ""}>排序：型号/规格</option>
-          <option value="category" ${assetSortField === "category" ? "selected" : ""}>排序：类别</option>
-          <option value="quantity" ${assetSortField === "quantity" ? "selected" : ""}>排序：数量</option>
-          <option value="location" ${assetSortField === "location" ? "selected" : ""}>排序：位置</option>
-          <option value="status" ${assetSortField === "status" ? "selected" : ""}>排序：状态</option>
-          <option value="people" ${assetSortField === "people" ? "selected" : ""}>排序：使用/保管人</option>
-          <option value="inTime" ${assetSortField === "inTime" ? "selected" : ""}>排序：最近入库</option>
-          <option value="outTime" ${assetSortField === "outTime" ? "selected" : ""}>排序：最近出库</option>
-          <option value="source" ${assetSortField === "source" ? "selected" : ""}>排序：文件来源</option>
-        </select>
-        <select id="assetSortDir">
-          <option value="asc" ${assetSortDir === "asc" ? "selected" : ""}>升序</option>
-          <option value="desc" ${assetSortDir === "desc" ? "selected" : ""}>降序</option>
-        </select>
-        <button class="secondary" id="clearAssetSelection" type="button">重置</button>
-      </div>
+      ${renderAssetStatusSummary()}
       ${renderBorrowerDetailPanel()}
       <div class="asset-list-panel">
+        <div class="asset-filter-card no-print">
+          <div class="asset-filter-main">
+            <input id="assetSearch" placeholder="搜索资产名称、编号、规格型号" value="${assetFilter}" />
+            <select id="assetStatusFilter">
+              <option value="all" ${assetStatusFilter === "all" ? "selected" : ""}>状态：全部</option>
+              <option value="in_stock" ${assetStatusFilter === "in_stock" ? "selected" : ""}>状态：在库可用</option>
+              <option value="checked_out" ${assetStatusFilter === "checked_out" ? "selected" : ""}>状态：使用中</option>
+              <option value="repair" ${assetStatusFilter === "repair" ? "selected" : ""}>状态：维修中</option>
+              <option value="retired" ${assetStatusFilter === "retired" ? "selected" : ""}>状态：已报废</option>
+            </select>
+            <div class="asset-category-filter">
+              <button class="${assetCategoryPanelOpen ? "active" : ""}" id="toggleAssetCategoryPanel" type="button">分类：${assetCategoryFilters.length ? assetCategoryFilters.join("、") : "全部"} <span>⌄</span></button>
+              ${assetCategoryPanelOpen ? renderAssetCategoryPanel() : ""}
+            </div>
+            <select id="assetSortField">
+              <option value="outTime" ${assetSortField === "outTime" ? "selected" : ""}>排序：出库/入库时间</option>
+              <option value="inTime" ${assetSortField === "inTime" ? "selected" : ""}>排序：最近入库</option>
+              <option value="model" ${assetSortField === "model" ? "selected" : ""}>排序：资产名称</option>
+              <option value="category" ${assetSortField === "category" ? "selected" : ""}>排序：分类</option>
+              <option value="quantity" ${assetSortField === "quantity" ? "selected" : ""}>排序：数量</option>
+              <option value="location" ${assetSortField === "location" ? "selected" : ""}>排序：位置</option>
+            </select>
+            <button class="advanced-filter-button" id="toggleAdvancedAssetFilters" type="button">展开高级筛选 <span>⌄</span></button>
+          </div>
+          <div class="asset-advanced-filters ${assetAdvancedFiltersOpen || assetKeeperFilter !== "all" || assetBorrowerFilter !== "all" ? "show" : ""}">
+            <select id="assetKeeperFilter">
+              <option value="all" ${assetKeeperFilter === "all" ? "selected" : ""}>保管人：全部</option>
+              ${keeperOptions}
+            </select>
+            <select id="assetBorrowerFilter">
+              <option value="all" ${assetBorrowerFilter === "all" ? "selected" : ""}>查看出借详情：全部人员</option>
+              ${borrowerOptions}
+            </select>
+            <select id="assetSortDir">
+              <option value="desc" ${assetSortDir === "desc" ? "selected" : ""}>降序排序</option>
+              <option value="asc" ${assetSortDir === "asc" ? "selected" : ""}>升序排序</option>
+            </select>
+            <button class="secondary" id="clearAssetSelection" type="button">重置筛选</button>
+          </div>
+        </div>
         <div class="asset-list-title">
           <h3>资产列表</h3>
-          <span>共 ${groups.length} 类 / ${printableAssets.length} 条明细</span>
+          <span>共 ${groups.length} 条</span>
+          ${renderAssetPagination(groups.length, totalPages, "top")}
         </div>
       <div class="table-wrap asset-table-wrap">
         <table>
           <thead>
             <tr>
-              <th>型号/规格</th><th>类别</th><th>数量</th><th>位置</th><th>状态</th><th>当前使用/保管</th><th>入库详情</th><th>出库详情</th><th>文件来源</th><th>操作</th>
+              <th>资产名称 / 编号</th><th>类别</th><th>数量</th><th>位置</th><th>状态</th><th>当前使用/保管</th><th>入库详情</th><th>出库详情</th><th>文件来源</th><th>操作</th>
             </tr>
           </thead>
           <tbody>
-            ${groups.map((group) => `
+            ${pagedGroups.map((group) => `
               <tr>
-                <td><strong>${group.model}</strong><div class="mini-meta">合并 ${group.count} 条资产明细</div></td>
+                <td><div class="asset-name-cell">${assetGroupVisual(group)}<div><strong>${group.model}</strong><div class="mini-meta">合并 ${group.count} 条资产明细</div></div></div></td>
                 <td>${group.category}</td>
                 <td>${group.quantity}</td>
                 <td>${assetGroupLocations(group)}</td>
@@ -1565,11 +1597,97 @@ function renderAssets() {
           </tbody>
         </table>
       </div>
+      ${renderAssetPagination(groups.length, totalPages, "bottom")}
       </div>
     </section>
     ${renderPrintableAssetSheets(printableAssets)}
     ${can("assets.manage") && assetDrawerOpen ? renderAssetDrawer() : ""}
     ${selectedAssetDetailId ? renderAssetDetailDrawer() : ""}
+  `;
+}
+
+function renderAssetStatusSummary() {
+  const assets = filteredAssets();
+  const total = assets.length;
+  const using = assets.filter((asset) => asset.status === "checked_out").length;
+  const available = assets.filter((asset) => asset.status === "in_stock").length;
+  const repairing = assets.filter((asset) => asset.status === "repair").length;
+  const retired = assets.filter((asset) => asset.status === "retired").length;
+  return `
+    <div class="asset-status-summary no-print">
+      ${assetStatusCard("资产总数", total, "所有资产明细数量", "total")}
+      ${assetStatusCard("使用中", using, "当前出库/出借数量", "using")}
+      ${assetStatusCard("在库可用", available, "当前在库资产数量", "available")}
+      ${assetStatusCard("维修中", repairing, "维修或处理中资产", "repair")}
+      ${assetStatusCard("已报废", retired, "已报废资产数量", "retired")}
+    </div>
+  `;
+}
+
+function renderAssetCategoryPanel() {
+  const categories = [...new Set([
+    ...state.assets.map((asset) => assetKind(asset)),
+    ...state.assets.map((asset) => asset.category),
+    ...assetCategories()
+  ].filter(Boolean))].slice(0, 28);
+  return `
+    <div class="asset-filter-popover">
+      <div class="asset-filter-popover-actions">
+        <button data-asset-category-all type="button">全选</button>
+        <button data-asset-category-clear type="button">清空筛选</button>
+      </div>
+      <div class="asset-category-options">
+        ${categories.map((category) => `
+          <label class="asset-category-option">
+            <input data-asset-category-option="${category}" type="checkbox" ${assetCategoryFilters.includes(category) ? "checked" : ""} />
+            <span>${category}</span>
+          </label>
+        `).join("")}
+      </div>
+      <div class="asset-filter-popover-footer">
+        <button class="ghost" data-asset-category-reset type="button">重置</button>
+        <button class="primary" data-asset-category-apply type="button">应用</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderAssetPagination(total, totalPages, position) {
+  if (!total) return `<span class="asset-pagination empty-page">共 0 条</span>`;
+  const pages = [];
+  const addPage = (page) => {
+    if (page >= 1 && page <= totalPages && !pages.includes(page)) pages.push(page);
+  };
+  addPage(1);
+  addPage(assetPage - 1);
+  addPage(assetPage);
+  addPage(assetPage + 1);
+  addPage(totalPages);
+  pages.sort((a, b) => a - b);
+  return `
+    <div class="asset-pagination ${position}">
+      <span>共 ${total} 条</span>
+      <select id="${position}AssetPageSize">
+        ${[10, 20, 50].map((size) => `<option value="${size}" ${assetPageSize === size ? "selected" : ""}>${size}条/页</option>`).join("")}
+      </select>
+      <button data-asset-page="${assetPage - 1}" ${assetPage <= 1 ? "disabled" : ""} type="button">‹</button>
+      ${pages.map((page, index) => `${index && page - pages[index - 1] > 1 ? `<span>...</span>` : ""}<button class="${assetPage === page ? "active" : ""}" data-asset-page="${page}" type="button">${page}</button>`).join("")}
+      <button data-asset-page="${assetPage + 1}" ${assetPage >= totalPages ? "disabled" : ""} type="button">›</button>
+      <label class="asset-page-jump">前往 <input id="${position}AssetPageJump" type="number" min="1" max="${totalPages}" value="${assetPage}" /> 页</label>
+    </div>
+  `;
+}
+
+function assetStatusCard(label, value, note, tone) {
+  return `
+    <article class="asset-status-card ${tone}">
+      <span class="asset-status-icon">${label.slice(0, 1)}</span>
+      <div>
+        <strong>${label}</strong>
+        <b>${value}<em> 台/件</em></b>
+        <small>${note}</small>
+      </div>
+    </article>
   `;
 }
 
@@ -1587,6 +1705,29 @@ function inventoryRecords(type = "") {
     .filter((record) => !type || record.type === type)
     .filter((record) => recordMatches(record, inventoryFilter))
     .sort((a, b) => recordMillis(b) - recordMillis(a));
+}
+
+function assetLookupText(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw, window.location.origin);
+    const assetParam = url.searchParams.get("asset");
+    if (assetParam) return assetParam.trim();
+  } catch {
+    // Plain asset names or codes are handled below.
+  }
+  return raw;
+}
+
+function resolveInventoryAsset(value) {
+  const query = assetLookupText(value);
+  if (!query) return null;
+  const normalized = query.toLowerCase();
+  const consumables = state.assets.filter((asset) => assetKind(asset) === "耗材");
+  return consumables.find((asset) => asset.id === query || asset.code === query)
+    || consumables.find((asset) => [asset.name, asset.code, asset.spec, asset.category].some((part) => String(part || "").toLowerCase() === normalized))
+    || consumables.find((asset) => [asset.name, asset.code, asset.spec, asset.category].some((part) => String(part || "").toLowerCase().includes(normalized)));
 }
 
 function stockLevel(asset) {
@@ -1638,7 +1779,7 @@ function renderInventory() {
   const inboundRecords = inventoryRecords("入库");
   const outboundRecords = inventoryRecords("出库");
   const lendableCount = items.length - blockedItems.length;
-  const itemOptions = items.map((asset) => `<option value="${asset.id}">${asset.name}${asset.spec ? ` · ${asset.spec}` : ""}（可出借）</option>`).join("");
+  const itemOptions = items.map((asset) => `<option value="${asset.code}">${asset.name}${asset.spec ? ` · ${asset.spec}` : ""} · ${asset.code}</option>`).join("");
   return `
     <section class="asset-workspace">
       <div class="asset-filter-bar no-print">
@@ -1654,14 +1795,30 @@ function renderInventory() {
       ${can("inventory.manage") ? `
         <section class="panel">
           <div class="section-title"><h2>库存调整</h2><span class="hint">用于盘点修正、损耗、补录等场景，会同步生成流水。</span></div>
-          <form id="inventoryAdjustForm" class="form-grid">
-            <div class="field"><label>耗材</label><select name="assetId" required>${itemOptions}</select></div>
+          <form id="inventoryAdjustForm" class="inventory-adjust-form">
+            <div class="inventory-source-block">
+              <h3>4. 任务来源</h3>
+              <div class="source-toggle large">
+                ${[
+                  ["manual", "手动导入"],
+                  ["link", "链接提取"]
+                ].map(([key, label]) => `<button class="${inventoryAdjustSource === key ? "active" : ""}" data-inventory-source="${key}" type="button">${label}</button>`).join("")}
+              </div>
+            </div>
+            <div class="form-grid">
+            <div class="field wide">
+              <label>${inventoryAdjustSource === "link" ? "链接 / 二维码内容 / 资产编号" : "耗材名称 / 编号 / 规格"}</label>
+              <input name="assetLookup" list="inventoryAssetOptions" required placeholder="${inventoryAdjustSource === "link" ? "粘贴资产详情链接、二维码内容或资产编号" : "输入耗材名称、编号或规格，系统自动匹配"}" />
+              <datalist id="inventoryAssetOptions">${itemOptions}</datalist>
+              <p class="hint">${inventoryAdjustSource === "link" ? "支持资产详情 URL、二维码内容、资产编号。" : "不用滚动选择，输入关键字后直接匹配耗材。"}</p>
+            </div>
             <div class="field"><label>调整类型</label><select name="mode"><option value="increase">增加库存</option><option value="decrease">减少库存</option></select></div>
             <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
             <div class="field"><label>经办/领用人</label><select name="userId">${selectableUsers().map((user) => `<option value="${user.id}">${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("")}</select></div>
             <div class="field"><label>单号</label><input name="paperNo" placeholder="可选" /></div>
             <div class="field"><label>原因</label><input name="reason" placeholder="盘点调整 / 损耗 / 补录" /></div>
             <div class="actions form-grid wide"><button class="primary" type="submit">保存调整</button></div>
+            </div>
           </form>
         </section>
       ` : ""}
@@ -2219,8 +2376,19 @@ function renderAssetDrawer() {
           <button class="ghost icon-button" id="closeAssetDrawer" type="button">×</button>
         </div>
         <div class="drawer-body">
+          <input type="hidden" name="image" value="${asset.image || ""}" />
           <div class="field"><label>资产编号</label><input name="code" value="${asset.code || ""}" placeholder="自动生成" /></div>
           <div class="field"><label><b>*</b> 资产名称</label><input name="name" required value="${asset.name || ""}" placeholder="请输入资产名称" /></div>
+          <div class="field wide">
+            <label>资产图片</label>
+            <label class="photo-upload asset-image-upload ${asset.image ? "has-image" : ""}" ${asset.image ? `style="background-image:url('${String(asset.image).replaceAll("'", "%27")}')"` : ""}>
+              <input name="imageFile" type="file" accept="image/*" />
+              <span>${asset.image ? "" : "☁"}</span>
+              <strong>${asset.image ? "点击更换资产图片" : "点击上传资产图片"}</strong>
+              <em id="assetImageFileName">支持 JPG、PNG、WebP，自动压缩</em>
+            </label>
+            ${asset.image ? `<label class="check-line"><input name="removeImage" type="checkbox" /><span>移除当前图片</span></label>` : ""}
+          </div>
           <div class="field"><label>品牌</label><input name="brand" value="${asset.brand || ""}" placeholder="品牌 / 厂商" /></div>
           <div class="field"><label><b>*</b> 类别</label><select name="category" required>${categoryOptions}</select></div>
           <div class="field"><label>规格</label><input name="spec" value="${asset.spec || ""}" placeholder="请输入规格型号" /></div>
@@ -2293,6 +2461,7 @@ function renderAssetDetailDrawer() {
       </div>
       <div class="drawer-body">
         <section class="detail-hero">
+          ${assetVisual(asset, "large")}
           <div>
             <span class="hint">${asset.code}</span>
             <h3>${asset.name}</h3>
@@ -4112,21 +4281,68 @@ function bindEvents() {
 
   bindSearchInput("#assetSearch", (value) => {
     assetFilter = value;
+    assetPage = 1;
   });
 
   document.querySelector("#assetStatusFilter")?.addEventListener("change", (event) => {
     assetStatusFilter = event.target.value;
+    assetPage = 1;
+    render();
+  });
+
+  document.querySelector("#toggleAssetCategoryPanel")?.addEventListener("click", () => {
+    assetCategoryPanelOpen = !assetCategoryPanelOpen;
+    render();
+  });
+
+  document.querySelectorAll("[data-asset-category-option]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const category = input.dataset.assetCategoryOption;
+      assetCategoryFilters = input.checked
+        ? [...new Set([...assetCategoryFilters, category])]
+        : assetCategoryFilters.filter((item) => item !== category);
+      assetPage = 1;
+      render();
+    });
+  });
+
+  document.querySelector("[data-asset-category-all]")?.addEventListener("click", () => {
+    assetCategoryFilters = [...new Set([
+      ...state.assets.map((asset) => assetKind(asset)),
+      ...state.assets.map((asset) => asset.category),
+      ...assetCategories()
+    ].filter(Boolean))].slice(0, 28);
+    assetPage = 1;
+    render();
+  });
+
+  document.querySelector("[data-asset-category-clear]")?.addEventListener("click", () => {
+    assetCategoryFilters = [];
+    assetPage = 1;
+    render();
+  });
+
+  document.querySelector("[data-asset-category-reset]")?.addEventListener("click", () => {
+    assetCategoryFilters = [];
+    assetPage = 1;
+    render();
+  });
+
+  document.querySelector("[data-asset-category-apply]")?.addEventListener("click", () => {
+    assetCategoryPanelOpen = false;
     render();
   });
 
   document.querySelector("#assetKeeperFilter")?.addEventListener("change", (event) => {
     assetKeeperFilter = event.target.value;
+    assetPage = 1;
     render();
   });
 
   document.querySelector("#assetBorrowerFilter")?.addEventListener("change", (event) => {
     assetBorrowerFilter = event.target.value;
     if (assetBorrowerFilter !== "all") assetStatusFilter = "checked_out";
+    assetPage = 1;
     render();
   });
 
@@ -4137,11 +4353,18 @@ function bindEvents() {
 
   document.querySelector("#assetSortField")?.addEventListener("change", (event) => {
     assetSortField = event.target.value;
+    assetPage = 1;
     render();
   });
 
   document.querySelector("#assetSortDir")?.addEventListener("change", (event) => {
     assetSortDir = event.target.value;
+    assetPage = 1;
+    render();
+  });
+
+  document.querySelector("#toggleAdvancedAssetFilters")?.addEventListener("click", () => {
+    assetAdvancedFiltersOpen = !assetAdvancedFiltersOpen;
     render();
   });
 
@@ -4149,11 +4372,39 @@ function bindEvents() {
     selectedAssetId = "";
     assetFilter = "";
     assetStatusFilter = "all";
+    assetCategoryFilters = [];
+    assetCategoryPanelOpen = false;
+    assetAdvancedFiltersOpen = false;
     assetKeeperFilter = "all";
     assetBorrowerFilter = "all";
-    assetSortField = "model";
-    assetSortDir = "asc";
+    assetSortField = "outTime";
+    assetSortDir = "desc";
+    assetPage = 1;
     render();
+  });
+
+  document.querySelectorAll("[data-asset-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextPage = Number(button.dataset.assetPage || assetPage);
+      if (!Number.isFinite(nextPage) || nextPage < 1) return;
+      assetPage = nextPage;
+      render();
+    });
+  });
+
+  document.querySelectorAll("#topAssetPageSize, #bottomAssetPageSize").forEach((select) => {
+    select.addEventListener("change", (event) => {
+      assetPageSize = Number(event.target.value || 10);
+      assetPage = 1;
+      render();
+    });
+  });
+
+  document.querySelectorAll("#topAssetPageJump, #bottomAssetPageJump").forEach((input) => {
+    input.addEventListener("change", (event) => {
+      assetPage = Math.max(1, Number(event.target.value || 1));
+      render();
+    });
   });
 
   bindSearchInput("#inventorySearch", (value) => {
@@ -4168,6 +4419,13 @@ function bindEvents() {
   document.querySelector("#inventoryAdjustForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const payload = withActor(formData(event.target));
+    const asset = resolveInventoryAsset(payload.assetLookup);
+    if (!asset) {
+      alert("没有匹配到耗材。请确认输入的是耗材名称、资产编号、规格，或有效资产详情链接。");
+      return;
+    }
+    payload.assetId = asset.id;
+    delete payload.assetLookup;
     payload.quantity = Number(payload.quantity);
     try {
       state = await api("/api/inventory/adjust", {
@@ -4178,6 +4436,13 @@ function bindEvents() {
     } catch (exc) {
       alert(exc.message);
     }
+  });
+
+  document.querySelectorAll("[data-inventory-source]").forEach((button) => {
+    button.addEventListener("click", () => {
+      inventoryAdjustSource = button.dataset.inventorySource || "manual";
+      render();
+    });
   });
 
   document.querySelectorAll("[data-safe-stock]").forEach((button) => {
@@ -4640,6 +4905,14 @@ function bindEvents() {
     event.preventDefault();
     const payload = withActor(formData(event.target));
     payload.quantity = Number(payload.quantity);
+    const imageFile = event.target.imageFile?.files?.[0];
+    delete payload.imageFile;
+    if (payload.removeImage) {
+      payload.image = "";
+    } else if (imageFile) {
+      payload.image = await imageToDataUrl(imageFile);
+    }
+    delete payload.removeImage;
     const endpoint = payload.assetId ? "/api/assets/update" : "/api/assets";
     state = await api(endpoint, { method: "POST", body: JSON.stringify(payload) });
     assetDrawerOpen = false;
@@ -4835,6 +5108,12 @@ function bindEvents() {
     });
     loginSettings.adminPrefillEnabled = Boolean(state.settings?.adminPrefillEnabled);
     render();
+  });
+
+  document.querySelector("#assetForm input[name='imageFile']")?.addEventListener("change", (event) => {
+    const fileName = event.target.files?.[0]?.name || "支持 JPG、PNG、WebP，自动压缩";
+    const label = document.querySelector("#assetImageFileName");
+    if (label) label.textContent = fileName;
   });
 
   document.querySelector("#assetDetailLabelForm")?.addEventListener("change", async (event) => {

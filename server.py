@@ -25,10 +25,10 @@ CONSUMABLE_REQUEST_TEMPLATE = TEMPLATE_DIR / "consumable-request-template.docx"
 CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/config/port.env"))
 PORT = int(os.environ.get("PORT", "8000"))
 PUBLIC_PORT = os.environ.get("PUBLIC_PORT") or os.environ.get("WAREHOUSE_HOST_PORT") or os.environ.get("PORT", "8000")
-DEFAULT_ADMIN_PASSWORD = os.environ.get("WAREHOUSE_ADMIN_PASSWORD", "change-me-before-use")
+DEFAULT_ADMIN_PASSWORD = os.environ.get("WAREHOUSE_ADMIN_PASSWORD", "admin")
 DEFAULT_IMPORTED_USER_PASSWORD = os.environ.get("WAREHOUSE_IMPORTED_USER_PASSWORD", "change-me-before-use")
 BEIJING_TZ = timezone(timedelta(hours=8))
-APP_VERSION = "20260608-school-rbac-flow-v92"
+APP_VERSION = "20260608-school-rbac-flow-v96"
 REQUEST_IP = contextvars.ContextVar("request_ip", default="")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -1137,7 +1137,7 @@ def update_asset_fields(conn, asset_id, updates, operator_id, action, business_n
     allowed = {
         "code", "name", "category", "spec", "quantity", "safe_stock", "brand", "unit", "unit_price",
         "total_amount", "purchase_date", "inbound_date", "supplier", "use_department", "use_user_id",
-        "source", "creator_id", "created_at", "updated_at", "location", "keeper_id", "status", "remark",
+        "source", "creator_id", "created_at", "updated_at", "location", "keeper_id", "status", "remark", "image",
     }
     pairs = [(key, value) for key, value in updates.items() if key in allowed]
     if not pairs:
@@ -1181,6 +1181,7 @@ def asset_payload_values(payload, actor, existing=None):
         "keeper_id": keeper_id,
         "status": clean_docx_text(payload.get("status") or (existing["status"] if existing else "in_stock")),
         "remark": clean_docx_text(payload.get("remark") or ""),
+        "image": payload.get("image", existing["image"] if existing and "image" in existing.keys() else "") or "",
     }
 
 
@@ -1255,6 +1256,39 @@ def ensure_column(conn, table, column, definition):
         conn.execute(f"alter table {table} add column {column} {definition}")
 
 
+def ensure_default_admin_login(conn):
+    admin = conn.execute(
+        """
+        select id from users
+        where username = 'admin' or id = 'u-admin'
+        order by case when username = 'admin' then 0 else 1 end
+        limit 1
+        """
+    ).fetchone()
+    if admin:
+        conn.execute(
+            """
+            update users
+            set username = 'admin',
+                password = ?,
+                role = 'admin',
+                role_id = 'admin',
+                active = 1
+            where id = ?
+            """,
+            (DEFAULT_ADMIN_PASSWORD, admin["id"]),
+        )
+        return
+    conn.execute(
+        """
+        insert into users
+        (id, username, password, name, role, role_id, department, active)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("u-admin", "admin", DEFAULT_ADMIN_PASSWORD, "系统管理员", "admin", "admin", "仓储部", 1),
+    )
+
+
 def init_db():
     with db() as conn:
         conn.executescript(
@@ -1327,7 +1361,8 @@ def init_db():
               location text not null,
               keeper_id text not null references users(id),
               status text not null,
-              remark text
+              remark text,
+              image text
             );
 
             create table if not exists records (
@@ -1601,6 +1636,7 @@ def init_db():
         seed_rbac(conn)
         migrate_user_roles(conn)
         ensure_column(conn, "records", "photo", "text")
+        ensure_column(conn, "assets", "image", "text")
         ensure_column(conn, "borrow_orders", "quantity", "integer not null default 1")
         ensure_column(conn, "borrow_orders", "count_quantity", "integer not null default 1")
         ensure_column(conn, "audits", "ip", "text")
@@ -1667,6 +1703,7 @@ def init_db():
         migrate_word_record_times_from_archives(conn)
         migrate_remove_word_records_using_import_time(conn)
         migrate_deduplicate_duplicate_records(conn)
+        ensure_default_admin_login(conn)
         existing_departments = conn.execute("select count(*) from departments").fetchone()[0]
         if not existing_departments:
             user_departments = rows_to_list(conn.execute("select distinct department as name from users where department <> ''"))
@@ -3857,8 +3894,8 @@ class Handler(SimpleHTTPRequestHandler):
                         insert into assets
                         (id, code, name, category, spec, quantity, safe_stock, brand, unit, unit_price, total_amount,
                          purchase_date, inbound_date, supplier, use_department, use_user_id, source, creator_id,
-                         created_at, updated_at, location, keeper_id, status, remark)
-                        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         created_at, updated_at, location, keeper_id, status, remark, image)
+                        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             asset_id,
@@ -3885,6 +3922,7 @@ class Handler(SimpleHTTPRequestHandler):
                             values["keeper_id"],
                             values["status"],
                             values["remark"],
+                            values["image"],
                         ),
                     )
                     asset = conn.execute("select * from assets where id = ?", (asset_id,)).fetchone()
