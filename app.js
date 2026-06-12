@@ -1,8 +1,12 @@
 ﻿const USER_KEY = "warehouse-current-user";
 const SESSION_USER_KEY = "warehouse-session-user";
+const TOKEN_KEY = "warehouse-current-session-token";
+const SESSION_TOKEN_KEY = "warehouse-session-token";
 const VIEW_MODE_KEY = "warehouse-view-mode";
 const SUSPECT_DUPLICATE_MODE_KEY = "warehouse-suspect-duplicate-mode";
-const APP_VERSION = "20260608-school-rbac-flow-v96";
+const APP_VERSION = "20260612-dashboard-overview-v134";
+const PURCHASE_WISH_DEFAULT_UPLIFT = 30;
+const DRAWER_WIDTH_STORAGE_PREFIX = "warehouse-drawer-width";
 
 let state = {
   currentUser: null,
@@ -26,7 +30,7 @@ let state = {
   roles: [],
   permissions: [],
   menuPermissions: [],
-  settings: { departments: [], assetCategories: [], assetCategoryItems: [], locations: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, assetDetailLabelEnabled: true, paperModuleEnabled: true, loginBackgroundImage: "", servicePort: "", printAssetTemplateName: "", printAssetTemplateCustom: false, printConsumableTemplateName: "", printConsumableTemplateCustom: false }
+  settings: { departments: [], assetCategories: [], assetCategoryItems: [], locations: [], deviceGroupRules: [], multiDepartmentEnabled: false, developerModeEnabled: false, adminPrefillEnabled: false, assetDetailLabelEnabled: true, paperModuleEnabled: true, loginBackgroundImage: "", servicePort: "", printAssetTemplateName: "", printAssetTemplateCustom: false, printConsumableTemplateName: "", printConsumableTemplateCustom: false }
 };
 let loginSettings = { adminPrefillEnabled: false, adminPrefillPassword: "", loginBackgroundImage: "", appVersion: APP_VERSION };
 let view = "dashboard";
@@ -34,6 +38,7 @@ let assetFilter = "";
 let selectedAssetId = "";
 let assetStatusFilter = "all";
 let assetCategoryFilters = [];
+let assetFamilyFilter = "all";
 let assetCategoryPanelOpen = false;
 let assetAdvancedFiltersOpen = false;
 let assetKeeperFilter = "all";
@@ -43,15 +48,19 @@ let assetSortDir = "desc";
 let assetPage = 1;
 let assetPageSize = 10;
 let inventoryFilter = "";
+let inventoryView = "status";
 let inventoryAdjustSource = "manual";
 let assetDrawerOpen = false;
 let editingAssetId = "";
 let selectedAssetDetailId = "";
 let dashboardSearch = "";
+let dashboardUsageOpen = false;
+let dashboardUsageUserId = "";
 let recordFilter = "all";
 let recordKindFilter = "all";
 let selectedDepartment = "all";
-let recordMode = "manual";
+let recordMode = "import";
+let recordStatsPeriod = nowLocal().slice(0, 7);
 let importKind = "inbound";
 let importResult = null;
 let wordImportResult = null;
@@ -61,13 +70,97 @@ let auditStartTime = "";
 let auditEndTime = "";
 let orderType = "claim";
 let reportType = "ledger";
+let deviceGroupFilter = "";
+let selectedDeviceGroupKeys = new Set();
+let deviceGroupDraftName = "";
+let deviceGroupDraftFamily = "";
+let selectedAssetGroupKeys = new Set();
+let ledgerDrawerKey = "";
+let ledgerDrawerMode = "";
+let recordActionMode = "inbound";
+let recordPrefillAssetId = "";
+let requestSection = "asset";
+let systemSection = "users";
+let selectedCheckTaskId = "";
+let selectedCheckGroupKey = "";
+let activeCheckItemId = "";
 let searchRenderTimer = null;
 let messagePanelOpen = false;
 let suspectDuplicateMode = localStorage.getItem(SUSPECT_DUPLICATE_MODE_KEY) || "expanded";
 let composingInputs = new Set();
+let systemHealth = null;
+let systemHealthCheckedAt = "";
+let systemHealthLoading = false;
+let loginNotice = "";
+
+function drawerWidthStorageKey(kind) {
+  return `${DRAWER_WIDTH_STORAGE_PREFIX}-${kind || "default"}`;
+}
+
+function savedDrawerWidth(kind, fallback) {
+  const raw = Number(localStorage.getItem(drawerWidthStorageKey(kind)) || 0);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+function drawerWidthStyle(kind, fallback) {
+  const width = savedDrawerWidth(kind, fallback);
+  return `style="--drawer-width: ${Math.round(width)}px" data-drawer-kind="${attrText(kind)}"`;
+}
+
+function renderDrawerResizeHandle(label = "拖动调整窗口宽度") {
+  return `<button class="drawer-resize-handle" data-drawer-resize-handle type="button" aria-label="${label}" title="${label}"></button>`;
+}
 
 function viewRoleParam() {
   return localStorage.getItem(VIEW_MODE_KEY) === "user" ? "&viewRole=user" : "";
+}
+
+function clearStoredSession() {
+  localStorage.removeItem(USER_KEY);
+  localStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(SESSION_USER_KEY);
+  sessionStorage.removeItem(SESSION_TOKEN_KEY);
+}
+
+function storedSession() {
+  const localUserId = localStorage.getItem(USER_KEY);
+  const localToken = localStorage.getItem(TOKEN_KEY);
+  if (localUserId && localToken) return { userId: localUserId, sessionToken: localToken };
+  const sessionUserId = sessionStorage.getItem(SESSION_USER_KEY);
+  const sessionToken = sessionStorage.getItem(SESSION_TOKEN_KEY);
+  if (sessionUserId && sessionToken) return { userId: sessionUserId, sessionToken };
+  if (localUserId || localToken || sessionUserId || sessionToken) clearStoredSession();
+  return null;
+}
+
+function saveStoredSession(userId, sessionToken, remember) {
+  clearStoredSession();
+  const userStore = remember ? localStorage : sessionStorage;
+  const tokenStore = remember ? localStorage : sessionStorage;
+  userStore.setItem(remember ? USER_KEY : SESSION_USER_KEY, userId);
+  tokenStore.setItem(remember ? TOKEN_KEY : SESSION_TOKEN_KEY, sessionToken);
+}
+
+function sessionToken() {
+  return storedSession()?.sessionToken || "";
+}
+
+function authQuery(userId = state.currentUser?.id) {
+  const token = sessionToken();
+  return `userId=${encodeURIComponent(userId || "")}&sessionToken=${encodeURIComponent(token)}${viewRoleParam()}`;
+}
+
+function handleSessionExpired(message = "登录已过期，请重新登录。") {
+  loginNotice = message || "登录已过期，请重新登录。";
+  clearStoredSession();
+  localStorage.removeItem(VIEW_MODE_KEY);
+  state.currentUser = null;
+  view = "dashboard";
+  render();
+  const error = new Error(loginNotice);
+  error.status = 401;
+  error.code = "SESSION_EXPIRED";
+  return error;
 }
 
 async function api(path, options = {}) {
@@ -78,28 +171,33 @@ async function api(path, options = {}) {
       ...options
     });
   } catch (exc) {
-    throw new Error(exc?.message === "Failed to fetch" ? "网络请求中断：文件可能较大、服务正在重启，或浏览器连接被断开，请稍后重试。" : exc.message || "网络请求失败");
+    throw new Error(exc?.message === "Failed to fetch" ? "网络请求中断：服务可能正在重启、后端处理异常、文件较大或浏览器连接被断开，请稍后重试。" : exc.message || "网络请求失败");
   }
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "请求失败");
+  if (!response.ok) {
+    if (data.code === "SESSION_EXPIRED") throw handleSessionExpired(data.error);
+    const error = new Error(data.error || "请求失败");
+    error.status = response.status;
+    error.code = data.code || "";
+    throw error;
+  }
   return data;
 }
 
 async function loadState() {
   await loadLoginSettings();
-  const saved = localStorage.getItem(USER_KEY) || sessionStorage.getItem(SESSION_USER_KEY);
+  const saved = storedSession();
   if (!saved) {
     render();
     return;
   }
   try {
-    const data = await api(`/api/state?userId=${encodeURIComponent(saved)}${viewRoleParam()}`);
+    const data = await api(`/api/state?${authQuery(saved.userId)}`);
     ensureFreshVersion(data);
     state = data;
     applyAssetUrlSelection();
   } catch {
-    localStorage.removeItem(USER_KEY);
-    sessionStorage.removeItem(SESSION_USER_KEY);
+    clearStoredSession();
     state.currentUser = null;
   }
   render();
@@ -116,7 +214,7 @@ async function loadLoginSettings() {
 
 async function refresh() {
   if (!state.currentUser) return render();
-  state = await api(`/api/state?userId=${encodeURIComponent(state.currentUser.id)}${viewRoleParam()}`);
+  state = await api(`/api/state?${authQuery()}`);
   ensureFreshVersion(state);
   applyAssetUrlSelection();
   render();
@@ -153,6 +251,14 @@ function fmt(value) {
 function blank(value) {
   const text = String(value ?? "").trim();
   return text && !["未填写", "未填", "无"].includes(text) ? text : "-";
+}
+
+function attrText(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }
 
 function isAdmin() {
@@ -294,46 +400,463 @@ function assetName(assetId) {
   return asset ? `${asset.name}（${asset.code}）` : "未知资产";
 }
 
+const DEVICE_FAMILY_RULES = [
+  { id: "computer", name: "电脑设备", icon: "▣", terms: ["电脑", "笔记本", "台式", "主机", "工作站", "服务器", "昭阳", "thinkpad", "小主机", "迷你主机", "mini pc"] },
+  { id: "display", name: "显示设备", icon: "▤", terms: ["显示器", "显示屏", "屏幕", "监视器", "投影", "电视", "aoc"] },
+  { id: "storage", name: "存储设备", icon: "◉", terms: ["硬盘", "固态", "ssd", "m.2", "m2", "nvme", "pcie", "u盘", "存储", "sa1000", "三星750", "三星970", "三星980", "三星990", "机械硬盘"] },
+  { id: "teaching", name: "教学资料", icon: "▥", terms: ["教材", "教程", "文档", "资料", "讲义", "办公教学", "python", "软件工具", "图书"] },
+  { id: "peripheral", name: "外设配件", icon: "◆", terms: ["键盘", "鼠标", "耳机", "网卡", "无线网卡", "扩展坞", "转接器", "适配器", "线缆", "数据线", "hdmi", "usb", "type-c", "typec", "支架", "配件", "套件"] },
+  { id: "consumable", name: "耗材用品", icon: "◍", terms: ["耗材", "墨盒", "硒鼓", "纸", "电池", "网线"] },
+  { id: "other", name: "其他设备", icon: "◇", terms: [] }
+];
+
+function textHasAny(text, terms) {
+  return terms.some((term) => text.includes(term));
+}
+
+function deviceFamilyRule(id) {
+  return DEVICE_FAMILY_RULES.find((rule) => rule.id === id);
+}
+
+function deviceFamily(asset) {
+  const text = rawAssetComparableText(asset);
+  if (textHasAny(text, ["硬盘", "固态", "ssd", "m.2", "m2", "nvme", "pcie", "u盘", "sa1000", "三星750", "三星970", "三星980", "三星990"])) return deviceFamilyRule("storage");
+  if (textHasAny(text, ["键盘", "鼠标", "耳机", "网卡", "无线网卡", "扩展坞", "转接器", "适配器", "线缆", "数据线", "hdmi", "type-c", "typec", "支架"])) return deviceFamilyRule("peripheral");
+  if (textHasAny(text, ["显示器", "显示屏", "屏幕", "监视器", "投影", "电视", "aoc"]) && !textHasAny(text, ["主机", "套件"])) return deviceFamilyRule("display");
+  const matched = DEVICE_FAMILY_RULES.find((rule) => rule.id !== "consumable" && rule.terms.length && textHasAny(text, rule.terms));
+  if (matched) return matched;
+  if (assetKind(asset) === "耗材") return deviceFamilyRule("consumable");
+  return DEVICE_FAMILY_RULES.find((rule) => rule.terms.length && textHasAny(text, rule.terms))
+    || deviceFamilyRule("other");
+}
+
+function deviceGroupRules() {
+  return state.settings?.deviceGroupRules || [];
+}
+
+function deviceGroupRuleForSourceKey(sourceKey) {
+  return deviceGroupRules().find((rule) => rule.sourceKey === sourceKey);
+}
+
+function manualDeviceGroupKey(rule) {
+  const name = String(rule?.groupName || "").trim();
+  return `manual|${compactAssetText(name) || name.toLowerCase()}`;
+}
+
+function manualDeviceGroupSummaries() {
+  const summaries = new Map();
+  for (const rule of deviceGroupRules()) {
+    const key = `${rule.groupName}|${rule.familyId || ""}`;
+    if (!summaries.has(key)) {
+      summaries.set(key, {
+        groupName: rule.groupName,
+        familyId: rule.familyId || "",
+        sourceKeys: []
+      });
+    }
+    summaries.get(key).sourceKeys.push(rule.sourceKey);
+  }
+  return [...summaries.values()].sort((a, b) => a.groupName.localeCompare(b.groupName, "zh-Hans-CN", { numeric: true, sensitivity: "base" }));
+}
+
+function compactAssetText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/think\s*pad/g, "thinkpad")
+    .replace(/mini\s*pc|迷你电脑/g, "迷你主机")
+    .replace(/显示屏|屏幕|监视器/g, "显示器")
+    .replace(/机械键盘|有线键盘|无线键盘|键鼠套装/g, "键盘")
+    .replace(/固态硬盘|移动硬盘|机械硬盘|硬碟/g, "硬盘")
+    .replace(/固态/g, "硬盘")
+    .replace(/内存条/g, "内存")
+    .replace(/[\s　·•.,，。:：;；、/\\|_+\-—–~～"'“”‘’()[\]{}【】<>《》]/g, "")
+    .trim();
+}
+
+function rawAssetComparableText(asset) {
+  return [asset?.name, asset?.spec, asset?.brand]
+    .filter(Boolean)
+    .join(" ")
+    .normalize("NFKC")
+    .toLowerCase();
+}
+
+function stripCapacityText(value) {
+  return String(value || "")
+    .replace(/\d{1,3}\s*g(?:b)?\s*\+\s*\d+(?:\.\d+)?\s*t(?:b)?/gi, "")
+    .replace(/\d{1,3}\s*g(?:b)?\s*\+\s*\d{3,4}\s*g(?:b)?/gi, "")
+    .replace(/\d{1,3}g\d+(?:\.\d+)?t/g, "")
+    .replace(/\d{1,3}g\d{3,4}g/g, "")
+    .replace(/\d{3,4}g$/g, "")
+    .replace(/\d+(?:\.\d+)?t$/g, "");
+}
+
+function normalizedStorageSize(value, unit) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  if (String(unit || "").toLowerCase().startsWith("t")) return `${number}t`;
+  return `${Math.round(number)}g`;
+}
+
+function assetConfigKey(asset) {
+  const raw = rawAssetComparableText(asset);
+  const keys = [];
+  for (const match of raw.matchAll(/(\d{1,3})\s*g(?:b)?\s*\+\s*(\d+(?:\.\d+)?)\s*t(?:b)?/g)) {
+    keys.push(`${Number(match[1])}g+${Number(match[2])}t`);
+  }
+  for (const match of raw.matchAll(/(\d{1,3})\s*g(?:b)?\s*\+\s*(\d{3,4})\s*g(?:b)?/g)) {
+    keys.push(`${Number(match[1])}g+${Number(match[2])}g`);
+  }
+  if (!keys.length) {
+    const compact = compactAssetText(raw);
+    const joined = compact.match(/(\d{1,3})g(\d+(?:\d)?)t/);
+    if (joined) keys.push(`${Number(joined[1])}g+${Number(joined[2])}t`);
+    const joinedG = compact.match(/(\d{1,3})g(\d{3,4})g/);
+    if (joinedG) keys.push(`${Number(joinedG[1])}g+${Number(joinedG[2])}g`);
+  }
+  if (!keys.length) {
+    for (const match of raw.matchAll(/(\d+(?:\.\d+)?)\s*(t|tb|g|gb)\b/g)) {
+      const size = normalizedStorageSize(match[1], match[2]);
+      if (size) keys.push(size);
+    }
+  }
+  return [...new Set(keys)].join("+");
+}
+
+function assetBrandKey(asset) {
+  const raw = rawAssetComparableText(asset);
+  const compact = compactAssetText(raw);
+  const brand = String(asset?.brand || "").trim();
+  if (brand) return compactAssetText(brand);
+  if (compact.includes("联想") || compact.includes("lenovo") || compact.includes("thinkpad") || compact.includes("昭阳")) return "联想";
+  if (compact.includes("aoc")) return "aoc";
+  if (compact.includes("铭凡")) return "铭凡";
+  if (compact.includes("金士顿") || compact.includes("kingston")) return "金士顿";
+  if (compact.includes("三星") || compact.includes("samsung")) return "三星";
+  return "";
+}
+
+function isM2StorageAsset(asset) {
+  const raw = rawAssetComparableText(asset);
+  const compact = compactAssetText(raw);
+  return textHasAny(raw, ["m.2", "m2", "nvme", "pcie"])
+    || compact.includes("sa1000m8")
+    || /(?:三星|samsung)?(?:970|980|990)(?:evo|pro)?/.test(compact);
+}
+
+function assetComparableName(asset) {
+  let text = stripCapacityText(compactAssetText(asset?.name));
+  if (!text) return "未命名资产";
+  text = text.replace(/显示器\d+$/g, "显示器");
+  text = text.replace(/笔记本电脑|手提电脑/g, "笔记本");
+  text = text.replace(/台式电脑|台式机电脑|电脑主机/g, "台式机");
+  const lenovoZhaoyang = text.match(/^(联想)?昭阳(x\d{2,4})/);
+  if (lenovoZhaoyang) return `${lenovoZhaoyang[1] || "联想"}昭阳${lenovoZhaoyang[2]}`;
+  const thinkpad = text.match(/^(联想)?thinkpad(p\d+[a-z]?)/);
+  if (thinkpad) return `${thinkpad[1] || "联想"}thinkpad${thinkpad[2]}`;
+  const aoc = text.match(/^aoc(显示器)?/);
+  if (aoc) return "aoc显示器";
+  const minix = text.match(/^铭凡(ms\d+)?/);
+  if (minix) return minix[1] ? `铭凡${minix[1]}` : "铭凡小主机";
+  const kingston = text.match(/^金士顿(sa\d+)/);
+  if (kingston) return `金士顿${kingston[1]}`;
+  const samsung = text.match(/^三星(\d{3,4})/);
+  if (samsung) return `三星${samsung[1]}`;
+  if (text.includes("显示器")) return `${assetBrandKey(asset) || ""}显示器`.trim() || "显示器";
+  if (text.includes("键盘")) return `${assetBrandKey(asset) || ""}键盘`.trim() || "键盘";
+  if (text.includes("网卡")) return `${assetBrandKey(asset) || ""}网卡`.trim() || "网卡";
+  if (text.includes("硬盘")) return `${assetBrandKey(asset) || ""}硬盘`.trim() || "硬盘";
+  return text;
+}
+
+function assetComparableSpec(asset) {
+  const spec = stripCapacityText(compactAssetText(asset?.spec));
+  const familyId = deviceFamily(asset)?.id || "";
+  if (["display", "storage", "peripheral", "teaching", "consumable"].includes(familyId)) return "";
+  return spec;
+}
+
+function assetDeviceType(asset) {
+  const raw = rawAssetComparableText(asset);
+  const compact = compactAssetText(raw);
+  const family = deviceFamily(asset);
+  if (family?.id === "computer") {
+    if (textHasAny(raw, ["笔记本", "notebook", "laptop", "thinkpad", "昭阳", "悦plus", "红米笔记本", "p15v", "x7-16", "x716"])) {
+      return { key: "laptop", title: "笔记本电脑系列" };
+    }
+    if (textHasAny(raw, ["小主机", "迷你主机", "mini pc", "ms01", "台式", "工作站", "主机"])) {
+      return { key: "desktop", title: "小主机 / 工作站" };
+    }
+    return { key: "computer", title: "电脑设备" };
+  }
+  if (family?.id === "display") {
+    const brand = assetBrandKey(asset);
+    return { key: `display-${brand || "generic"}`, title: brand ? `${brand.toUpperCase()} 显示器` : "显示设备" };
+  }
+  if (family?.id === "storage") {
+    if (compact.includes("硬盘盒")) return { key: "drive-enclosure", title: "硬盘盒 / 存储扩展盒" };
+    if (isM2StorageAsset(asset)) return { key: "m2-ssd", title: "M.2 固态硬盘" };
+    if (compact.includes("硬盘")) return { key: "drive", title: "存储设备 / 硬盘" };
+    return { key: "storage", title: "存储设备" };
+  }
+  if (family?.id === "peripheral") {
+    if (compact.includes("键盘") || compact.includes("鼠标")) return { key: "keyboard-mouse", title: "键盘鼠标配件" };
+    if (compact.includes("网卡")) return { key: "network-card", title: "无线网卡" };
+    if (compact.includes("扩展坞") || compact.includes("转接器") || compact.includes("适配器")) return { key: "adapter", title: "扩展坞 / 转接器" };
+    return { key: "peripheral", title: "外设配件" };
+  }
+  if (family?.id === "teaching") return { key: "teaching", title: "教学资料" };
+  if (family?.id === "consumable") return { key: "consumable", title: "耗材用品" };
+  return { key: assetComparableName(asset), title: assetModelText(asset) };
+}
+
+function assetLogicalGroupKey(asset) {
+  const type = assetDeviceType(asset);
+  const family = deviceFamily(asset);
+  const nameKey = ["other", "consumable"].includes(family?.id) ? assetComparableName(asset) : type.key;
+  return [family?.id || "other", nameKey].join("|");
+}
+
+function assetLogicalGroupTitle(asset) {
+  const type = assetDeviceType(asset);
+  return type.title || assetModelText(asset);
+}
+
 function assetModelText(asset) {
   const name = String(asset?.name || "").trim();
   const spec = String(asset?.spec || "").trim();
   return [name, spec].filter(Boolean).join(" · ") || "未命名资产";
 }
 
+function assetAutoGroupKey(asset) {
+  const family = deviceFamily(asset);
+  return [
+    family?.id || "other",
+    assetLogicalGroupKey(asset)
+  ].join("|");
+}
+
+function assetManualGroupRule(asset) {
+  return deviceGroupRuleForSourceKey(assetAutoGroupKey(asset));
+}
+
 function assetGroupKey(asset) {
-  return assetModelText(asset).toLowerCase();
+  const manualRule = assetManualGroupRule(asset);
+  return manualRule ? manualDeviceGroupKey(manualRule) : assetAutoGroupKey(asset);
+}
+
+function groupCategoryText(group) {
+  return displayCategoryText(blank([...new Set(group.assets.map((asset) => asset.category || assetKind(asset)).filter(Boolean))].join("；")));
+}
+
+function groupKindText(group) {
+  return [...new Set(group.assets.map((asset) => assetKind(asset)).filter(Boolean))].join(" / ") || "资产";
 }
 
 function assetGroups() {
   const groups = new Map();
   for (const asset of state.assets) {
     const key = assetGroupKey(asset);
+    const sourceKey = assetAutoGroupKey(asset);
+    const manualRule = deviceGroupRuleForSourceKey(sourceKey);
+    const variant = assetModelText(asset);
     if (!groups.has(key)) {
+      const family = manualRule?.familyId ? (deviceFamilyRule(manualRule.familyId) || deviceFamily(asset)) : deviceFamily(asset);
       groups.set(key, {
         key,
         id: asset.id,
         name: asset.name || "未命名资产",
         spec: asset.spec || "",
-        model: assetModelText(asset),
-        category: asset.category || "-",
+        model: manualRule?.groupName || assetLogicalGroupTitle(asset),
+        category: displayCategoryText(asset.category || "-"),
+        familyId: family?.id || "other",
+        familyName: family?.name || "其他设备",
+        familyIcon: family?.icon || "◇",
+        manual: Boolean(manualRule),
+        manualName: manualRule?.groupName || "",
         quantity: 0,
         count: 0,
+        aliases: new Map(),
+        configKeys: new Set(),
+        sourceKeys: new Set(),
         assets: []
       });
     }
     const group = groups.get(key);
     group.quantity += Number(asset.quantity || 0);
     group.count += 1;
+    group.aliases.set(variant, (group.aliases.get(variant) || 0) + Number(asset.quantity || 1));
+    if (assetConfigKey(asset)) group.configKeys.add(assetConfigKey(asset));
+    group.sourceKeys.add(sourceKey);
+    if (manualRule) {
+      group.manual = true;
+      group.manualName = manualRule.groupName || group.manualName;
+    }
     group.assets.push(asset);
-    if ((!group.category || group.category === "-") && asset.category) group.category = asset.category;
+    if ((!group.category || group.category === "-") && asset.category) group.category = displayCategoryText(asset.category);
   }
-  return [...groups.values()].sort((a, b) => a.model.localeCompare(b.model, "zh-Hans-CN"));
+  return [...groups.values()].map((group) => ({
+    ...group,
+    category: groupCategoryText(group),
+    kindText: groupKindText(group),
+    aliasEntries: [...group.aliases.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-Hans-CN", { numeric: true })),
+    aliasList: [...group.aliases.keys()],
+    configList: [...group.configKeys],
+    sourceKeyList: [...group.sourceKeys],
+    sourceGroupCount: group.sourceKeys.size,
+    variantCount: group.aliases.size
+  })).sort((a, b) => a.model.localeCompare(b.model, "zh-Hans-CN"));
 }
 
 function assetGroupById(assetId) {
   const asset = state.assets.find((item) => item.id === assetId);
   if (!asset) return null;
   return assetGroups().find((group) => group.key === assetGroupKey(asset)) || null;
+}
+
+function assetGroupIsAsset(group) {
+  return group.assets.some((asset) => assetKind(asset) === "资产");
+}
+
+function ledgerField(value, fallback) {
+  const text = String(value || "").trim();
+  return text || fallback;
+}
+
+function displayCategoryText(value) {
+  const text = String(value || "").trim();
+  if (!text) return "-";
+  return text
+    .split("；")
+    .map((part) => part.trim().replace(/^\[[^\]]+\]\s*/, ""))
+    .filter(Boolean)
+    .join("；") || text;
+}
+
+function assetLedgerGroupKey(asset) {
+  return [
+    "ledger",
+    ledgerField(asset.category, "未分类"),
+    ledgerField(asset.name, "未命名资产"),
+    ledgerField(asset.spec, "未填写规格")
+  ].join("|||");
+}
+
+function summarizeValues(items, getter, limit = 2) {
+  const counts = new Map();
+  items.forEach((item) => {
+    const value = blank(getter(item));
+    if (value === "-") return;
+    counts.set(value, (counts.get(value) || 0) + 1);
+  });
+  const entries = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-Hans-CN", { numeric: true }));
+  if (!entries.length) return "-";
+  const visible = entries.slice(0, limit).map(([name, count]) => `${name}(${count})`).join("、");
+  return entries.length > limit ? `${visible}、...` : visible;
+}
+
+function ledgerStatusCounts(assets) {
+  return assets.reduce((counts, asset) => {
+    const status = asset.status || "in_stock";
+    counts[status] = (counts[status] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function ledgerGroupMatchesAssetFilters(asset) {
+  const flow = assetFlow(asset);
+  if (assetStatusFilter !== "all" && asset.status !== assetStatusFilter) return false;
+  if (assetCategoryFilters.length && !assetCategoryFilters.includes(assetKind(asset)) && !assetCategoryFilters.includes(asset.category)) return false;
+  if (assetFamilyFilter !== "all" && deviceFamily(asset)?.id !== assetFamilyFilter) return false;
+  if (assetKeeperFilter !== "all" && asset.keeperId !== assetKeeperFilter && flow.borrowerId !== assetKeeperFilter) return false;
+  if (assetBorrowerFilter !== "all") {
+    const hasRecord = state.records.some((record) => record.assetId === asset.id && record.userId === assetBorrowerFilter && record.type === "出库");
+    if (asset.keeperId !== assetBorrowerFilter && asset.useUserId !== assetBorrowerFilter && flow.borrowerId !== assetBorrowerFilter && !hasRecord) return false;
+  }
+  if (!assetMatches(asset, assetFilter)) return false;
+  return true;
+}
+
+function buildAssetLedgerGroups(assets) {
+  const groups = new Map();
+  for (const asset of assets) {
+    const key = assetLedgerGroupKey(asset);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        id: asset.id,
+        name: ledgerField(asset.name, "未命名资产"),
+        model: ledgerField(asset.name, "未命名资产"),
+        spec: ledgerField(asset.spec, "未填写规格"),
+        category: displayCategoryText(ledgerField(asset.category, "未分类")),
+        familyId: deviceFamily(asset)?.id || "other",
+        familyName: "底账分组",
+        familyIcon: "▦",
+        quantity: 0,
+        count: 0,
+        aliases: new Map(),
+        configKeys: new Set(),
+        sourceKeys: new Set([key]),
+        assets: []
+      });
+    }
+    const group = groups.get(key);
+    const quantity = Number(asset.quantity || 0) || 1;
+    group.quantity += quantity;
+    group.count += 1;
+    group.assets.push(asset);
+    group.aliases.set(assetModelText(asset), (group.aliases.get(assetModelText(asset)) || 0) + quantity);
+  }
+  return [...groups.values()].map((group) => ({
+    ...group,
+    aliasEntries: [...group.aliases.entries()],
+    aliasList: [...group.aliases.keys()],
+    configList: [group.spec].filter(Boolean),
+    sourceKeyList: [group.key],
+    sourceGroupCount: 1,
+    variantCount: group.aliases.size,
+    statusCounts: ledgerStatusCounts(group.assets),
+    locationSummary: summarizeValues(group.assets, (asset) => asset.location, 3),
+    departmentSummary: summarizeValues(group.assets, (asset) => asset.useDepartment, 2),
+    userSummary: summarizeValues(group.assets, (asset) => assetFlow(asset).borrowerName !== "-" ? assetFlow(asset).borrowerName : userName(asset.useUserId || asset.keeperId), 3)
+  })).sort(compareAssetGroups);
+}
+
+function allAssetLedgerGroups() {
+  return buildAssetLedgerGroups(state.assets.filter((asset) => assetKind(asset) === "资产"));
+}
+
+function assetLedgerGroupByKey(key) {
+  return allAssetLedgerGroups().find((group) => group.key === key) || null;
+}
+
+function assetLedgerGroupByAssetId(assetId) {
+  const asset = state.assets.find((item) => item.id === assetId);
+  return asset ? assetLedgerGroupByKey(assetLedgerGroupKey(asset)) : null;
+}
+
+function assetLedgerGroups() {
+  const assets = state.assets
+    .filter((asset) => assetKind(asset) === "资产")
+    .filter(ledgerGroupMatchesAssetFilters);
+  const groups = buildAssetLedgerGroups(assets);
+  const validKeys = new Set(groups.map((group) => group.key));
+  selectedAssetGroupKeys = new Set([...selectedAssetGroupKeys].filter((key) => validKeys.has(key)));
+  if (ledgerDrawerKey && !assetLedgerGroupByKey(ledgerDrawerKey)) {
+    ledgerDrawerKey = "";
+    ledgerDrawerMode = "";
+  }
+  return groups;
+}
+
+function selectedAssetGroups(groups = assetLedgerGroups()) {
+  return groups.filter((group) => selectedAssetGroupKeys.has(group.key));
+}
+
+function selectedLedgerAssets(groups = assetLedgerGroups()) {
+  const selected = selectedAssetGroups(groups);
+  return (selected.length ? selected : groups).flatMap((group) => group.assets.filter((asset) => assetKind(asset) === "资产"));
 }
 
 function assetRecords(assetIds) {
@@ -622,7 +1145,12 @@ function assetGroupRecordDetail(group, type, mode = "html") {
     `单号：${record.paperNo || "-"}`
   ];
   if (mode === "text") return parts.join("；");
-  return `<div class="flow-detail">${parts.map((item) => `<span>${item}</span>`).join("")}</div>`;
+  return `
+    <div class="flow-detail compact-flow" title="${attrText(parts.join("；"))}">
+      <span>${type}：${time}</span>
+      <span>${actorLabel}：${userName(record.userId)} / ${record.quantity || "-"} / ${record.paperNo || "-"}</span>
+    </div>
+  `;
 }
 
 function borrowerRecordsForUser(userId) {
@@ -715,6 +1243,253 @@ function assetGroupSourceFiles(group) {
   return blank([...new Set(files)].join("；"));
 }
 
+function assetGroupSourceCell(group) {
+  const value = assetGroupSourceFiles(group);
+  if (value === "-") return "-";
+  const files = value.split("；").map((item) => item.trim()).filter(Boolean);
+  const visible = files.slice(0, 2).join("；");
+  const extra = files.length > 2 ? ` 等 ${files.length} 个` : "";
+  return `<span class="source-file-cell" title="${attrText(value)}">${visible}${extra}</span>`;
+}
+
+function groupMetric(group, status) {
+  return group.assets
+    .filter((asset) => asset.status === status)
+    .reduce((sum, asset) => sum + Number(asset.quantity || 1), 0);
+}
+
+function groupAvailableCount(group) {
+  return groupMetric(group, "in_stock");
+}
+
+function groupUsingCount(group) {
+  return groupMetric(group, "checked_out");
+}
+
+function assetGroupAliasChips(group, limit = 4) {
+  const entries = group.aliasEntries || group.aliasList?.map((name) => [name, 1]) || [];
+  if (!entries.length) return `<span class="variant-chip muted">暂无变体</span>`;
+  const chips = entries.slice(0, limit).map(([name, count]) => `<span class="variant-chip">${name}<em>×${count}</em></span>`);
+  if (entries.length > limit) chips.push(`<span class="variant-chip muted">+${entries.length - limit}</span>`);
+  return chips.join("");
+}
+
+function selectedDeviceGroups(groups = assetGroups()) {
+  const validKeys = new Set(groups.map((group) => group.key));
+  selectedDeviceGroupKeys = new Set([...selectedDeviceGroupKeys].filter((key) => validKeys.has(key)));
+  return groups.filter((group) => selectedDeviceGroupKeys.has(group.key));
+}
+
+function selectedDeviceSourceKeys(groups = assetGroups()) {
+  return [...new Set(selectedDeviceGroups(groups).flatMap((group) => group.sourceKeyList || []))];
+}
+
+function deviceGroupByKey(key, groups = assetGroups()) {
+  return groups.find((group) => group.key === key);
+}
+
+function defaultDeviceGroupFamily(groups) {
+  if (deviceGroupDraftFamily) return deviceGroupDraftFamily;
+  const familyIds = [...new Set(groups.map((group) => group.familyId).filter(Boolean))];
+  return familyIds.length === 1 ? familyIds[0] : (familyIds[0] || "computer");
+}
+
+function renderManualDeviceGroupSummary() {
+  const summaries = manualDeviceGroupSummaries();
+  if (!summaries.length) return "";
+  return `
+    <div class="manual-device-group-list">
+      ${summaries.map((summary) => {
+        const family = deviceFamilyRule(summary.familyId) || deviceFamilyRule("other");
+        return `
+          <div class="manual-device-group-item">
+            <div>
+              <strong>${summary.groupName}</strong>
+              <span>${family?.name || "其他设备"} · ${summary.sourceKeys.length} 个原始组</span>
+            </div>
+            <button class="danger small" data-unassign-manual-name="${attrText(summary.groupName)}" type="button">取消归类</button>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderDeviceGroupAssignPanel(groups) {
+  if (!can("base_data.manage")) return "";
+  const selectedGroups = selectedDeviceGroups(groups);
+  const selectedSourceCount = selectedDeviceSourceKeys(groups).length;
+  const defaultName = deviceGroupDraftName || (selectedGroups.length === 1 ? selectedGroups[0].manualName || selectedGroups[0].model : "");
+  const familyValue = defaultDeviceGroupFamily(selectedGroups);
+  const knownNames = [...new Set(deviceGroupRules().map((rule) => rule.groupName).filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-Hans-CN", { numeric: true, sensitivity: "base" }));
+  return `
+    <div class="device-group-assign-panel">
+      <form id="deviceGroupAssignForm" class="device-group-assign-form">
+        <div class="device-group-assign-title">
+          <strong>手动选择归类</strong>
+          <span>已选 ${selectedGroups.length} 个当前组 / ${selectedSourceCount} 个原始组</span>
+        </div>
+        <input name="groupName" list="manualDeviceGroupNames" required placeholder="输入标准归类名称，例如：电脑设备" value="${attrText(defaultName)}" />
+        <select name="familyId">
+          ${DEVICE_FAMILY_RULES.map((family) => `<option value="${family.id}" ${familyValue === family.id ? "selected" : ""}>${family.name}</option>`).join("")}
+        </select>
+        <button class="primary" type="submit" ${selectedGroups.length ? "" : "disabled"}>保存归类</button>
+        <button class="ghost" id="clearDeviceGroupSelection" type="button">清空选择</button>
+        <datalist id="manualDeviceGroupNames">
+          ${knownNames.map((name) => `<option value="${attrText(name)}"></option>`).join("")}
+        </datalist>
+      </form>
+      ${renderManualDeviceGroupSummary()}
+    </div>
+  `;
+}
+
+function deviceFamilyBuckets(groups = assetGroups()) {
+  const buckets = new Map();
+  for (const group of groups) {
+    if (!buckets.has(group.familyId)) {
+      buckets.set(group.familyId, {
+        id: group.familyId,
+        name: group.familyName,
+        icon: group.familyIcon,
+        groups: [],
+        quantity: 0,
+        available: 0,
+        using: 0,
+        variants: 0
+      });
+    }
+    const bucket = buckets.get(group.familyId);
+    bucket.groups.push(group);
+    bucket.quantity += Number(group.quantity || 0);
+    bucket.available += groupAvailableCount(group);
+    bucket.using += groupUsingCount(group);
+    bucket.variants += group.variantCount || 0;
+  }
+  const order = DEVICE_FAMILY_RULES.map((rule) => rule.id);
+  return [...buckets.values()].sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+}
+
+function renderDeviceFamilySidebar(groups) {
+  const buckets = deviceFamilyBuckets(groups);
+  const total = buckets.reduce((sum, bucket) => sum + bucket.quantity, 0);
+  return `
+    <aside class="device-family-sidebar no-print">
+      <div class="device-family-head">
+        <strong>设备分类</strong>
+        <button class="ghost small" data-device-family="all" type="button">全部</button>
+      </div>
+      <div class="device-family-search">
+        <input id="deviceGroupSearch" placeholder="搜索分类或逻辑组" value="${attrText(deviceGroupFilter)}" />
+      </div>
+      <div class="device-family-list">
+        <button class="${assetFamilyFilter === "all" ? "active" : ""}" data-device-family="all" type="button">
+          <span class="device-family-icon">▦</span>
+          <strong>全部资产</strong>
+          <em>${total}</em>
+        </button>
+        ${buckets.map((bucket) => `
+          <button class="${assetFamilyFilter === bucket.id ? "active" : ""}" data-device-family="${bucket.id}" type="button">
+            <span class="device-family-icon">${bucket.icon}</span>
+            <strong>${bucket.name}</strong>
+            <em>${bucket.quantity}</em>
+          </button>
+        `).join("")}
+      </div>
+    </aside>
+  `;
+}
+
+function renderDeviceGroupCard(group) {
+  const locations = assetGroupLocations(group);
+  const statusLabel = assetGroupStatus(group);
+  const selected = selectedDeviceGroupKeys.has(group.key);
+  const canManageGroups = can("base_data.manage");
+  return `
+    <article class="device-group-card ${selected ? "selected" : ""} ${group.manual ? "manual" : ""}">
+      <div class="device-group-main">
+        ${assetGroupVisual(group)}
+        <div>
+          <strong>${group.model}</strong>
+          <p>${group.familyName} / ${group.category}${group.manual ? " / 手动归类" : ""}</p>
+        </div>
+      </div>
+      <div class="device-group-metrics">
+        <span><em>总数</em><b>${group.quantity}</b></span>
+        <span><em>可用</em><b>${groupAvailableCount(group)}</b></span>
+        <span><em>使用中</em><b>${groupUsingCount(group)}</b></span>
+      </div>
+      <div class="device-group-status">
+        ${statusLabel}
+        <span class="mini-meta">${locations === "-" ? "未填写位置" : locations}</span>
+      </div>
+      <div class="device-group-actions">
+        ${canManageGroups ? `
+          <label class="device-select-line">
+            <input data-device-group-select="${attrText(group.key)}" type="checkbox" ${selected ? "checked" : ""} />
+            <span>选择</span>
+          </label>
+          <button class="ghost small" data-assign-device-group="${attrText(group.key)}" type="button">归类</button>
+          ${group.manual ? `<button class="danger small" data-unassign-device-group="${attrText(group.key)}" type="button">取消</button>` : ""}
+        ` : ""}
+        <button class="ghost small" data-view-asset="${group.id}" type="button">详情</button>
+      </div>
+      <div class="device-variant-chips">
+        ${assetGroupAliasChips(group)}
+      </div>
+    </article>
+  `;
+}
+
+function renderDeviceGroupOverview(groups) {
+  const query = deviceGroupFilter.trim().toLowerCase();
+  const visibleGroups = groups.filter((group) => {
+    if (assetFamilyFilter !== "all" && group.familyId !== assetFamilyFilter) return false;
+    if (!query) return true;
+    return includesQuery([
+      group.model,
+      group.familyName,
+      group.category,
+      assetGroupLocations(group),
+      ...(group.aliasList || [])
+    ], query);
+  });
+  const buckets = deviceFamilyBuckets(visibleGroups);
+  return `
+    <section class="device-group-overview no-print">
+      ${renderDeviceFamilySidebar(groups)}
+      <div class="device-group-board">
+        <div class="device-board-head">
+          <div>
+            <h3>设备归类管理</h3>
+            <span>系统先自动归并；你勾选多个设备组保存后，会按手动归类优先合并显示。</span>
+          </div>
+          <div class="device-board-summary">
+            <strong>${visibleGroups.length}</strong><span>逻辑组</span>
+            <strong>${visibleGroups.reduce((sum, group) => sum + group.variantCount, 0)}</strong><span>写法</span>
+            <strong>${visibleGroups.reduce((sum, group) => sum + Number(group.quantity || 0), 0)}</strong><span>件数</span>
+          </div>
+        </div>
+        ${renderDeviceGroupAssignPanel(groups)}
+        ${buckets.map((bucket) => `
+          <section class="device-family-section">
+            <div class="device-family-title">
+              <span class="device-family-icon">${bucket.icon}</span>
+              <div>
+                <h4>${bucket.name}</h4>
+                <p>包含 ${bucket.groups.length} 个逻辑组 / ${bucket.variants} 种写法 / ${bucket.quantity} 件</p>
+              </div>
+            </div>
+            <div class="device-group-list">
+              ${bucket.groups.map(renderDeviceGroupCard).join("")}
+            </div>
+          </section>
+        `).join("") || `<div class="empty compact-empty">暂无匹配的设备组</div>`}
+      </div>
+    </section>
+  `;
+}
+
 function assetGroupMatches(group, query) {
   const q = query.trim().toLowerCase();
   if (!q) return true;
@@ -723,6 +1498,9 @@ function assetGroupMatches(group, query) {
     group.name,
     group.spec,
     group.category,
+    group.familyName,
+    ...(group.aliasList || []),
+    ...group.assets.flatMap((asset) => [asset.id, asset.code, asset.name, asset.spec, asset.location]),
     group.quantity,
     assetGroupLocations(group),
     assetGroupPeople(group),
@@ -732,7 +1510,8 @@ function assetGroupMatches(group, query) {
   ], q);
 }
 
-function filteredAssetGroups() {
+function filteredAssetGroups(options = {}) {
+  const includeFamilyFilter = options.includeFamilyFilter !== false;
   return assetGroups().filter((group) => {
     if (selectedAssetId && !group.assets.some((asset) => asset.id === selectedAssetId)) return false;
     if (assetStatusFilter !== "all" && !group.assets.some((asset) => asset.status === assetStatusFilter)) return false;
@@ -745,6 +1524,7 @@ function filteredAssetGroups() {
         || flow.borrowerId === assetBorrowerFilter
         || state.records.some((record) => record.assetId === asset.id && record.userId === assetBorrowerFilter && record.type === "出库");
     })) return false;
+    if (includeFamilyFilter && assetFamilyFilter !== "all" && group.familyId !== assetFamilyFilter) return false;
     return assetGroupMatches(group, assetFilter);
   }).sort(compareAssetGroups);
 }
@@ -1192,6 +1972,7 @@ function renderLogin() {
       </div>
       <form class="login-panel" id="loginForm">
         <h2>用户登录</h2>
+        ${loginNotice ? `<p class="login-notice">${attrText(loginNotice)}</p>` : ""}
         <p class="hint">管理员查看全部资产和操作记录，普通用户查看自己的出入库状态。</p>
         <div class="field">
           <label for="username">姓名</label>
@@ -1213,25 +1994,41 @@ function renderLogin() {
   `;
 }
 
+function canView(viewKey) {
+  if (viewKey === "requests") return canMenu("assetRequests") || canMenu("purchaseWishes");
+  if (viewKey === "system") return canMenu("users") || canMenu("baseData") || canMenu("settings") || canMenu("audit");
+  if (["paper", "assetRequests", "purchaseWishes", "users", "baseData", "settings", "audit"].includes(viewKey)) return false;
+  return canMenu(viewKey);
+}
+
+function activeNavKey() {
+  if (["assetRequests", "purchaseWishes"].includes(view)) return "requests";
+  if (["users", "baseData", "settings", "audit"].includes(view)) return "system";
+  return view;
+}
+
+function normalizeViewKey(viewKey) {
+  if (viewKey === "paper") return "records";
+  if (["assetRequests", "purchaseWishes"].includes(viewKey)) return "requests";
+  if (["users", "baseData", "settings", "audit"].includes(viewKey)) return "system";
+  return viewKey;
+}
+
 function renderShell() {
   const user = state.currentUser;
   const pendingAdminRequests = (state.adminRequests || []).filter((item) => item.status === "待处理").length;
   const navItems = [
     ["dashboard", "总览", "⌂"],
-    ["assets", "资产状态", "▦"],
-    ["inventory", "库存管理", "▥"],
+    ["assets", "资产台账", "▦"],
+    ["inventory", "耗材库存", "▥"],
     ["records", can("records.manage") ? "出入库登记" : "我的出入库", "⇄"],
+    ["orders", "业务办理", "▧"],
     ["checks", "盘点管理", "☑"],
-    ["orders", "业务单据", "▧"],
+    ["requests", can("asset_requests.manage") ? "申请与采购" : "申请与采购", "□"],
     ["reports", "报表统计", "▨"],
-    ["assetRequests", can("asset_requests.manage") ? "资产申请" : "申请资产", "□"],
-    ["purchaseWishes", "需求清单", "☆"],
-    ["paper", "纸质单据方案", "▤"],
-    ["users", pendingAdminRequests ? `用户管理(${pendingAdminRequests})` : "用户管理", "◉"],
-    ["baseData", "基础数据", "▣"],
-    ["settings", "设置", "⚙"],
-    ["audit", "操作记录", "◎"]
-  ].filter(([key]) => canMenu(key));
+    ["system", pendingAdminRequests ? `系统管理(${pendingAdminRequests})` : "系统管理", "⚙"]
+  ].filter(([key]) => canView(key));
+  const activeKey = activeNavKey();
   return `
     <section class="layout">
       <aside class="sidebar">
@@ -1241,7 +2038,7 @@ function renderShell() {
         </div>
         <nav class="nav">
           ${navItems.map(([key, label, icon]) => `
-            <button data-view="${key}" class="${view === key ? "active" : ""}">
+            <button data-view="${key}" class="${activeKey === key ? "active" : ""}">
               <span class="nav-icon">${icon}</span>
               <span>${label}</span>
             </button>
@@ -1265,10 +2062,11 @@ function renderShell() {
         <header class="topbar">
           <div>
             <h1>${pageTitle()}</h1>
-            <p>${pageSubtitle()}</p>
+            ${pageSubtitle() ? `<p>${pageSubtitle()}</p>` : ""}
           </div>
           <div class="topbar-actions">
             ${view === "assets" ? renderAssetTopbarActions() : ""}
+            ${view === "records" ? renderRecordTopbarActions() : ""}
             ${can("asset_requests.manage") || can("users.manage") ? renderMessageCenter() : ""}
           </div>
         </header>
@@ -1306,8 +2104,7 @@ function renderMessageCenter() {
   const requests = state.adminRequests || [];
   const pending = requests.filter((item) => item.status === "待处理");
   const assetPending = (state.assetRequests || []).filter((item) => item.status === "待处理");
-  const wishPending = (state.purchaseWishes || []).filter((item) => item.status === "待采购" || item.status === "已采纳");
-  const pendingTotal = pending.length + assetPending.length + wishPending.length;
+  const pendingTotal = pending.length + assetPending.length;
   return `
     <div class="message-center">
       <button class="message-button" id="messageCenterBtn" type="button" title="消息">
@@ -1325,7 +2122,6 @@ function renderMessageCenter() {
           </div>
           ${renderAdminRequestsPanel("compact")}
           ${renderAssetRequestMessages()}
-          ${renderPurchaseWishMessages()}
         </div>
       ` : ""}
     </div>
@@ -1334,16 +2130,18 @@ function renderMessageCenter() {
 
 function pageTitle() {
   return {
-    dashboard: "业务总览",
-    assets: "资产状态",
-    inventory: "库存管理",
+    dashboard: "资产底账总览",
+    assets: "资产台账",
+    inventory: "耗材库存",
     checks: "盘点管理",
-    orders: "业务单据",
+    orders: "业务办理",
     reports: "报表统计",
+    requests: "申请与采购",
     assetRequests: isAdmin() ? "资产申请管理" : "申请资产",
     purchaseWishes: isAdmin() ? "采购需求清单" : "我的需求清单",
     records: isAdmin() ? "出入库登记" : "我的出入库状态",
     paper: "纸质单据电子化方案",
+    system: "系统管理",
     users: "用户管理",
     baseData: "基础数据",
     settings: "系统设置",
@@ -1353,16 +2151,18 @@ function pageTitle() {
 
 function pageSubtitle() {
   return {
-    dashboard: "从数据库读取库存、出库、纸质单据和近期操作。",
-    assets: "管理员可打印资产表，普通用户仅看与自己相关资产。",
-    inventory: "针对易耗品查看当前库存、安全库存、流水、预警和库存调整。",
+    dashboard: "以学校资产底表为核心，串联资产台账、人员使用、耗材库存、出入库流水和盘点结果。",
+    assets: "资产只展示台账、当前位置、当前状态和状态驱动操作。",
+    inventory: "耗材按库存数量和库存流水管理，支持入库、领用、退回和盘点修正。",
     checks: "按位置、分类、责任人或状态生成盘点任务，录入实际结果并生成差异。",
-    orders: "办理正式领用、借用归还、调拨、维修和报废流程。",
+    orders: "办理资产出借、归还、调拨、维修和报废等正式业务流程。",
     reports: "按资产总账、分类、部门、位置、责任人、流水和盘点差异导出报表。",
+    requests: "统一处理资产领用申请和下一年度采购需求。",
     assetRequests: isAdmin() ? "处理普通用户提交的资产领用申请。" : "填写需要领用的资产、数量和用途，等待管理员处理。",
     purchaseWishes: isAdmin() ? "汇总每个人下一年度想要或需要的设备，为预算和采购提供参考。" : "写下自己希望采购或补充的设备，管理员会用于预算和采购参考。",
-    records: "登记入库时间、出库时间、经办人和纸质单据编号。",
+    records: "",
     paper: "把手写材料通过拍照、编号、复核和电子台账串起来。",
+    system: "集中维护用户、基础数据、系统设置、高级维护和操作记录。",
     users: "维护多用户架构和角色权限。",
     baseData: "维护资产类别等基础数据。",
     settings: "维护系统基础配置。",
@@ -1371,56 +2171,565 @@ function pageSubtitle() {
 }
 
 function renderView() {
-  return {
+  const key = normalizeViewKey(view);
+  const renderer = {
     dashboard: renderDashboard,
     assets: renderAssets,
     inventory: renderInventory,
     checks: renderInventoryChecks,
     orders: renderOrders,
     reports: renderReports,
+    requests: renderRequests,
     assetRequests: renderAssetRequests,
     purchaseWishes: renderPurchaseWishes,
     records: renderRecords,
     paper: renderPaper,
+    system: renderSystemManagement,
     users: renderUsers,
     baseData: renderBaseData,
     settings: renderSettings,
     audit: renderAudit
-  }[view]();
+  }[key] || renderDashboard;
+  return renderer();
+}
+
+function renderRecordTopbarActions() {
+  return `
+    <div class="record-page-actions no-print">
+      <label class="record-period-control">
+        <span>统计周期：</span>
+        <input id="recordStatsPeriod" type="month" value="${recordStatsPeriod}" />
+      </label>
+      <button class="secondary" id="refreshRecordsBtn" type="button">⟳ 刷新</button>
+    </div>
+  `;
 }
 
 function renderDashboard() {
   const matchedAssets = state.assets.filter((asset) => assetMatches(asset, dashboardSearch));
   const matchedRecords = state.records.filter((record) => recordMatches(record, dashboardSearch));
-  const assetItems = matchedAssets.filter((asset) => assetKind(asset) === "资产");
-  const consumableItems = matchedAssets.filter((asset) => assetKind(asset) === "耗材");
-  const assetRecords = matchedRecords.filter((record) => recordKind(record) === "资产");
-  const consumableRecords = matchedRecords.filter((record) => recordKind(record) === "耗材");
-  const checkedOutAssets = assetItems.filter((asset) => asset.status === "checked_out").length;
-  const checkedOutConsumables = consumableItems.filter((asset) => asset.status === "checked_out").length;
-  const paperPending = state.paperQueue.filter((item) => item.status !== "已归档").length;
-  const assetLimit = dashboardSearch ? 30 : 6;
-  const consumableLimit = dashboardSearch ? 30 : 6;
+  const metrics = dashboardMetrics(matchedAssets, matchedRecords);
   return `
-    <section class="dashboard-search">
-      <div class="dashboard-search-inner">
-        <span class="search-mark">⌕</span>
-        <input id="dashboardSearch" placeholder="搜索资产编号、名称、位置、借用人、纸质单号、备注" value="${dashboardSearch}" />
-        <button class="primary" type="button" data-view="dashboard">搜索</button>
+    ${renderDashboardOverviewCards(metrics)}
+    ${renderDashboardLedgerGroupsPanel(metrics)}
+    ${dashboardUsageOpen ? renderDashboardUsageDrawer(metrics) : ""}
+    ${ledgerDrawerKey ? renderLedgerDetailDrawer() : ""}
+  `;
+}
+
+function dashboardMetrics(assets, records) {
+  const fixedAssets = assets.filter((asset) => assetKind(asset) === "资产");
+  const consumables = assets.filter((asset) => assetKind(asset) === "耗材");
+  const assetIds = new Set(assets.map((asset) => asset.id));
+  const checkItems = (state.inventoryCheckItems || []).filter((item) => assetIds.has(item.assetId));
+  const groupRows = dashboardLedgerGroups(fixedAssets);
+  const currentUsingAssets = fixedAssets.filter((asset) => asset.status === "checked_out" || Boolean(assetFlow(asset).borrowerId));
+  const consumableRecords = records.filter((record) => recordKind(record) === "耗材" && record.type === "出库");
+  const unavailable = fixedAssets.filter((asset) => ["repair", "retired"].includes(asset.status));
+  const checkAbnormal = checkItems.filter((item) => item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点");
+  const importExceptionCount = (state.importArchives || []).reduce((sum, item) => sum + Number((item.result?.skipped || []).length || 0), 0);
+  const codeCount = fixedAssets.filter((asset) => String(asset.code || "").trim()).length;
+  const totalAmount = fixedAssets.reduce((sum, asset) => sum + dashboardAssetAmount(asset), 0);
+  const inStockCount = fixedAssets.filter((asset) => (asset.status || "in_stock") === "in_stock").length;
+  return {
+    assets,
+    records,
+    fixedAssets,
+    consumables,
+    groupRows,
+    peopleRows: dashboardPeopleRows(assets, records),
+    scopeLabel: dashboardSearch ? "匹配底表明细" : "底表明细",
+    assetCount: fixedAssets.length,
+    groupCount: groupRows.length,
+    fixedCount: fixedAssets.length,
+    fixedCodeCoverage: `${codeCount}/${fixedAssets.length || 0}`,
+    consumableCount: consumables.length,
+    consumableQuantity: consumables.reduce((sum, asset) => sum + Number(asset.quantity || 0), 0),
+    consumableRecordQuantity: consumableRecords.reduce((sum, record) => sum + Number(record.quantity || 0), 0),
+    currentUsingCount: currentUsingAssets.length,
+    borrowedFixedCount: currentUsingAssets.length,
+    totalAmount,
+    inStockCount,
+    checkItems,
+    checkAbnormalCount: checkAbnormal.length,
+    importExceptionCount,
+    unavailableCount: unavailable.length,
+    exceptionCount: unavailable.length + checkAbnormal.length + importExceptionCount,
+    recentRecords: [...records].sort((a, b) => recordMillis(b) - recordMillis(a))
+  };
+}
+
+function dashboardAssetAmount(asset) {
+  const total = Number(asset.totalAmount || 0);
+  if (total) return total;
+  return Number(asset.unitPrice || 0) * Number(asset.quantity || 0);
+}
+
+function dashboardLedgerKey(asset) {
+  return [
+    String(asset.category || "未分类").trim() || "未分类",
+    String(asset.name || "未命名资产").trim() || "未命名资产",
+    String(asset.spec || "未填写规格").trim() || "未填写规格"
+  ].join("|||");
+}
+
+function dashboardLedgerGroups(assets) {
+  const groups = new Map();
+  for (const asset of assets) {
+    const key = dashboardLedgerKey(asset);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        ledgerKey: assetLedgerGroupKey(asset),
+        category: displayCategoryText(asset.category || "未分类"),
+        name: asset.name || "未命名资产",
+        spec: asset.spec || "未填写规格",
+        quantity: 0,
+        assets: [],
+        locations: new Set(),
+        departments: new Set(),
+        statuses: new Map()
+      });
+    }
+    const group = groups.get(key);
+    const quantity = Number(asset.quantity || 0) || 1;
+    group.quantity += quantity;
+    group.assets.push(asset);
+    if (asset.location) group.locations.add(asset.location);
+    if (asset.useDepartment || asset.department) group.departments.add(asset.useDepartment || asset.department);
+    const status = asset.status || "in_stock";
+    group.statuses.set(status, (group.statuses.get(status) || 0) + 1);
+  }
+  return [...groups.values()].sort((a, b) => b.quantity - a.quantity || a.name.localeCompare(b.name, "zh-Hans-CN", { numeric: true }));
+}
+
+function dashboardGroupStatus(group) {
+  const entries = [...group.statuses.entries()].sort((a, b) => b[1] - a[1]);
+  if (!entries.length) return "-";
+  if (entries.length === 1) return statusBadge(entries[0][0]);
+  return `<span class="badge warn">混合</span><span class="mini-meta">${entries.map(([status, count]) => `${statusText(status)} ${count}`).join(" / ")}</span>`;
+}
+
+function dashboardSetText(values, limit = 2) {
+  const list = [...values].filter(Boolean);
+  if (!list.length) return "-";
+  const visible = list.slice(0, limit).join("；");
+  return list.length > limit ? `${visible} 等 ${list.length} 处` : visible;
+}
+
+function renderDashboardOverviewCards(metrics) {
+  return `
+    <section class="dashboard-overview-cards no-print">
+      <article class="dashboard-intro-card">
+        <span class="dashboard-card-icon">▤</span>
+        <div>
+          <strong>统一管理学校全部资产</strong>
+          <p>汇总资产类别、数量、使用、在放及人员领取/借用情况，支持查看明细与快速检索。</p>
+        </div>
+      </article>
+      ${renderDashboardOverviewStatCard("资产总数", metrics.assetCount, "所有资产数量总计", "▱")}
+      ${renderDashboardOverviewStatCard("资产类别", metrics.groupCount, "资产类别数量", "▦")}
+      ${renderDashboardOverviewStatCard("使用情况", metrics.currentUsingCount, "可点击查看每个人具名下资产", "人", { usage: true })}
+      ${renderDashboardOverviewStatCard("在库", metrics.inStockCount, "当前在库资产数量", "▥")}
+    </section>
+  `;
+}
+
+function renderDashboardOverviewStatCard(label, value, sub, icon, options = {}) {
+  const tag = options.usage ? "button" : "article";
+  const actionAttrs = options.usage ? ` data-dashboard-usage type="button" aria-label="查看人员使用情况"` : "";
+  return `
+    <${tag} class="dashboard-overview-stat ${options.usage ? "clickable" : ""}"${actionAttrs}>
+      <span class="dashboard-card-icon">${icon}</span>
+      <div>
+        <span>${label}</span>
+        <strong>${value}</strong>
+        <em>${sub}</em>
+      </div>
+    </${tag}>
+  `;
+}
+
+function renderDashboardLedgerHero(metrics) {
+  const importAction = dashboardImportAction();
+  return `
+    <section class="ledger-command-panel">
+      <div class="ledger-command-copy">
+        <span class="eyebrow">统一资产底账</span>
+        <h2>学校资产 Excel 是全系统的底表</h2>
+        <p>资产台账、人员使用、耗材库存、出入库登记、盘点管理和操作记录都围绕这份底表联动：底表建账，人员表绑定，耗材表扣库，盘点核现实，流水做追溯。</p>
+        <div class="ledger-command-actions">
+          ${renderDashboardActionButton(importAction.label, importAction.action, "primary")}
+          ${renderDashboardActionButton("查看父子级台账", { view: "assets" }, "secondary")}
+          ${can("checks.manage") ? renderDashboardActionButton("创建盘点任务", { view: "checks" }, "secondary") : renderDashboardActionButton("查看盘点结果", { view: "checks" }, "secondary")}
+        </div>
+      </div>
+      <div class="ledger-health-grid">
+        ${renderLedgerHealth("固定资产", metrics.fixedCount, "一物一码，按资产编号追踪", metrics.fixedCount ? "ok" : "warn")}
+        ${renderLedgerHealth("耗材库存", metrics.consumableQuantity, "按名称+规格扣减库存", metrics.consumableCount ? "ok" : "warn")}
+        ${renderLedgerHealth("使用绑定", metrics.currentUsingCount, "来自出入库和人员表", metrics.currentUsingCount ? "warn" : "ok")}
+        ${renderLedgerHealth("盘点异常", metrics.checkAbnormalCount, "回写台账清查情况", metrics.checkAbnormalCount ? "bad" : "ok")}
       </div>
     </section>
-    <div class="dashboard-stats">
-      ${dashboardStatCard(dashboardSearch ? "匹配资产类" : "资产类", assetItems.length, `出库中 ${checkedOutAssets}`, "▦")}
-      ${dashboardStatCard(dashboardSearch ? "匹配耗材类" : "耗材类", consumableItems.length, `领用中 ${checkedOutConsumables}`, "◍")}
-      ${dashboardStatCard(dashboardSearch ? "匹配出入库" : "出入库记录", matchedRecords.length, `资产 ${assetRecords.length} / 耗材 ${consumableRecords.length}`, "⇄")}
-      ${dashboardStatCard("待处理纸质单", paperPending, "需复核或归档", "▤")}
+  `;
+}
+
+function dashboardImportAction() {
+  return can("records.manage")
+    ? { label: "导入学校资产底表", action: { view: "records", mode: "import", importKind: "inbound" } }
+    : { label: "查看资产台账", action: { view: "assets" } };
+}
+
+function dashboardImportEmptyAction() {
+  const item = dashboardImportAction();
+  return { label: item.label, ...item.action };
+}
+
+function renderLedgerHealth(label, value, note, tone) {
+  return `
+    <article class="ledger-health-card ${tone}">
+      <span>${label}</span>
+      <strong>${value}</strong>
+      <em>${note}</em>
+    </article>
+  `;
+}
+
+function renderDashboardActionButton(label, action, cls = "secondary") {
+  return `<button class="${cls} small" data-empty-action="${attrText(JSON.stringify(action))}" type="button">${label}</button>`;
+}
+
+function renderDashboardDataFlow(metrics) {
+  const importAction = dashboardImportAction().action;
+  const checkAction = can("checks.manage") ? { view: "checks" } : { view: "checks" };
+  const steps = [
+    ["1", "底表建账", `${metrics.assetCount} 条明细`, "学校资产底表决定系统里有什么资产", importAction, metrics.assetCount ? "ok" : "warn"],
+    ["2", "父子归类", `${metrics.groupCount} 个父级`, "按资产分类 + 名称 + 规格型号汇总", { view: "assets" }, metrics.groupCount ? "ok" : "warn"],
+    ["3", "人员绑定", `${metrics.currentUsingCount} 件使用中`, "人员资产表只绑定底表已有资产编号", { view: "assets", assetStatusFilter: "checked_out" }, metrics.currentUsingCount ? "warn" : "ok"],
+    ["4", "耗材扣库", `${metrics.consumableRecordQuantity} 件已领用`, "人员耗材表从耗材库存扣减数量", { view: "inventory" }, metrics.consumableCount ? "ok" : "warn"],
+    ["5", "盘点核实", `${metrics.checkItems.length} 条盘点`, "从当前台账生成盘点范围并回写结果", checkAction, metrics.checkAbnormalCount ? "bad" : "ok"],
+    ["6", "流水追溯", `${metrics.records.length} 条流水`, "所有入库、借出、归还、调拨、维修、报废留痕", { view: "records" }, metrics.records.length ? "ok" : "warn"]
+  ];
+  return `
+    <section class="ledger-flow-panel">
+      ${steps.map(([index, title, value, note, action, tone]) => `
+        <button class="ledger-flow-step ${tone}" data-empty-action="${attrText(JSON.stringify(action))}" type="button">
+          <span>${index}</span>
+          <strong>${title}</strong>
+          <b>${value}</b>
+          <em>${note}</em>
+        </button>
+      `).join("")}
+    </section>
+  `;
+}
+
+function renderDashboardLedgerGroupsPanel(metrics) {
+  const rows = metrics.groupRows.slice(0, dashboardSearch ? 20 : 8);
+  return `
+    <section class="dashboard-panel ledger-groups-panel">
+      <div class="dashboard-table-head">
+        <div class="section-title compact-title">
+          <h2>资产分类清单</h2>
+          <span class="hint">${dashboardSearch ? `筛选出 ${metrics.groupRows.length} 条` : `共 ${rows.length} 条数据`}</span>
+        </div>
+        <div class="dashboard-table-tools no-print">
+          <div class="dashboard-inline-search">
+            <span>⌕</span>
+            <input id="dashboardSearch" placeholder="搜索资产名称、编号或位置" value="${attrText(dashboardSearch)}" />
+          </div>
+          <button class="secondary small" data-empty-action="${attrText(JSON.stringify({ view: "assets" }))}" type="button">筛选</button>
+        </div>
+      </div>
+      <div class="table-wrap compact-table dashboard-ledger-table">
+        <table>
+          <thead><tr><th>资产名称</th><th>类别</th><th>数量</th><th>状态</th><th>位置/部门</th><th>操作</th></tr></thead>
+          <tbody>
+            ${rows.map((group) => `
+              <tr>
+                <td><strong>${attrText(group.name)}</strong><div class="mini-meta">${attrText(group.spec)}</div></td>
+                <td>${attrText(group.category)}</td>
+                <td>${group.quantity}</td>
+                <td>${dashboardGroupStatus(group)}</td>
+                <td>${attrText(dashboardSetText(group.locations))}<div class="mini-meta">${attrText(dashboardSetText(group.departments))}</div></td>
+                <td><button class="ghost small dashboard-detail-link" data-ledger-open-group="${attrText(group.ledgerKey)}" type="button">查看详情 ›</button></td>
+              </tr>
+            `).join("") || emptyActionRow(6, "还没有学校资产底表", "先导入学校资产 Excel 底表，后续台账、人员绑定、耗材扣库和盘点才有统一数据源。", [dashboardImportEmptyAction()])}
+          </tbody>
+        </table>
+      </div>
+      <div class="dashboard-table-foot">
+        <span>共 ${metrics.groupRows.length} 条数据</span>
+        <span>${dashboardSearch ? "显示前 20 条匹配结果" : "默认显示前 8 条"}</span>
+      </div>
+    </section>
+  `;
+}
+
+function dashboardPeopleRows(assets, records) {
+  const rows = new Map();
+  const ensure = (userId) => {
+    const id = userId || "u-import-unknown";
+    if (!rows.has(id)) {
+      rows.set(id, {
+        userId: id,
+        name: userName(id),
+        department: userDepartment(id),
+        fixed: 0,
+        consumableQuantity: 0,
+        currentUsing: 0,
+        returned: 0,
+        abnormal: 0
+      });
+    }
+    return rows.get(id);
+  };
+  for (const asset of assets) {
+    const userId = dashboardAssetUsageUserId(asset);
+    if (!userId) continue;
+    const row = ensure(userId);
+    if (assetKind(asset) === "资产") {
+      row.fixed += 1;
+      if (asset.status === "checked_out" || flow.borrowerId) row.currentUsing += 1;
+      if (["repair", "retired"].includes(asset.status)) row.abnormal += 1;
+    }
+  }
+  for (const record of records) {
+    if (recordKind(record) === "耗材" && record.type === "出库") {
+      ensure(dashboardPersonKey(record.userId)).consumableQuantity += Number(record.quantity || 0);
+    }
+    if (recordKind(record) === "资产" && record.type === "入库") {
+      const userId = dashboardPersonKey(record.userId);
+      if (rows.has(userId)) rows.get(userId).returned += Number(record.quantity || 0);
+    }
+  }
+  return [...rows.values()]
+    .filter((row) => row.fixed || row.consumableQuantity || row.currentUsing || row.returned || row.abnormal)
+    .sort((a, b) => (b.currentUsing + b.consumableQuantity + b.fixed) - (a.currentUsing + a.consumableQuantity + a.fixed));
+}
+
+function dashboardPersonKey(userId) {
+  return userId || "u-import-unknown";
+}
+
+function dashboardAssetUsageUserId(asset) {
+  const flow = assetFlow(asset);
+  if (flow.borrowerId) return dashboardPersonKey(flow.borrowerId);
+  if ((asset.status === "checked_out" || asset.status === "使用中") && (asset.useUserId || asset.keeperId)) {
+    return dashboardPersonKey(asset.useUserId || asset.keeperId);
+  }
+  return "";
+}
+
+function dashboardPersonFixedAssets(userId, assets) {
+  return assets
+    .filter((asset) => assetKind(asset) === "资产" && dashboardAssetUsageUserId(asset) === userId)
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh-Hans-CN", { numeric: true })
+      || String(a.code || "").localeCompare(String(b.code || ""), "zh-Hans-CN", { numeric: true }));
+}
+
+function dashboardPersonConsumableRecords(userId, records) {
+  return records
+    .filter((record) => recordKind(record) === "耗材" && record.type === "出库" && dashboardPersonKey(record.userId) === userId)
+    .sort((a, b) => recordMillis(b) - recordMillis(a));
+}
+
+function dashboardPersonRecordRows(userId, records) {
+  return records
+    .filter((record) => dashboardPersonKey(record.userId) === userId)
+    .sort((a, b) => recordMillis(b) - recordMillis(a))
+    .slice(0, 12);
+}
+
+function dashboardRecordAsset(record) {
+  return state.assets.find((asset) => asset.id === record.assetId) || null;
+}
+
+function renderDashboardUsageDrawer(metrics) {
+  const rows = metrics.peopleRows;
+  const selectedUserId = dashboardUsageUserId && rows.some((row) => row.userId === dashboardUsageUserId)
+    ? dashboardUsageUserId
+    : rows[0]?.userId || "";
+  const selectedRow = rows.find((row) => row.userId === selectedUserId) || null;
+  return `
+    <div class="drawer-backdrop no-print" id="dashboardUsageBackdrop"></div>
+    <aside class="asset-drawer dashboard-usage-drawer resizable-drawer no-print" ${drawerWidthStyle("dashboard-usage", 900)} aria-label="人员使用情况">
+      ${renderDrawerResizeHandle("拖动调整人员使用情况窗口宽度")}
+      <div class="drawer-head">
+        <div>
+          <h2>人员使用情况</h2>
+          <p>按同一份资产底账、人员资产表、耗材领用表和出入库流水自动生成。</p>
+        </div>
+        <button class="ghost icon-button" id="closeDashboardUsage" type="button">×</button>
+      </div>
+      <div class="drawer-body">
+        ${rows.length ? `
+          <div class="dashboard-usage-layout">
+            <div class="dashboard-usage-people">
+              ${rows.map((row) => `
+                <button class="${row.userId === selectedUserId ? "active" : ""}" data-dashboard-person="${attrText(row.userId)}" type="button">
+                  <span>
+                    <strong>${attrText(row.name)}</strong>
+                    <em>${attrText(row.department || "-")}</em>
+                  </span>
+                  <b>${row.currentUsing}</b>
+                </button>
+              `).join("")}
+            </div>
+            ${renderDashboardUsageDetail(selectedRow, metrics)}
+          </div>
+        ` : renderEmptyAction("还没有人员使用记录", "导入人员资产使用表、人员耗材领用表，或在台账里划一笔出借后，这里会自动按人员汇总。", can("records.manage") ? [{ label: "导入人员表", view: "records", mode: "import", importKind: "inbound" }, { label: "划一笔出借", view: "records", mode: "manual", action: "lend" }] : [{ label: "查看资产台账", view: "assets" }])}
+      </div>
+    </aside>
+  `;
+}
+
+function renderDashboardUsageDetail(row, metrics) {
+  if (!row) return `<div class="empty compact-empty">请选择人员查看明细。</div>`;
+  const fixedAssets = dashboardPersonFixedAssets(row.userId, metrics.assets);
+  const consumableRecords = dashboardPersonConsumableRecords(row.userId, metrics.records);
+  const records = dashboardPersonRecordRows(row.userId, metrics.records);
+  return `
+    <section class="dashboard-usage-detail">
+      <div class="dashboard-usage-summary">
+        <div><span>固定资产</span><strong>${fixedAssets.length}</strong></div>
+        <div><span>耗材领用</span><strong>${consumableRecords.reduce((sum, record) => sum + Number(record.quantity || 0), 0)}</strong></div>
+        <div><span>使用中</span><strong>${row.currentUsing}</strong></div>
+        <div><span>异常</span><strong>${row.abnormal}</strong></div>
+      </div>
+      <div class="dashboard-usage-section">
+        <h3>固定资产</h3>
+        ${renderDashboardPersonAssetTable(fixedAssets)}
+      </div>
+      <div class="dashboard-usage-section">
+        <h3>耗材领用</h3>
+        ${renderDashboardPersonConsumableTable(consumableRecords)}
+      </div>
+      <div class="dashboard-usage-section">
+        <h3>最近出入库记录</h3>
+        ${renderDashboardPersonRecordList(records)}
+      </div>
+    </section>
+  `;
+}
+
+function renderDashboardPersonAssetTable(assets) {
+  if (!assets.length) return `<div class="empty compact-empty">这个人当前没有绑定固定资产。</div>`;
+  return `
+    <div class="table-wrap compact-table dashboard-usage-table">
+      <table>
+        <thead><tr><th>资产编号</th><th>资产名称</th><th>规格型号</th><th>当前状态</th><th>当前位置</th><th>开始日期</th></tr></thead>
+        <tbody>
+          ${assets.map((asset) => {
+            const latestOut = latestAssetRecord(asset, "出库");
+            return `
+              <tr>
+                <td>${attrText(blank(asset.code || asset.id))}</td>
+                <td>${attrText(asset.name || "-")}</td>
+                <td>${attrText(blank(asset.spec))}</td>
+                <td>${statusBadge(asset.status)}</td>
+                <td>${attrText(blank(asset.location))}</td>
+                <td>${attrText(fmt(latestOut?.outTime) || "-")}</td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
     </div>
-    <div class="dashboard-grid">
-      ${renderDashboardRecordPanel("资产近期出入库", assetRecords.slice(0, assetLimit), "暂无资产出入库记录")}
-      ${renderDashboardRecordPanel("耗材近期领用", consumableRecords.slice(0, consumableLimit), "暂无耗材领用记录")}
-      ${renderReminderPanel("资产状态提醒", assetItems, "资产", checkedOutAssets, paperPending)}
-      ${renderReminderPanel("耗材状态提醒", consumableItems, "耗材", checkedOutConsumables, paperPending)}
+  `;
+}
+
+function renderDashboardPersonConsumableTable(records) {
+  if (!records.length) return `<div class="empty compact-empty">这个人还没有耗材领用记录。</div>`;
+  return `
+    <div class="table-wrap compact-table dashboard-usage-table">
+      <table>
+        <thead><tr><th>耗材名称</th><th>规格型号</th><th>数量</th><th>单位</th><th>领用日期</th></tr></thead>
+        <tbody>
+          ${records.map((record) => {
+            const asset = dashboardRecordAsset(record);
+            return `
+              <tr>
+                <td>${attrText(asset?.name || assetName(record.assetId))}</td>
+                <td>${attrText(blank(asset?.spec))}</td>
+                <td>${Number(record.quantity || 0)}</td>
+                <td>${attrText(blank(asset?.unit || record.unit || "件"))}</td>
+                <td>${attrText(fmt(record.outTime || record.inTime) || "-")}</td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
     </div>
+  `;
+}
+
+function renderDashboardPersonRecordList(records) {
+  if (!records.length) return `<div class="empty compact-empty">还没有这个人的出入库流水。</div>`;
+  return `
+    <div class="dashboard-usage-records">
+      ${records.map((record) => `
+        <article>
+          <strong>${attrText(record.type || "-")} · ${attrText(assetName(record.assetId))}</strong>
+          <span>${attrText(fmt(recordTime(record)))} / 数量 ${record.quantity || "-"} / 单号 ${attrText(record.paperNo || "-")}</span>
+          <em>${attrText(recordDisplayNote(record))}</em>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderDashboardPeoplePanel(metrics) {
+  const rows = metrics.peopleRows.slice(0, dashboardSearch ? 20 : 8);
+  return `
+    <section class="dashboard-panel">
+      <div class="section-title compact-title">
+        <h2>人员使用情况</h2>
+        <span class="hint">由资产状态和出入库流水自动生成</span>
+      </div>
+      <div class="dashboard-person-list">
+        ${rows.map((row) => `
+          <article class="dashboard-person-row">
+            <div>
+              <strong>${attrText(row.name)}</strong>
+              <span>${attrText(row.department || "-")}</span>
+            </div>
+            <dl>
+              <div><dt>固定资产</dt><dd>${row.fixed}</dd></div>
+              <div><dt>耗材领用</dt><dd>${row.consumableQuantity}</dd></div>
+              <div><dt>使用中</dt><dd>${row.currentUsing}</dd></div>
+              <div><dt>异常</dt><dd>${row.abnormal}</dd></div>
+            </dl>
+          </article>
+        `).join("") || renderEmptyAction("还没有人员使用记录", "导入人员资产使用表或登记划一笔出借后，人员视角会自动从同一份底账生成。", can("records.manage") ? [{ label: "导入人员表", view: "records", mode: "import", importKind: "inbound" }, { label: "划一笔出借", view: "records", mode: "manual", action: "lend" }] : [{ label: "查看资产台账", view: "assets" }])}
+      </div>
+    </section>
+  `;
+}
+
+function renderDashboardExceptionsPanel(metrics, paperPending) {
+  const rows = [
+    ["状态不可用", metrics.unavailableCount, "维修中或已报废资产不能直接借用/领用", { view: "assets", assetStatusFilter: "repair" }],
+    ["盘点异常", metrics.checkAbnormalCount, "位置不符、盘亏、损坏、盘盈等盘点差异", { view: "checks" }],
+    ["导入异常", metrics.importExceptionCount, "资产编号不存在、冲突或库存不足", { view: "records", mode: "import" }],
+    ["纸质单待处理", paperPending, "纸质单据需要复核、归档或电子化留档", { view: "records", mode: "import", importKind: "word" }]
+  ];
+  return `
+    <section class="dashboard-panel">
+      <div class="section-title compact-title">
+        <h2>异常与待处理</h2>
+        <span class="hint">阻止错误导入和重复建账</span>
+      </div>
+      <div class="reminder-list">
+        ${rows.map(([label, value, note, action]) => `
+          <button class="reminder-row ${value ? "bad" : "ok"} dashboard-action-row" data-empty-action="${attrText(JSON.stringify(action))}" type="button">
+            <span class="reminder-dot"></span>
+            <div><strong>${label}</strong><em>${note}</em></div>
+            <b>${value}</b>
+          </button>
+        `).join("")}
+      </div>
+    </section>
   `;
 }
 
@@ -1439,15 +2748,29 @@ function dashboardStatCard(label, value, sub, icon) {
 
 function renderDashboardRecordPanel(title, records, emptyText) {
   return `
-    <section class="dashboard-panel">
-      <div class="section-title"><h2>${title}</h2></div>
+    <section class="dashboard-panel dashboard-record-panel">
+      <div class="section-title compact-title"><h2>${title}</h2><span class="hint">${records.length} 条</span></div>
       ${renderDashboardRecordRows(records, emptyText)}
     </section>
   `;
 }
 
 function renderDashboardRecordRows(records, emptyText) {
-  if (!records.length) return `<div class="empty compact-empty">${emptyText}</div>`;
+  if (!records.length) {
+    const isConsumable = emptyText.includes("耗材");
+    const isLedgerFlow = emptyText.includes("联动");
+    return renderEmptyAction(
+      emptyText,
+      isLedgerFlow
+        ? "导入学校资产底表、绑定人员资产、登记耗材领用或录入盘点后，系统会把同一份底账上的变化串成流水。"
+        : isConsumable ? "先完成耗材入库或领用，系统会在总览展示最近流水。" : "先完成资产入库、划一笔出借或电子档导入，系统会在总览展示最近流水。",
+      isLedgerFlow
+        ? can("records.manage")
+          ? [{ label: "导入学校资产底表", view: "records", mode: "import", importKind: "inbound" }, { label: "Word出借单导入", view: "records", mode: "import", importKind: "word" }]
+          : [{ label: "查看资产台账", view: "assets" }]
+        : isConsumable ? consumableEntryActions() : recordEntryActions()
+    );
+  }
   return `<div class="dashboard-record-list">${records.map((record) => {
     const asset = state.assets.find((item) => item.id === record.assetId) || {};
     return `
@@ -1467,14 +2790,17 @@ function renderDashboardRecordRows(records, emptyText) {
 }
 
 function renderReminderPanel(title, items, kind, activeCount, paperPending) {
-  const lowStock = items.filter((asset) => Number(asset.quantity || 0) <= 1).length;
+  const isConsumable = kind === "耗材";
   const inStock = items.filter((asset) => asset.status === "in_stock").length;
+  const abnormal = items.filter((asset) => ["repair", "retired"].includes(asset.status)).length;
   return `
-    <section class="dashboard-panel">
-      <div class="section-title"><h2>${title}</h2></div>
+    <section class="dashboard-panel dashboard-reminder-panel">
+      <div class="section-title compact-title"><h2>${title}</h2><span class="hint">${items.length} 项</span></div>
       <div class="reminder-list">
-        ${reminderRow("库存不足", `${lowStock} 项`, lowStock ? "warn" : "ok", "需补充数量小于等于 1 的${kind}")}
-        ${reminderRow(kind === "资产" ? "待归还" : "领用中", `${activeCount} 项`, activeCount ? "warn" : "ok", kind === "资产" ? "当前处于出库中的资产" : "当前处于领用中的耗材")}
+        ${isConsumable
+          ? reminderRow("不可出借", `${abnormal} 项`, abnormal ? "bad" : "ok", "维修中或已报废的耗材")
+          : reminderRow("维修/报废", `${abnormal} 项`, abnormal ? "bad" : "ok", "当前不可直接领用或出借的资产")}
+        ${reminderRow(isConsumable ? "领用中" : "待归还", `${activeCount} 项`, activeCount ? "warn" : "ok", isConsumable ? "当前处于领用中的耗材" : "当前处于出库中的资产")}
         ${reminderRow("可用库存", `${inStock} 项`, "ok", `仍在库的${kind}`)}
         ${reminderRow("纸质单待处理", `${paperPending} 张`, paperPending ? "bad" : "ok", "等待复核、归档或电子化留档")}
       </div>
@@ -1514,22 +2840,123 @@ function renderAssetCards(items, emptyText) {
   `;
 }
 
+function renderEmptyAction(title, description, actions = []) {
+  return `
+    <div class="empty-action">
+      <strong>${title}</strong>
+      <p>${description}</p>
+      <div class="empty-action-buttons">
+        ${actions.map((action) => `<button class="${action.danger ? "danger" : "secondary"} small" data-empty-action="${attrText(JSON.stringify(action))}" type="button">${action.label}</button>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function emptyActionRow(colspan, title, description, actions = []) {
+  return `<tr><td colspan="${colspan}" class="empty">${renderEmptyAction(title, description, actions)}</td></tr>`;
+}
+
+function recordEntryActions() {
+  if (!can("records.manage")) return [{ label: "查看资产台账", view: "assets" }];
+  return [
+    { label: "新增入库", view: "records", mode: "manual", action: "inbound" },
+    { label: "电子档导入", view: "records", mode: "import" }
+  ];
+}
+
+function consumableEntryActions() {
+  if (!can("records.manage")) return [{ label: "查看耗材库存", view: "inventory" }];
+  return [
+    { label: "耗材领用", view: "records", mode: "manual", action: "consume" },
+    { label: "新增入库", view: "records", mode: "manual", action: "inbound" }
+  ];
+}
+
+function renderAssetBatchToolbar(groups) {
+  if (!can("assets.manage") && !can("reports.export")) return "";
+  const selected = selectedAssetGroups(groups);
+  return `
+    <div class="asset-batch-toolbar no-print">
+      <span>已选 ${selected.length} 组 / ${selectedLedgerAssets(groups).length} 条资产</span>
+      <div class="row-actions">
+        <button class="secondary small" id="batchExportAssets" type="button">批量导出</button>
+        <button class="secondary small" id="batchPrintAssetLabels" type="button">批量打印标签</button>
+        ${can("base_data.manage") ? `<button class="secondary small" id="batchClassifyAssets" type="button">批量归类</button>` : ""}
+        ${can("checks.manage") ? `<button class="secondary small" id="batchInventoryCheck" type="button">批量盘点</button>` : ""}
+        ${selected.length ? `<button class="ghost small" id="clearAssetGroupSelectionInline" type="button">清空选择</button>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+function groupHasStatus(group, status) {
+  return group.assets.some((asset) => asset.status === status);
+}
+
+function ledgerAssetsByStatus(group, status) {
+  if (!status || status === "all") return group.assets;
+  return group.assets.filter((asset) => (asset.status || "in_stock") === status);
+}
+
+function ledgerStatusTone(status) {
+  return {
+    checked_out: "using",
+    in_stock: "available",
+    repair: "repair",
+    retired: "retired"
+  }[status] || "default";
+}
+
+function renderLedgerStatusButtons(group) {
+  const order = ["checked_out", "repair", "retired", "in_stock"];
+  return `
+    <div class="ledger-status-buttons">
+      ${order.map((status) => {
+        const count = group.statusCounts?.[status] || 0;
+        if (!count) return "";
+        return `<button class="ledger-status-chip ${ledgerStatusTone(status)}" data-ledger-status="${status}" data-ledger-group="${attrText(group.key)}" type="button">${statusText(status)} ${count}</button>`;
+      }).join("") || `<span class="ledger-status-chip muted">暂无状态</span>`}
+    </div>
+  `;
+}
+
+function renderAssetLedgerActions(group) {
+  if (!can("assets.manage")) return `<td><button class="ghost small" data-ledger-open-group="${attrText(group.key)}" type="button">查看明细</button></td>`;
+  return `
+    <td>
+      <div class="row-actions">
+        <button class="primary small" data-ledger-open-group="${attrText(group.key)}" type="button">查看明细</button>
+        ${groupHasStatus(group, "in_stock") ? `<button class="ghost small" data-ledger-status="in_stock" data-ledger-group="${attrText(group.key)}" type="button">在库划一笔</button>` : ""}
+      </div>
+    </td>
+  `;
+}
+
+function renderAssetLedgerGroupManager(groups) {
+  if (!can("base_data.view")) return "";
+  return `
+    <div id="assetDeviceGroupOverview" class="asset-device-group-overview no-print">
+      ${renderDeviceGroupOverview(groups)}
+    </div>
+  `;
+}
+
 function renderAssets() {
-  const groups = filteredAssetGroups();
-  const printableAssets = filteredAssets();
+  const groups = assetLedgerGroups();
+  const printableAssets = selectedLedgerAssets(groups);
   const totalPages = Math.max(1, Math.ceil(groups.length / assetPageSize));
   if (assetPage > totalPages) assetPage = totalPages;
   const pagedGroups = groups.slice((assetPage - 1) * assetPageSize, assetPage * assetPageSize);
   const keeperOptions = selectableUsers().map((user) => `<option value="${user.id}" ${assetKeeperFilter === user.id ? "selected" : ""}>${user.name}</option>`).join("");
   const borrowerOptions = selectableUsers().map((user) => `<option value="${user.id}" ${assetBorrowerFilter === user.id ? "selected" : ""}>${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("");
+  const familyOptions = DEVICE_FAMILY_RULES.map((family) => `<option value="${family.id}" ${assetFamilyFilter === family.id ? "selected" : ""}>${family.name}</option>`).join("");
   return `
     <section class="asset-workspace">
       ${renderAssetStatusSummary()}
-      ${renderBorrowerDetailPanel()}
       <div class="asset-list-panel">
         <div class="asset-filter-card no-print">
           <div class="asset-filter-main">
-            <input id="assetSearch" placeholder="搜索资产名称、编号、规格型号" value="${assetFilter}" />
+            <input id="assetSearch" placeholder="搜索资产编号、条码、名称、借用人、位置、纸质单号" value="${assetFilter}" />
             <select id="assetStatusFilter">
               <option value="all" ${assetStatusFilter === "all" ? "selected" : ""}>状态：全部</option>
               <option value="in_stock" ${assetStatusFilter === "in_stock" ? "selected" : ""}>状态：在库可用</option>
@@ -1538,7 +2965,7 @@ function renderAssets() {
               <option value="retired" ${assetStatusFilter === "retired" ? "selected" : ""}>状态：已报废</option>
             </select>
             <div class="asset-category-filter">
-              <button class="${assetCategoryPanelOpen ? "active" : ""}" id="toggleAssetCategoryPanel" type="button">分类：${assetCategoryFilters.length ? assetCategoryFilters.join("、") : "全部"} <span>⌄</span></button>
+              <button class="${assetCategoryPanelOpen ? "active" : ""}" id="toggleAssetCategoryPanel" type="button">分类：${assetCategoryFilters.length ? assetCategoryFilters.map(displayCategoryText).join("、") : "全部"} <span>⌄</span></button>
               ${assetCategoryPanelOpen ? renderAssetCategoryPanel() : ""}
             </div>
             <select id="assetSortField">
@@ -1551,7 +2978,11 @@ function renderAssets() {
             </select>
             <button class="advanced-filter-button" id="toggleAdvancedAssetFilters" type="button">展开高级筛选 <span>⌄</span></button>
           </div>
-          <div class="asset-advanced-filters ${assetAdvancedFiltersOpen || assetKeeperFilter !== "all" || assetBorrowerFilter !== "all" ? "show" : ""}">
+          <div class="asset-advanced-filters ${assetAdvancedFiltersOpen || assetFamilyFilter !== "all" || assetKeeperFilter !== "all" || assetBorrowerFilter !== "all" ? "show" : ""}">
+            <select id="assetFamilyFilter">
+              <option value="all" ${assetFamilyFilter === "all" ? "selected" : ""}>设备分类：全部</option>
+              ${familyOptions}
+            </select>
             <select id="assetKeeperFilter">
               <option value="all" ${assetKeeperFilter === "all" ? "selected" : ""}>保管人：全部</option>
               ${keeperOptions}
@@ -1568,32 +2999,43 @@ function renderAssets() {
           </div>
         </div>
         <div class="asset-list-title">
-          <h3>资产列表</h3>
-          <span>共 ${groups.length} 条</span>
+          <h3>资产分组汇总</h3>
+          <span>按 资产分类 + 资产名称 + 规格型号 汇总，共 ${groups.length} 组 / ${printableAssets.length} 条资产编号</span>
           ${renderAssetPagination(groups.length, totalPages, "top")}
         </div>
+      ${renderAssetBatchToolbar(groups)}
       <div class="table-wrap asset-table-wrap">
         <table>
           <thead>
             <tr>
-              <th>资产名称 / 编号</th><th>类别</th><th>数量</th><th>位置</th><th>状态</th><th>当前使用/保管</th><th>入库详情</th><th>出库详情</th><th>文件来源</th><th>操作</th>
+              <th class="select-col"><input data-asset-select-all type="checkbox" ${pagedGroups.length && pagedGroups.every((group) => selectedAssetGroupKeys.has(group.key)) ? "checked" : ""} /></th>
+              <th>资产分类</th>
+              <th>资产名称</th>
+              <th>规格型号</th>
+              <th>数量</th>
+              <th>状态汇总</th>
+              <th>位置汇总</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
             ${pagedGroups.map((group) => `
               <tr>
-                <td><div class="asset-name-cell">${assetGroupVisual(group)}<div><strong>${group.model}</strong><div class="mini-meta">合并 ${group.count} 条资产明细</div></div></div></td>
-                <td>${group.category}</td>
+                <td class="select-col"><input data-asset-group-select="${attrText(group.key)}" type="checkbox" ${selectedAssetGroupKeys.has(group.key) ? "checked" : ""} /></td>
+                <td>${attrText(group.category)}</td>
+                <td>
+                  <button class="asset-ledger-name" data-ledger-open-group="${attrText(group.key)}" type="button">
+                    <strong>${attrText(group.name)}</strong>
+                    <span>${group.count} 个资产编号</span>
+                  </button>
+                </td>
+                <td>${attrText(group.spec)}</td>
                 <td>${group.quantity}</td>
-                <td>${assetGroupLocations(group)}</td>
-                <td>${assetGroupStatus(group)}</td>
-                <td>${assetGroupPeople(group)}</td>
-                <td>${assetGroupRecordDetail(group, "入库")}</td>
-                <td>${assetGroupRecordDetail(group, "出库")}</td>
-                <td>${assetGroupSourceFiles(group)}</td>
-                ${can("assets.manage") ? `<td><div class="row-actions"><button class="ghost small" data-view-asset="${group.id}" type="button">详情</button>${group.count === 1 ? `<button class="ghost small" data-edit-asset="${group.id}" type="button">编辑</button><button class="danger small" data-delete-asset="${group.id}" type="button">删除</button>` : `<span class="mini-meta">已按型号归类</span>`}</div></td>` : `<td><button class="ghost small" data-view-asset="${group.id}" type="button">详情</button></td>`}
+                <td>${renderLedgerStatusButtons(group)}</td>
+                <td>${attrText(group.locationSummary)}<div class="mini-meta">${attrText(group.departmentSummary)}</div></td>
+                ${renderAssetLedgerActions(group)}
               </tr>
-            `).join("") || `<tr><td colspan="10" class="empty">暂无资产</td></tr>`}
+            `).join("") || `<tr><td colspan="8" class="empty">${renderEmptyAction("资产台账为空", "先导入学校资产 Excel 底表，系统会按资产分类、资产名称、规格型号自动形成父级分组。", [{ label: "新增入库", view: "records", mode: "manual", action: "inbound" }, { label: "导入学校资产底表", view: "records", mode: "import" }])}</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1602,12 +3044,182 @@ function renderAssets() {
     </section>
     ${renderPrintableAssetSheets(printableAssets)}
     ${can("assets.manage") && assetDrawerOpen ? renderAssetDrawer() : ""}
+    ${ledgerDrawerKey ? renderLedgerDetailDrawer() : ""}
     ${selectedAssetDetailId ? renderAssetDetailDrawer() : ""}
   `;
 }
 
+function assetCurrentUserName(asset) {
+  const flow = assetFlow(asset);
+  const name = flow.borrowerName && flow.borrowerName !== "-" && flow.borrowerName !== "未知用户"
+    ? flow.borrowerName
+    : userName(asset.useUserId || asset.keeperId);
+  return name === "未知用户" ? "-" : name;
+}
+
+function assetCurrentDepartment(asset) {
+  const flow = assetFlow(asset);
+  return flow.borrowDepartment && flow.borrowDepartment !== "-"
+    ? flow.borrowDepartment
+    : blank(asset.useDepartment || userDepartment(asset.useUserId || asset.keeperId));
+}
+
+function assetRemarkField(asset, labels) {
+  const parts = String(asset.remark || "").split("；").map((item) => item.trim()).filter(Boolean);
+  for (const label of labels) {
+    const found = parts.find((part) => part.startsWith(`${label}：`) || part.startsWith(`${label}:`));
+    if (found) return found.replace(`${label}：`, "").replace(`${label}:`, "").trim();
+  }
+  return "";
+}
+
+function ledgerDrawerTitle(mode) {
+  if (mode === "checked_out") return "使用中资产";
+  if (mode === "in_stock") return "在库资产编号";
+  if (mode === "repair") return "维修中资产";
+  if (mode === "retired") return "已报废资产";
+  return "资产详情";
+}
+
+function renderLedgerDrawerTabs(group) {
+  const tabs = [
+    ["group", "全部", group.assets.length],
+    ["checked_out", "使用中", group.statusCounts?.checked_out || 0],
+    ["in_stock", "在库", group.statusCounts?.in_stock || 0],
+    ["repair", "维修", group.statusCounts?.repair || 0],
+    ["retired", "报废", group.statusCounts?.retired || 0]
+  ].filter(([, , count], index) => index === 0 || count);
+  return `
+    <div class="ledger-drawer-tabs">
+      ${tabs.map(([mode, label, count]) => `<button class="${ledgerDrawerMode === mode ? "active" : ""}" data-ledger-drawer-tab="${mode}" data-ledger-group="${attrText(group.key)}" type="button">${label}<span>${count}</span></button>`).join("")}
+    </div>
+  `;
+}
+
+function renderLedgerGroupSummary(group) {
+  const totalAmount = group.assets.reduce((sum, asset) => sum + Number(asset.totalAmount || Number(asset.unitPrice || 0) * Number(asset.quantity || 0)), 0);
+  return `
+    <section class="ledger-drawer-summary">
+      <div><span>资产分类</span><strong>${attrText(group.category)}</strong></div>
+      <div><span>资产名称</span><strong>${attrText(group.name)}</strong></div>
+      <div><span>规格型号</span><strong>${attrText(group.spec)}</strong></div>
+      <div><span>资产编号</span><strong>${group.assets.length}</strong></div>
+      <div><span>位置汇总</span><strong>${attrText(group.locationSummary)}</strong></div>
+      <div><span>台账原值</span><strong>${formatMoney(totalAmount)}</strong></div>
+    </section>
+  `;
+}
+
+function ledgerUsingPeople(group) {
+  const rows = new Map();
+  for (const asset of ledgerAssetsByStatus(group, "checked_out")) {
+    const userId = assetFlow(asset).borrowerId || asset.useUserId || asset.keeperId || "unknown";
+    if (!rows.has(userId)) {
+      rows.set(userId, {
+        userId,
+        name: userId === "unknown" ? "未绑定使用人" : userName(userId),
+        department: userId === "unknown" ? "-" : userDepartment(userId),
+        assets: []
+      });
+    }
+    rows.get(userId).assets.push(asset);
+  }
+  return [...rows.values()].sort((a, b) => b.assets.length - a.assets.length || a.name.localeCompare(b.name, "zh-Hans-CN", { numeric: true }));
+}
+
+function renderLedgerUsingPeople(group) {
+  const rows = ledgerUsingPeople(group);
+  if (!rows.length) return `<div class="empty compact-empty">这一组当前没有使用中的资产。</div>`;
+  return `
+    <section class="ledger-people-list">
+      ${rows.map((row) => `
+        <article class="ledger-person-card">
+          <div>
+            <strong>${attrText(row.name)}</strong>
+            <span>${attrText(row.department)}</span>
+          </div>
+          <b>${row.assets.length}</b>
+          <p>${row.assets.map((asset) => attrText(asset.code)).join("、")}</p>
+        </article>
+      `).join("")}
+    </section>
+  `;
+}
+
+function renderLedgerCheckoutForm(asset) {
+  if (!can("records.manage") || (asset.status || "in_stock") !== "in_stock") return "";
+  const options = selectableUsers()
+    .map((user) => `<option value="${user.id}">${attrText(user.name)}${isMultiDepartment() ? ` · ${attrText(user.department)}` : ""}</option>`)
+    .join("");
+  return `
+    <form class="ledger-checkout-form" data-ledger-checkout-form="${asset.id}">
+      <input type="hidden" name="assetId" value="${asset.id}" />
+      <select name="userId" required>
+        <option value="">选择使用人</option>
+        ${options}
+      </select>
+      <button class="primary small" type="submit">划到名下</button>
+    </form>
+  `;
+}
+
+function renderLedgerAssetRows(group, mode) {
+  const assets = ledgerAssetsByStatus(group, mode === "group" ? "all" : mode);
+  if (!assets.length) return `<div class="empty compact-empty">当前筛选下没有资产编号。</div>`;
+  return `
+    <div class="table-wrap compact-table ledger-detail-table">
+      <table>
+        <thead>
+          <tr><th>资产编号</th><th>状态</th><th>当前部门</th><th>当前使用人</th><th>具体存放地点</th><th>取得日期</th><th>资产原值</th><th>清查盘点</th><th>清查盘盈</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          ${assets.map((asset) => `
+            <tr>
+              <td><button class="ledger-code-button" data-ledger-focus-asset="${asset.id}" type="button">${attrText(asset.code)}</button></td>
+              <td>${statusBadge(asset.status)}</td>
+              <td>${attrText(assetCurrentDepartment(asset))}</td>
+              <td>${attrText(assetCurrentUserName(asset))}</td>
+              <td>${attrText(blank(asset.location))}</td>
+              <td>${attrText(blank(asset.purchaseDate || asset.inboundDate))}</td>
+              <td>${Number(asset.totalAmount || asset.unitPrice || 0).toFixed(2)}</td>
+              <td>${attrText(blank(assetRemarkField(asset, ["清查盘点情况", "4月12日清查盘点情况"])))}</td>
+              <td>${attrText(blank(assetRemarkField(asset, ["清查盘盈情况"])))}</td>
+              <td>${renderLedgerCheckoutForm(asset) || `<button class="ghost small" data-view-asset="${asset.id}" type="button">查看</button>`}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderLedgerDetailDrawer() {
+  const group = assetLedgerGroupByKey(ledgerDrawerKey);
+  if (!group) return "";
+  const mode = ledgerDrawerMode || "group";
+  return `
+    <div class="drawer-backdrop no-print" id="ledgerDetailBackdrop"></div>
+    <aside class="asset-drawer ledger-detail-drawer resizable-drawer no-print" ${drawerWidthStyle("ledger-detail", 920)} aria-label="资产台账明细">
+      ${renderDrawerResizeHandle("拖动调整资产台账明细宽度")}
+      <div class="drawer-head">
+        <div>
+          <h2>${ledgerDrawerTitle(mode)}</h2>
+          <p>${attrText(group.category)} / ${attrText(group.name)} / ${attrText(group.spec)}</p>
+        </div>
+        <button class="ghost icon-button" id="closeLedgerDetail" type="button">×</button>
+      </div>
+      <div class="drawer-body">
+        ${renderLedgerGroupSummary(group)}
+        ${renderLedgerDrawerTabs(group)}
+        ${mode === "checked_out" ? renderLedgerUsingPeople(group) : ""}
+        ${renderLedgerAssetRows(group, mode)}
+      </div>
+    </aside>
+  `;
+}
+
 function renderAssetStatusSummary() {
-  const assets = filteredAssets();
+  const assets = assetLedgerGroups().flatMap((group) => group.assets.filter((asset) => assetKind(asset) === "资产"));
   const total = assets.length;
   const using = assets.filter((asset) => asset.status === "checked_out").length;
   const available = assets.filter((asset) => asset.status === "in_stock").length;
@@ -1640,7 +3252,7 @@ function renderAssetCategoryPanel() {
         ${categories.map((category) => `
           <label class="asset-category-option">
             <input data-asset-category-option="${category}" type="checkbox" ${assetCategoryFilters.includes(category) ? "checked" : ""} />
-            <span>${category}</span>
+            <span>${displayCategoryText(category)}</span>
           </label>
         `).join("")}
       </div>
@@ -1725,9 +3337,40 @@ function resolveInventoryAsset(value) {
   if (!query) return null;
   const normalized = query.toLowerCase();
   const consumables = state.assets.filter((asset) => assetKind(asset) === "耗材");
-  return consumables.find((asset) => asset.id === query || asset.code === query)
-    || consumables.find((asset) => [asset.name, asset.code, asset.spec, asset.category].some((part) => String(part || "").toLowerCase() === normalized))
-    || consumables.find((asset) => [asset.name, asset.code, asset.spec, asset.category].some((part) => String(part || "").toLowerCase().includes(normalized)));
+  return resolveAssetLookup(query, consumables);
+}
+
+function assetSearchParts(asset) {
+  return [
+    asset.id,
+    asset.code,
+    asset.name,
+    asset.spec,
+    asset.category,
+    asset.brand,
+    asset.location,
+    asset.department,
+    asset.useDepartment,
+    asset.supplier
+  ].map((part) => String(part || "").trim()).filter(Boolean);
+}
+
+function resolveAssetLookup(value, candidates = state.assets) {
+  const query = assetLookupText(value);
+  if (!query) return null;
+  const normalized = query.toLowerCase();
+  return candidates.find((asset) => asset.id === query || asset.code === query)
+    || candidates.find((asset) => assetSearchParts(asset).some((part) => part.toLowerCase() === normalized))
+    || candidates.find((asset) => assetSearchParts(asset).some((part) => part.toLowerCase().includes(normalized)));
+}
+
+function resolveRecordAsset(value) {
+  const query = assetLookupText(value);
+  if (!query) return null;
+  const normalized = query.toLowerCase();
+  const group = assetGroups().find((item) => item.id === query || item.key === normalized || item.model.toLowerCase() === normalized)
+    || assetGroups().find((item) => [item.name, item.spec, item.model, item.category].some((part) => String(part || "").toLowerCase().includes(normalized)));
+  return group?.assets?.[0] || resolveAssetLookup(query);
 }
 
 function stockLevel(asset) {
@@ -1745,10 +3388,10 @@ function stockLevelText(asset) {
   return `<span class="badge ok">正常</span>`;
 }
 
-function lendableStatusBadge(asset) {
-  if (asset.status === "retired") return `<span class="badge bad">不可出借</span>`;
+function inventoryAvailabilityBadge(asset) {
+  if (asset.status === "retired") return `<span class="badge bad">停用</span>`;
   if (asset.status === "repair") return `<span class="badge warn">维修中</span>`;
-  return `<span class="badge ok">可出借</span>`;
+  return stockLevelText(asset);
 }
 
 function renderInventoryFlow(records, emptyText) {
@@ -1766,9 +3409,142 @@ function renderInventoryFlow(records, emptyText) {
               <td>${blank(record.paperNo)}</td>
               <td>${recordDisplayNote(record)}</td>
             </tr>
-          `).join("") || `<tr><td colspan="6" class="empty">${emptyText}</td></tr>`}
+          `).join("") || emptyActionRow(6, emptyText, "先通过日常登记录入耗材入库、领用或退回，系统会在这里沉淀库存流水。", consumableEntryActions())}
         </tbody>
       </table>
+    </div>
+  `;
+}
+
+function renderInventoryStatusTable(items) {
+  return `
+    <div class="table-wrap inventory-table-wrap">
+      <table>
+        <thead><tr><th>耗材</th><th>类别</th><th>规格</th><th>库存数量</th><th>库存状态</th><th>最近流水</th>${can("inventory.manage") ? "<th>操作</th>" : ""}</tr></thead>
+        <tbody>
+          ${items.map((asset) => `
+            <tr>
+              <td><strong>${asset.name}</strong><div class="mini-meta">${asset.code}</div></td>
+              <td>${blank(asset.category)}</td>
+              <td>${blank(asset.spec)}</td>
+              <td>${Number(asset.quantity || 0)} ${blank(asset.unit || "件")}</td>
+              <td>${inventoryAvailabilityBadge(asset)}</td>
+              <td class="mini-meta">${inventoryLatestFlowText(asset)}</td>
+              ${can("inventory.manage") ? `<td><span class="mini-meta">按库存流水管理</span></td>` : ""}
+            </tr>
+          `).join("") || `<tr><td colspan="${can("inventory.manage") ? 7 : 6}" class="empty">${renderEmptyAction("还没有耗材库存", "先新增耗材入库，之后可在这里登记领用、退回和盘点修正。", [{ label: "新增入库", view: "records", mode: "manual", action: "inbound" }, { label: "电子档导入", view: "records", mode: "import" }])}</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderInventoryFlowTable(records, emptyText) {
+  return `
+    <div class="table-wrap inventory-table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>类型</th><th>耗材</th><th>数量</th><th>经办/领用人</th><th>单号</th><th>备注</th></tr></thead>
+        <tbody>
+          ${records.map((record) => `
+            <tr>
+              <td>${fmt(record.type === "入库" ? record.inTime : record.outTime)}</td>
+              <td>${record.type}</td>
+              <td>${assetName(record.assetId)}</td>
+              <td>${record.quantity}</td>
+              <td>${userName(record.userId)}</td>
+              <td>${blank(record.paperNo)}</td>
+              <td>${recordDisplayNote(record)}</td>
+            </tr>
+          `).join("") || emptyActionRow(7, emptyText, "先通过日常登记录入耗材入库、领用或退回，系统会在这里沉淀库存流水。", consumableEntryActions())}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderInventoryUnifiedPanel(items, inboundRecords, outboundRecords, blockedItems, itemOptions) {
+  const allRecords = [...inboundRecords, ...outboundRecords].sort((a, b) => recordMillis(b) - recordMillis(a));
+  const views = [
+    ["status", "耗材状态", items.length],
+    ["inbound", "入库流水", inboundRecords.length],
+    ["outbound", "出库流水", outboundRecords.length],
+    ["all", "全部流水", allRecords.length],
+    ["blocked", "异常耗材", blockedItems.length]
+  ];
+  const active = views.some(([key]) => key === inventoryView) ? inventoryView : "status";
+  const content = {
+    status: renderInventoryStatusTable(items),
+    inbound: renderInventoryFlowTable(inboundRecords, "还没有入库流水"),
+    outbound: renderInventoryFlowTable(outboundRecords, "还没有出库流水"),
+    all: renderInventoryFlowTable(allRecords, "还没有出入库流水"),
+    blocked: renderInventoryStatusTable(blockedItems)
+  }[active];
+  const hints = {
+    status: "按耗材库存数量和安全库存显示当前状态。",
+    inbound: "只显示入库、补录等增加方向的流水。",
+    outbound: "只显示出库、领用等减少方向的流水。",
+    all: "按时间倒序合并展示入库和出库流水。",
+    blocked: "只显示维修中或已停用的耗材。"
+  };
+  return `
+    <section class="panel inventory-unified-panel">
+      <div class="section-title inventory-unified-title">
+        <div>
+          <h2>耗材库存与库存流水</h2>
+          <span class="hint">${hints[active]}</span>
+        </div>
+        <div class="inventory-view-tabs" role="tablist" aria-label="库存视图">
+          ${views.map(([key, label, count]) => `<button class="${active === key ? "active" : ""}" data-inventory-view="${key}" type="button">${label}<span>${count}</span></button>`).join("")}
+        </div>
+      </div>
+      ${renderInventoryAdjustForm(itemOptions)}
+      ${content}
+    </section>
+  `;
+}
+
+function latestInventoryRecord(assetId) {
+  return state.records
+    .filter((record) => record.assetId === assetId)
+    .sort((a, b) => recordMillis(b) - recordMillis(a))[0];
+}
+
+function inventoryLatestFlowText(asset) {
+  const record = latestInventoryRecord(asset.id);
+  if (!record) return "-";
+  return `${record.type === "出库" ? "出库/领用" : "入库/补录"} · ${fmt(recordTime(record))} · ${userName(record.userId)} · 数量 ${record.quantity || "-"}`;
+}
+
+function renderInventoryAdjustForm(itemOptions) {
+  if (!can("inventory.manage")) return "";
+  return `
+    <div class="inventory-adjust-panel inventory-inline-adjust">
+      <div class="section-title"><h3>耗材流水登记</h3><span class="hint">数量只记录本次入库/领用流水。</span></div>
+      <form id="inventoryAdjustForm" class="inventory-adjust-form">
+        <div class="inventory-source-block">
+          <h3>登记方式</h3>
+          <div class="source-toggle large">
+            ${[
+              ["manual", "手动登记"],
+              ["link", "扫码/链接"]
+            ].map(([key, label]) => `<button class="${inventoryAdjustSource === key ? "active" : ""}" data-inventory-source="${key}" type="button">${label}</button>`).join("")}
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="field wide">
+            <label>${inventoryAdjustSource === "link" ? "链接 / 二维码内容 / 资产编号" : "耗材名称 / 编号 / 规格"}</label>
+            <input name="assetLookup" list="inventoryAssetOptions" required placeholder="${inventoryAdjustSource === "link" ? "粘贴资产详情链接、二维码内容或资产编号" : "输入耗材名称、编号或规格，系统自动匹配"}" />
+            <datalist id="inventoryAssetOptions">${itemOptions}</datalist>
+            <p class="hint">${inventoryAdjustSource === "link" ? "支持资产详情 URL、二维码内容、资产编号。" : "不用滚动选择，输入关键字后直接匹配耗材。"}</p>
+          </div>
+          <div class="field"><label>流水类型</label><select name="mode"><option value="increase">入库</option><option value="decrease">领用</option><option value="increase">退回</option><option value="increase">盘点修正增加</option><option value="decrease">盘点修正减少</option></select></div>
+          <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
+          <div class="field"><label>经办/领用人</label><select name="userId">${selectableUsers().map((user) => `<option value="${user.id}">${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("")}</select></div>
+          <div class="field"><label>单号</label><input name="paperNo" placeholder="可选" /></div>
+          <div class="field"><label>原因</label><input name="reason" placeholder="入库 / 领用 / 退回 / 盘点修正" /></div>
+          <div class="actions form-grid wide"><button class="primary" type="submit">保存流水</button></div>
+        </div>
+      </form>
     </div>
   `;
 }
@@ -1778,7 +3554,8 @@ function renderInventory() {
   const blockedItems = items.filter((asset) => asset.status === "retired" || asset.status === "repair");
   const inboundRecords = inventoryRecords("入库");
   const outboundRecords = inventoryRecords("出库");
-  const lendableCount = items.length - blockedItems.length;
+  const normalCount = items.length - blockedItems.length;
+  const flowCount = inboundRecords.length + outboundRecords.length;
   const itemOptions = items.map((asset) => `<option value="${asset.code}">${asset.name}${asset.spec ? ` · ${asset.spec}` : ""} · ${asset.code}</option>`).join("");
   return `
     <section class="asset-workspace">
@@ -1787,84 +3564,12 @@ function renderInventory() {
         <button class="secondary" id="clearInventorySearch" type="button">重置</button>
       </div>
       <div class="stats">
-        <div class="stat"><span>物品种类</span><strong>${items.length}</strong><em>当前纳入出借管理</em></div>
-        <div class="stat"><span>当前库存</span><strong>-</strong><em>不按仓库数量汇总</em></div>
-        <div class="stat"><span>可出借</span><strong>${lendableCount}</strong><em>维修/报废除外</em></div>
-        <div class="stat"><span>流水记录</span><strong>${inboundRecords.length + outboundRecords.length}</strong><em>入库 + 出库</em></div>
+        <div class="stat"><span>耗材种类</span><strong>${items.length}</strong><em>当前纳入库存管理</em></div>
+        <div class="stat"><span>正常库存</span><strong>${normalCount}</strong><em>未维修/停用</em></div>
+        <div class="stat"><span>异常耗材</span><strong>${blockedItems.length}</strong><em>维修中或已停用</em></div>
+        <div class="stat"><span>流水记录</span><strong>${flowCount}</strong><em>入库 + 出库</em></div>
       </div>
-      ${can("inventory.manage") ? `
-        <section class="panel">
-          <div class="section-title"><h2>库存调整</h2><span class="hint">用于盘点修正、损耗、补录等场景，会同步生成流水。</span></div>
-          <form id="inventoryAdjustForm" class="inventory-adjust-form">
-            <div class="inventory-source-block">
-              <h3>4. 任务来源</h3>
-              <div class="source-toggle large">
-                ${[
-                  ["manual", "手动导入"],
-                  ["link", "链接提取"]
-                ].map(([key, label]) => `<button class="${inventoryAdjustSource === key ? "active" : ""}" data-inventory-source="${key}" type="button">${label}</button>`).join("")}
-              </div>
-            </div>
-            <div class="form-grid">
-            <div class="field wide">
-              <label>${inventoryAdjustSource === "link" ? "链接 / 二维码内容 / 资产编号" : "耗材名称 / 编号 / 规格"}</label>
-              <input name="assetLookup" list="inventoryAssetOptions" required placeholder="${inventoryAdjustSource === "link" ? "粘贴资产详情链接、二维码内容或资产编号" : "输入耗材名称、编号或规格，系统自动匹配"}" />
-              <datalist id="inventoryAssetOptions">${itemOptions}</datalist>
-              <p class="hint">${inventoryAdjustSource === "link" ? "支持资产详情 URL、二维码内容、资产编号。" : "不用滚动选择，输入关键字后直接匹配耗材。"}</p>
-            </div>
-            <div class="field"><label>调整类型</label><select name="mode"><option value="increase">增加库存</option><option value="decrease">减少库存</option></select></div>
-            <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
-            <div class="field"><label>经办/领用人</label><select name="userId">${selectableUsers().map((user) => `<option value="${user.id}">${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("")}</select></div>
-            <div class="field"><label>单号</label><input name="paperNo" placeholder="可选" /></div>
-            <div class="field"><label>原因</label><input name="reason" placeholder="盘点调整 / 损耗 / 补录" /></div>
-            <div class="actions form-grid wide"><button class="primary" type="submit">保存调整</button></div>
-            </div>
-          </form>
-        </section>
-      ` : ""}
-      <section class="panel">
-        <div class="section-title"><h2>当前库存</h2><span class="hint">此处不统计仓库数量，只判断是否可出借。</span></div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>耗材</th><th>类别</th><th>规格</th><th>当前库存</th><th>安全库存</th><th>位置</th><th>状态</th>${can("inventory.manage") ? "<th>操作</th>" : ""}</tr></thead>
-            <tbody>
-              ${items.map((asset) => `
-                <tr>
-                  <td><strong>${asset.name}</strong><div class="mini-meta">${asset.code}</div></td>
-                  <td>${blank(asset.category)}</td>
-                  <td>${blank(asset.spec)}</td>
-                  <td>-</td>
-                  <td>-</td>
-                  <td>-</td>
-                  <td>${lendableStatusBadge(asset)}</td>
-                  ${can("inventory.manage") ? `<td><span class="mini-meta">按出借管理</span></td>` : ""}
-                </tr>
-              `).join("") || `<tr><td colspan="${can("inventory.manage") ? 8 : 7}" class="empty">暂无耗材库存</td></tr>`}
-            </tbody>
-          </table>
-        </div>
-      </section>
-      <section class="panel">
-        <div class="section-title"><h2>不可出借清单</h2><span class="hint">只显示维修中或已报废的物品。</span></div>
-        <div class="record-list">
-          ${blockedItems.map((asset) => `
-            <article class="record-card">
-              <div class="card-head"><strong>${asset.name}</strong>${lendableStatusBadge(asset)}</div>
-              <p>当前库存：-，安全库存：-，位置：-</p>
-            </article>
-          `).join("") || `<div class="empty">暂无不可出借物品</div>`}
-        </div>
-      </section>
-      <section class="grid">
-        <div class="panel">
-          <div class="section-title"><h2>入库流水</h2><span class="hint">${inboundRecords.length} 条</span></div>
-          ${renderInventoryFlow(inboundRecords, "暂无入库流水")}
-        </div>
-        <div class="panel">
-          <div class="section-title"><h2>出库流水</h2><span class="hint">${outboundRecords.length} 条</span></div>
-          ${renderInventoryFlow(outboundRecords, "暂无出库流水")}
-        </div>
-      </section>
+      ${renderInventoryUnifiedPanel(items, inboundRecords, outboundRecords, blockedItems, itemOptions)}
     </section>
   `;
 }
@@ -1888,119 +3593,409 @@ function statusSelectOptions(selected) {
   ].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
 }
 
-function renderInventoryChecks() {
-  if (!can("checks.view")) return "";
+function currentCheckTask() {
   const tasks = state.inventoryCheckTasks || [];
-  const activeTask = tasks[0];
-  const locationOptions = locations().map((location) => `<option value="${location.name}">${location.name}</option>`).join("");
-  const categoryOptions = assetCategories().map((category) => `<option value="${category}">${category}</option>`).join("");
-  const keeperOptions = selectableUsers().map((user) => `<option value="${user.id}">${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("");
-  const statusOptions = statusSelectOptions("");
-  const items = activeTask ? checkTaskItems(activeTask.id) : [];
-  const checked = items.filter((item) => item.checked).length;
-  const abnormal = items.filter((item) => item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点").length;
+  const selected = tasks.find((task) => task.id === selectedCheckTaskId);
+  if (selected) return selected;
+  const active = tasks.find((task) => task.status !== "已完成") || tasks[0] || null;
+  selectedCheckTaskId = active?.id || "";
+  return active;
+}
+
+function checkAsset(item) {
+  return state.assets.find((asset) => asset.id === item.assetId) || {};
+}
+
+function checkGroupKeyFromValues(category, name, spec) {
+  return [
+    "check",
+    ledgerField(category, "未分类"),
+    ledgerField(name, "未命名资产"),
+    ledgerField(spec, "未填写规格")
+  ].join("|||");
+}
+
+function checkGroupKeyForItem(item) {
+  const asset = checkAsset(item);
+  return checkGroupKeyFromValues(asset.category, asset.name, asset.spec);
+}
+
+function checkGroupKeyForAsset(asset) {
+  return checkGroupKeyFromValues(asset.category, asset.name, asset.spec);
+}
+
+function emptyCheckGroup(key, asset) {
+  return {
+    key,
+    category: displayCategoryText(ledgerField(asset.category, "未分类")),
+    name: ledgerField(asset.name, "未命名资产"),
+    spec: ledgerField(asset.spec, "未填写规格"),
+    locationSummary: "-",
+    departmentSummary: "-",
+    items: [],
+    assets: [],
+    statusCounts: {},
+    checked: 0,
+    abnormal: 0,
+    total: 0
+  };
+}
+
+function buildCheckGroupsFromItems(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const asset = checkAsset(item);
+    const key = checkGroupKeyForItem(item);
+    if (!groups.has(key)) groups.set(key, emptyCheckGroup(key, asset));
+    const group = groups.get(key);
+    const status = item.systemStatus || asset.status || "in_stock";
+    group.items.push(item);
+    group.assets.push(asset);
+    group.statusCounts[status] = (group.statusCounts[status] || 0) + 1;
+    group.total += 1;
+    if (item.checked) group.checked += 1;
+    if (item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点") group.abnormal += 1;
+  }
+  return finalizeCheckGroups(groups);
+}
+
+function buildCheckGroupsFromAssets(assets) {
+  const groups = new Map();
+  for (const asset of assets) {
+    const key = checkGroupKeyForAsset(asset);
+    if (!groups.has(key)) groups.set(key, emptyCheckGroup(key, asset));
+    const group = groups.get(key);
+    const status = asset.status || "in_stock";
+    const item = {
+      id: asset.id,
+      taskId: "",
+      assetId: asset.id,
+      systemLocation: asset.location || "",
+      actualLocation: "",
+      systemStatus: status,
+      actualStatus: "",
+      systemKeeperId: asset.keeperId || asset.useUserId || "",
+      actualKeeperId: "",
+      checked: 0,
+      diffType: "未盘点",
+      remark: "",
+      previewOnly: true
+    };
+    group.items.push(item);
+    group.assets.push(asset);
+    group.statusCounts[status] = (group.statusCounts[status] || 0) + 1;
+    group.total += 1;
+  }
+  return finalizeCheckGroups(groups);
+}
+
+function finalizeCheckGroups(groups) {
+  return [...groups.values()].map((group) => ({
+    ...group,
+    locationSummary: summarizeValues(group.items, (item) => item.systemLocation || checkAsset(item).location, 3),
+    departmentSummary: summarizeValues(group.assets, (asset) => asset.useDepartment, 2)
+  })).sort(compareCheckGroups);
+}
+
+function compareCheckGroups(left, right) {
+  return left.category.localeCompare(right.category, "zh-Hans-CN", { numeric: true, sensitivity: "base" })
+    || left.name.localeCompare(right.name, "zh-Hans-CN", { numeric: true, sensitivity: "base" })
+    || left.spec.localeCompare(right.spec, "zh-Hans-CN", { numeric: true, sensitivity: "base" });
+}
+
+function checkGroupsForActiveTask(activeTask) {
+  if (activeTask) return buildCheckGroupsFromItems(checkTaskItems(activeTask.id));
+  return buildCheckGroupsFromAssets(state.assets.filter((asset) => assetKind(asset) === "资产"));
+}
+
+function resolveSelectedCheckGroup(groups) {
+  const selected = groups.find((group) => group.key === selectedCheckGroupKey) || groups[0] || null;
+  selectedCheckGroupKey = selected?.key || "";
+  return selected;
+}
+
+function firstPendingCheckItem(group) {
+  return group?.items.find((item) => !item.checked) || group?.items[0] || null;
+}
+
+function resolveActiveCheckItem(group) {
+  if (!group) {
+    activeCheckItemId = "";
+    return null;
+  }
+  const selected = group.items.find((item) => item.id === activeCheckItemId) || firstPendingCheckItem(group);
+  activeCheckItemId = selected?.id || "";
+  return selected || null;
+}
+
+function selectNextCheckItem(currentItemId) {
+  const activeTask = currentCheckTask();
+  const groups = activeTask ? buildCheckGroupsFromItems(checkTaskItems(activeTask.id)) : [];
+  const flat = groups.flatMap((group) => group.items.map((item) => ({ item, groupKey: group.key })));
+  if (!flat.length) {
+    selectedCheckGroupKey = "";
+    activeCheckItemId = "";
+    return;
+  }
+  const currentIndex = flat.findIndex((entry) => entry.item.id === currentItemId);
+  const nextPoolStart = currentIndex >= 0 ? currentIndex + 1 : 0;
+  const next = flat.slice(nextPoolStart).find((entry) => !entry.item.checked)
+    || flat.slice(0, nextPoolStart).find((entry) => !entry.item.checked)
+    || flat[currentIndex + 1]
+    || flat[currentIndex]
+    || flat[0];
+  selectedCheckGroupKey = next?.groupKey || "";
+  activeCheckItemId = next?.item.id || "";
+}
+
+function checkStatusSummary(statusCounts) {
+  const order = ["checked_out", "repair", "retired", "in_stock"];
+  const entries = [
+    ...order.filter((status) => statusCounts[status]).map((status) => [status, statusCounts[status]]),
+    ...Object.entries(statusCounts).filter(([status]) => !order.includes(status))
+  ];
+  return entries.map(([status, count]) => `<span class="ledger-status-chip ${ledgerStatusTone(status)}">${statusText(status)} ${count}</span>`).join("")
+    || `<span class="ledger-status-chip muted">暂无状态</span>`;
+}
+
+function blankLocationOptions(selected = "") {
+  return `<option value="" ${selected ? "" : "selected"}>留白</option>${locationOptions(selected)}`;
+}
+
+function blankStatusOptions(selected = "") {
+  return `<option value="" ${selected ? "" : "selected"}>留白</option>${statusSelectOptions(selected)}`;
+}
+
+function blankKeeperOptions(selected = "") {
+  return `<option value="" ${selected ? "" : "selected"}>留白</option>${selectableUsers().map((user) => `<option value="${user.id}" ${selected === user.id ? "selected" : ""}>${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}</option>`).join("")}`;
+}
+
+function renderCheckProgress(activeTask, groups, selectedGroup, checked, total, abnormal) {
   return `
-    <section class="panel">
-      <div class="section-title"><h2>创建盘点任务</h2><span class="hint">一期先支持按范围生成资产清单，再人工录入实际结果。</span></div>
-      <form id="inventoryCheckForm" class="form-grid">
-        <div class="field"><label>盘点范围</label><select name="scopeType" id="checkScopeType"><option value="all">全部资产</option><option value="location">按位置</option><option value="category">按分类</option><option value="keeper">按责任人</option><option value="status">按状态</option></select></div>
-        <div class="field"><label>范围值</label><select name="scopeValue" id="checkScopeValue"><option value="">全部</option>${locationOptions}</select></div>
-        <div class="field"><label>负责人</label><select name="ownerId">${keeperOptions}</select></div>
-        <div class="field wide"><label>备注</label><input name="remark" placeholder="例如：2026 春季实验室资产盘点" /></div>
-        <button class="primary" type="submit">生成盘点任务</button>
-      </form>
-      <template id="checkScopeOptions">
-        <select data-scope="location"><option value="">全部位置</option>${locationOptions}</select>
-        <select data-scope="category"><option value="">全部分类</option>${categoryOptions}</select>
-        <select data-scope="keeper"><option value="">全部责任人</option>${keeperOptions}</select>
-        <select data-scope="status"><option value="">全部状态</option>${statusOptions}</select>
-        <select data-scope="all"><option value="">全部</option></select>
-      </template>
-    </section>
-    <section class="panel">
-      <div class="section-title">
-        <h2>盘点任务</h2>
-        <span class="hint">共 ${tasks.length} 个任务</span>
+    <div class="check-progress">
+      <div class="check-progress-card ${activeTask ? "done" : "active"}">
+        <strong>盘点任务</strong>
+        <em>${activeTask ? activeTask.checkNo : "从当前资产底账生成范围"}</em>
       </div>
-      <div class="table-wrap">
+      <div class="check-progress-card ${activeTask ? "active" : ""}">
+        <strong>资产清单</strong>
+        <em>${groups.length} 个分组 / ${total} 个资产编号</em>
+      </div>
+      <div class="check-progress-card ${selectedGroup ? "active" : ""}">
+        <strong>资产说明</strong>
+        <em>${selectedGroup ? `${selectedGroup.name} · ${selectedGroup.total} 个编号` : "选择一个分组查看编号"}</em>
+      </div>
+      <div class="check-progress-meter">
+        <strong>${checked}/${total || 0}</strong>
+        <span>已完成</span>
+        <em>异常 ${abnormal}</em>
+      </div>
+    </div>
+  `;
+}
+
+function renderCheckGroupPanel(groups, activeTask) {
+  return `
+    <section class="panel check-group-panel">
+      <div class="section-title">
+        <h2>盘点清单</h2>
+        <span class="hint">${activeTask ? `当前任务 ${activeTask.checkNo}` : "依赖已导入学校资产 Excel 底账汇总"}</span>
+      </div>
+      <div class="table-wrap compact-table">
         <table>
-          <thead><tr><th>盘点单号</th><th>范围</th><th>负责人</th><th>开始</th><th>结束</th><th>状态</th><th>进度</th><th>异常</th><th>操作</th></tr></thead>
+          <thead><tr><th>资产分类</th><th>资产名称</th><th>规格型号</th><th>数量</th><th>状态汇总</th><th>位置汇总</th><th>操作</th></tr></thead>
           <tbody>
-            ${tasks.map((task) => {
-              const taskItems = checkTaskItems(task.id);
-              const taskChecked = taskItems.filter((item) => item.checked).length;
-              const taskAbnormal = taskItems.filter((item) => item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点").length;
-              return `
-                <tr>
-                  <td>${task.checkNo}</td>
-                  <td>${task.scopeType} ${task.scopeValue || "全部"}</td>
-                  <td>${userName(task.ownerId)}</td>
-                  <td>${fmt(task.startTime)}</td>
-                  <td>${fmt(task.endTime)}</td>
-                  <td>${requestStatusBadge(task.status)}</td>
-                  <td>${taskChecked}/${taskItems.length}</td>
-                  <td>${taskAbnormal}</td>
-                  <td><div class="row-actions">${task.status !== "已完成" && can("checks.manage") ? `<button class="secondary small" data-complete-check="${task.id}" type="button">完成</button>` : ""}${can("reports.export") ? `<button class="ghost small" data-export-check="${task.id}" type="button">导出</button>` : ""}</div></td>
-                </tr>
-              `;
-            }).join("") || `<tr><td colspan="9" class="empty">暂无盘点任务</td></tr>`}
+            ${groups.map((group) => `
+              <tr class="${group.key === selectedCheckGroupKey ? "selected-row" : ""}">
+                <td>${attrText(group.category)}</td>
+                <td>
+                  <button class="asset-ledger-name" data-check-group="${attrText(group.key)}" type="button">
+                    <strong>${attrText(group.name)}</strong>
+                    <span>${group.total} 个资产编号</span>
+                  </button>
+                </td>
+                <td>${attrText(group.spec)}</td>
+                <td>${group.total}</td>
+                <td>
+                  <div class="ledger-status-buttons">${checkStatusSummary(group.statusCounts)}</div>
+                  <div class="mini-meta">已盘 ${group.checked}/${group.total}${group.abnormal ? ` · 异常 ${group.abnormal}` : ""}</div>
+                </td>
+                <td>${attrText(group.locationSummary)}<div class="mini-meta">${attrText(group.departmentSummary)}</div></td>
+                <td><button class="${group.key === selectedCheckGroupKey ? "primary" : "secondary"} small" data-check-group="${attrText(group.key)}" type="button">查看编号</button></td>
+              </tr>
+            `).join("") || emptyActionRow(7, "还没有可盘点资产", "先导入学校资产 Excel 底表，盘点任务会从这份底账自动生成。", [{ label: "导入学校资产底表", view: "records", mode: "import" }])}
           </tbody>
         </table>
       </div>
     </section>
-    ${activeTask ? `
-      ${can("checks.manage") ? `
+  `;
+}
+
+function renderCheckItemRow(item, activeItem, activeTask) {
+  const asset = checkAsset(item);
+  const canEdit = activeTask && can("checks.manage") && !item.previewOnly;
+  const isActive = activeItem?.id === item.id;
+  return `
+    <tr class="${isActive ? "check-item-active" : ""}">
+      <td>${isActive ? `<span class="badge warn">当前</span>` : checkDiffBadge(item.diffType)}</td>
+      <td><button class="ledger-code-button" data-check-active-item="${item.id}" data-check-group="${attrText(checkGroupKeyForItem(item))}" type="button">${attrText(asset.code || item.assetId || "-")}</button></td>
+      <td><strong>${attrText(asset.name || "未知资产")}</strong><div class="mini-meta">${attrText(displayCategoryText(asset.category || "-"))} · ${attrText(asset.spec || "未填写规格")}</div></td>
+      <td>${attrText(item.systemLocation || asset.location || "")}</td>
+      <td>${canEdit ? `<select data-check-location="${item.id}">${blankLocationOptions(item.actualLocation || "")}</select>` : attrText(item.actualLocation || "")}</td>
+      <td>${statusBadge(item.systemStatus || asset.status)}</td>
+      <td>${canEdit ? `<select data-check-status="${item.id}">${blankStatusOptions(item.actualStatus || "")}</select>` : attrText(statusText(item.actualStatus || ""))}</td>
+      <td>${userName(item.systemKeeperId || asset.keeperId || asset.useUserId)}</td>
+      <td>${canEdit ? `<select data-check-keeper="${item.id}">${blankKeeperOptions(item.actualKeeperId || "")}</select>` : attrText(item.actualKeeperId ? userName(item.actualKeeperId) : "")}</td>
+      <td>${canEdit ? `<input data-check-remark="${item.id}" value="${attrText(item.remark || "")}" placeholder="留白或填写异常说明" />` : attrText(item.remark || "")}</td>
+      <td>${canEdit ? `<button class="secondary small" data-save-check-item="${item.id}" type="button">保存并下一个</button>` : "-"}</td>
+    </tr>
+  `;
+}
+
+function renderCheckItemPanel(selectedGroup, activeItem, activeTask) {
+  return `
+    <section class="panel check-item-panel">
+      <div class="section-title">
+        <h2>盘点清单</h2>
+        <span class="hint">${selectedGroup ? `${selectedGroup.name} · ${selectedGroup.location}` : "点击上面的资产名称查看具体资产编号"}</span>
+      </div>
+      ${!activeTask && selectedGroup ? `<p class="hint check-preview-hint">下面是当前导入底账中的资产编号预览。生成盘点任务后，可以逐个保存，完成一个会自动跳到下一个。</p>` : ""}
+      <div class="table-wrap compact-table check-item-table">
+        <table>
+          <thead><tr><th>进度</th><th>资产编号</th><th>资产</th><th>账面位置</th><th>实际位置</th><th>账面状态</th><th>实际状态</th><th>账面使用人</th><th>实际使用人</th><th>备注</th><th>操作</th></tr></thead>
+          <tbody>
+            ${selectedGroup?.items.map((item) => renderCheckItemRow(item, activeItem, activeTask)).join("") || emptyActionRow(11, "请选择一个资产分组", "点击上方资产名称后，这里会列出该组下面所有资产编号。", [{ label: "查看资产台账", view: "assets" }])}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderCheckAssetInfoPanel(selectedGroup, activeItem, activeTask) {
+  if (!selectedGroup) {
+    return `
+      <section class="panel check-asset-info-panel">
+        <div class="section-title"><h2>资产说明</h2><span class="hint">请选择左侧资产</span></div>
+        ${renderEmptyAction("还没有选中资产", "点击左侧盘点清单里的资产名称后，这里会显示该组所有资产编号。", [])}
+      </section>
+    `;
+  }
+  return `
+    <section class="panel check-asset-info-panel">
+      <div class="section-title">
+        <h2>资产说明</h2>
+        <span class="hint">${selectedGroup.total} 个资产编号</span>
+      </div>
+      <div class="check-asset-summary">
+        <div><span>资产分类</span><strong>${attrText(selectedGroup.category)}</strong></div>
+        <div><span>资产名称</span><strong>${attrText(selectedGroup.name)}</strong></div>
+        <div><span>规格型号</span><strong>${attrText(selectedGroup.spec)}</strong></div>
+        <div><span>位置汇总</span><strong>${attrText(selectedGroup.locationSummary)}</strong></div>
+      </div>
+      <div class="check-code-list">
+        ${selectedGroup.items.map((item) => {
+          const asset = checkAsset(item);
+          const isActive = activeItem?.id === item.id;
+          return `
+            <button class="check-code-card ${isActive ? "active" : ""}" data-check-active-item="${item.id}" data-check-group="${attrText(selectedGroup.key)}" type="button">
+              <strong>${attrText(asset.code || item.assetId || "-")}</strong>
+              <span>${isActive ? `<span class="badge warn">当前</span>` : checkDiffBadge(item.diffType)}</span>
+              <em>${attrText(item.systemLocation || asset.location || "")}</em>
+            </button>
+          `;
+        }).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderCheckSidePanel(activeTask, tasks, checked, total, abnormal, selectedGroup, activeItem, locationOptionsHtml) {
+  const taskRows = tasks.map((task) => {
+    const taskItems = checkTaskItems(task.id);
+    const taskChecked = taskItems.filter((item) => item.checked).length;
+    const taskAbnormal = taskItems.filter((item) => item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点").length;
+    return `
+      <button class="check-task-row ${activeTask?.id === task.id ? "active" : ""}" data-select-check-task="${task.id}" type="button">
+        <span>${attrText(task.checkNo)}</span>
+        <strong>${taskChecked}/${taskItems.length}</strong>
+        <em>${requestStatusBadge(task.status)} 异常 ${taskAbnormal}</em>
+      </button>
+    `;
+  }).join("");
+  return `
+    <aside class="check-side-panel no-print">
+      ${renderCheckAssetInfoPanel(selectedGroup, activeItem, activeTask)}
       <section class="panel">
-        <div class="section-title"><h2>扫码盘点 / 盘盈录入</h2><span class="hint">扫码内容可以是资产二维码链接或资产编号。</span></div>
-        <form id="checkScanForm" class="form-grid">
-          <div class="field wide"><label>扫码内容</label><input name="scanText" required placeholder="粘贴资产二维码内容或资产编号" /></div>
-          <input type="hidden" name="taskId" value="${activeTask.id}" />
-          <div class="field"><label>实际位置</label><select name="actualLocation">${locationOptions()}</select></div>
-          <div class="field"><label>实际状态</label><select name="actualStatus">${statusSelectOptions("")}</select></div>
-          <div class="field"><label>实际责任人</label><select name="actualKeeperId">${userOptions()}</select></div>
-          <div class="field"><label>备注</label><input name="remark" placeholder="扫码盘点" /></div>
-          <div class="setting-actions"><button class="primary" type="submit">提交扫码结果</button><button class="secondary" id="startCheckQrScanner" type="button">摄像头扫码</button></div>
-        </form>
-        <form id="checkSurplusForm" class="form-grid">
-          <input type="hidden" name="taskId" value="${activeTask.id}" />
-          <div class="field"><label>盘盈资产名称</label><input name="name" required placeholder="现场发现但系统无记录的资产" /></div>
-          <div class="field"><label>编号</label><input name="code" placeholder="留空自动生成" /></div>
-          <div class="field"><label>分类</label><select name="category">${assetCategories().map((category) => `<option value="${category}">${category}</option>`).join("")}</select></div>
-          <div class="field"><label>位置</label><select name="location">${locationOptions()}</select></div>
-          <div class="field"><label>责任人</label><select name="keeperId">${userOptions()}</select></div>
-          <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" /></div>
-          <div class="field wide"><label>备注</label><input name="remark" placeholder="盘盈说明" /></div>
-          <button class="secondary" type="submit">录入盘盈</button>
-        </form>
-      </section>` : ""}
-      <section class="panel">
-        <div class="section-title"><h2>最新任务明细：${activeTask.checkNo}</h2><span class="hint">已盘 ${checked}/${items.length}，异常 ${abnormal}</span></div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>资产</th><th>系统位置</th><th>实际位置</th><th>系统状态</th><th>实际状态</th><th>系统责任人</th><th>实际责任人</th><th>差异</th><th>备注</th><th>操作</th></tr></thead>
-            <tbody>
-              ${items.map((item) => {
-                const asset = state.assets.find((entry) => entry.id === item.assetId) || {};
-                return `
-                  <tr>
-                    <td><strong>${asset.name || "未知资产"}</strong><div class="mini-meta">${asset.code || item.assetId}</div></td>
-                    <td>${blank(item.systemLocation)}</td>
-                    <td><select data-check-location="${item.id}">${locations().map((location) => `<option value="${location.name}" ${(item.actualLocation || item.systemLocation) === location.name ? "selected" : ""}>${location.name}</option>`).join("")}</select></td>
-                    <td>${statusBadge(item.systemStatus)}</td>
-                    <td><select data-check-status="${item.id}">${statusSelectOptions(item.actualStatus || item.systemStatus)}</select></td>
-                    <td>${userName(item.systemKeeperId)}</td>
-                    <td><select data-check-keeper="${item.id}">${selectableUsers().map((user) => `<option value="${user.id}" ${(item.actualKeeperId || item.systemKeeperId) === user.id ? "selected" : ""}>${user.name}</option>`).join("")}</select></td>
-                    <td>${checkDiffBadge(item.diffType)}</td>
-                    <td><input data-check-remark="${item.id}" value="${item.remark || ""}" placeholder="备注" /></td>
-                    <td><button class="secondary small" data-save-check-item="${item.id}" type="button">保存</button></td>
-                  </tr>
-                `;
-              }).join("")}
-            </tbody>
-          </table>
+        <div class="section-title"><h2>任务概况</h2><span class="hint">${activeTask ? attrText(activeTask.checkNo) : "尚未生成任务"}</span></div>
+        <div class="check-summary-grid">
+          <div><span>底账资产</span><strong>${state.assets.filter((asset) => assetKind(asset) === "资产").length}</strong></div>
+          <div><span>任务资产</span><strong>${total}</strong></div>
+          <div><span>已盘点</span><strong>${checked}</strong></div>
+          <div><span>异常</span><strong>${abnormal}</strong></div>
+        </div>
+        <p class="hint">保存当前资产编号后，系统会自动定位到下一个未盘点编号；没有填写的实际位置、状态、使用人会保持为空。</p>
+        <div class="row-actions">
+          ${activeTask && activeTask.status !== "已完成" && can("checks.manage") ? `<button class="secondary small" data-complete-check="${activeTask.id}" type="button">完成任务</button>` : ""}
+          ${activeTask && can("reports.export") ? `<button class="ghost small" data-export-check="${activeTask.id}" type="button">导出报告</button>` : ""}
         </div>
       </section>
-    ` : ""}
+      <section class="panel">
+        <div class="section-title"><h2>盘点任务</h2><span class="hint">共 ${tasks.length} 个</span></div>
+        <div class="check-task-list">
+          ${taskRows || renderEmptyAction("还没有盘点任务", "先从当前资产底账生成盘点任务，再逐组核对资产编号。", [{ label: "导入学校资产底表", view: "records", mode: "import" }])}
+        </div>
+      </section>
+      ${activeTask && can("checks.manage") ? `
+        <section class="panel">
+          <div class="section-title"><h2>扫码 / 盘盈</h2><span class="hint">保留原有快速录入能力</span></div>
+          <form id="checkScanForm" class="check-side-form">
+            <input type="hidden" name="taskId" value="${activeTask.id}" />
+            <label>扫码内容<input name="scanText" required placeholder="资产二维码内容或资产编号" /></label>
+            <label>实际位置<select name="actualLocation"><option value="">留白</option>${locationOptionsHtml}</select></label>
+            <label>实际状态<select name="actualStatus">${blankStatusOptions("")}</select></label>
+            <label>实际责任人<select name="actualKeeperId">${blankKeeperOptions("")}</select></label>
+            <label>备注<input name="remark" placeholder="扫码盘点" /></label>
+            <div class="row-actions"><button class="primary small" type="submit">提交扫码</button><button class="secondary small" id="startCheckQrScanner" type="button">摄像头扫码</button></div>
+          </form>
+          <form id="checkSurplusForm" class="check-side-form">
+            <input type="hidden" name="taskId" value="${activeTask.id}" />
+            <label>盘盈资产名称<input name="name" required placeholder="现场发现但系统无记录的资产" /></label>
+            <label>编号<input name="code" placeholder="留空自动生成" /></label>
+            <label>分类<select name="category">${assetCategories().map((category) => `<option value="${category}">${category}</option>`).join("")}</select></label>
+            <label>位置<select name="location">${locationOptionsHtml}</select></label>
+            <label>责任人<select name="keeperId">${userOptions()}</select></label>
+            <label>数量<input name="quantity" type="number" min="1" value="1" /></label>
+            <label>备注<input name="remark" placeholder="盘盈说明" /></label>
+            <button class="secondary small" type="submit">录入盘盈</button>
+          </form>
+        </section>
+      ` : ""}
+    </aside>
+  `;
+}
+
+function renderInventoryChecks() {
+  if (!can("checks.view")) return "";
+  const tasks = state.inventoryCheckTasks || [];
+  const activeTask = currentCheckTask();
+  const locationOptionsHtml = locations().map((location) => `<option value="${location.name}">${location.name}</option>`).join("");
+  const groups = checkGroupsForActiveTask(activeTask);
+  const selectedGroup = resolveSelectedCheckGroup(groups);
+  const activeItem = resolveActiveCheckItem(selectedGroup);
+  const items = activeTask ? checkTaskItems(activeTask.id) : groups.flatMap((group) => group.items);
+  const checked = items.filter((item) => item.checked).length;
+  const abnormal = items.filter((item) => item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点").length;
+  return `
+    <section class="check-workspace">
+      ${renderCheckProgress(activeTask, groups, selectedGroup, checked, items.length, abnormal)}
+      <div class="check-layout">
+        <div class="check-main">
+          ${renderCheckGroupPanel(groups, activeTask)}
+        </div>
+        ${renderCheckSidePanel(activeTask, tasks, checked, items.length, abnormal, selectedGroup, activeItem, locationOptionsHtml)}
+      </div>
+    </section>
   `;
 }
 
@@ -2008,8 +4003,32 @@ function availableOrderAssets() {
   return state.assets.filter((asset) => asset.status !== "retired");
 }
 
-function assetOptions(selected = "") {
-  return availableOrderAssets().map((asset) => `<option value="${asset.id}" ${selected === asset.id ? "selected" : ""}>${asset.name} · ${asset.code} · ${statusText(asset.status)}</option>`).join("");
+function orderAssetCandidates(kind = orderType) {
+  const candidates = availableOrderAssets();
+  if (["claim", "borrow"].includes(kind)) {
+    return candidates.filter((asset) => asset.status !== "repair");
+  }
+  return candidates;
+}
+
+function resolveOrderAsset(value, kind = orderType) {
+  return resolveAssetLookup(value, orderAssetCandidates(kind));
+}
+
+function orderAssetLookupField(kind) {
+  const candidates = orderAssetCandidates(kind);
+  const options = candidates
+    .map((asset) => `<option value="${attrText(asset.code || asset.id)}" label="${attrText(`${asset.name}${asset.spec ? ` · ${asset.spec}` : ""} · ${statusText(asset.status)}`)}"></option>`)
+    .join("");
+  return `
+    <input type="hidden" name="assetId" value="" />
+    <div class="field wide order-asset-lookup" data-order-asset-kind="${kind}">
+      <label>资产</label>
+      <input name="assetLookup" list="orderAssetOptions-${kind}" required placeholder="输入资产名称、编号、规格，或粘贴扫码详情链接" autocomplete="off" />
+      <datalist id="orderAssetOptions-${kind}">${options}</datalist>
+      <p class="asset-lookup-hint">已排除不可办理的已报废资产，不用滚动长列表。</p>
+    </div>
+  `;
 }
 
 function userOptions(selected = "") {
@@ -2062,8 +4081,12 @@ function renderReports() {
     ["borrow", "借还明细", "借出与归还记录"],
     ["inbound", "入库明细", "入库记录"],
     ["outbound", "出库明细", "出库记录"],
+    ["stock-flow", "库存流水", "数量变动明细"],
+    ["transfer", "调拨明细", "部门、位置和责任人流转"],
+    ["repair", "维修明细", "维修过程和费用"],
+    ["asset-flow", "资产流转日志", "台账状态变更轨迹"],
     ["scrap", "报废资产清单", "已报废资产"],
-    ["consumable-warning", "耗材库存预警", "低于安全库存的耗材"]
+    ["consumable-status", "耗材状态异常清单", "维修中或已报废的耗材"]
   ];
   const latestTask = (state.inventoryCheckTasks || [])[0];
   return `
@@ -2077,7 +4100,7 @@ function renderReports() {
           </article>
         `).join("")}
         <article class="report-card">
-          <div><strong>盘点差异报告</strong><p class="hint">${latestTask ? `最新任务 ${latestTask.checkNo}` : "暂无盘点任务"}</p></div>
+          <div><strong>盘点差异报告</strong><p class="hint">${latestTask ? `最新任务 ${latestTask.checkNo}` : "还没有盘点任务"}</p></div>
           ${latestTask ? `<button class="secondary small" data-export-check="${latestTask.id}" type="button">导出</button>` : `<span class="hint">无任务</span>`}
         </article>
       </div>
@@ -2088,19 +4111,20 @@ function renderReports() {
         ${dashboardStatCard("资产总数", state.assets.length, "台账条目", "▦")}
         ${dashboardStatCard("总金额", state.assets.reduce((sum, item) => sum + Number(item.totalAmount || 0), 0).toFixed(2), "按台账总金额", "￥")}
         ${dashboardStatCard("报废资产", state.assets.filter((item) => item.status === "retired").length, "禁止领用/借用/调拨", "×")}
-        ${dashboardStatCard("耗材预警", inventoryItems().filter((asset) => stockLevel(asset) !== "ok").length, "低于安全库存", "!")}
+        ${dashboardStatCard("耗材异常", inventoryItems().filter((asset) => ["repair", "retired"].includes(asset.status)).length, "维修/报废", "!")}
       </div>
     </section>
   `;
 }
 
 function renderOrderForm() {
-  const assets = assetOptions();
-  if (!assets) return `<div class="empty">暂无可办理业务的资产</div>`;
+  if (!orderAssetCandidates(orderType).length) {
+    return renderEmptyAction("还没有可办理业务的资产", "先新增资产入库，资产进入台账后才能办理领用、借用、调拨、维修或报废。", recordEntryActions());
+  }
   if (orderType === "claim") {
     return `
       <form id="claimOrderForm" class="form-grid">
-        <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+        ${orderAssetLookupField("claim")}
         <div class="field"><label>领用人</label><select name="userId" required>${userOptions()}</select></div>
         <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
         <div class="field"><label>领用后位置</label><select name="location">${locationOptions()}</select></div>
@@ -2113,7 +4137,7 @@ function renderOrderForm() {
   if (orderType === "borrow") {
     return `
       <form id="borrowOrderForm" class="form-grid">
-        <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+        ${orderAssetLookupField("borrow")}
         <div class="field"><label>借用人</label><select name="borrowerId" required>${userOptions()}</select></div>
         <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
         <div class="field"><label>预计归还日期</label><input name="expectedReturnDate" type="date" /></div>
@@ -2127,7 +4151,7 @@ function renderOrderForm() {
   if (orderType === "transfer") {
     return `
       <form id="transferOrderForm" class="form-grid">
-        <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+        ${orderAssetLookupField("transfer")}
         <div class="field"><label>新部门</label><select name="newDepartment" required>${departmentOptions()}</select></div>
         <div class="field"><label>新位置</label><select name="newLocation" required>${locationOptions()}</select></div>
         <div class="field"><label>新责任人</label><select name="newKeeperId" required>${userOptions()}</select></div>
@@ -2140,7 +4164,7 @@ function renderOrderForm() {
   if (orderType === "repair") {
     return `
       <form id="repairOrderForm" class="form-grid">
-        <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+        ${orderAssetLookupField("repair")}
         <div class="field"><label>报修人</label><select name="reporterId" required>${userOptions(state.currentUser.id)}</select></div>
         <div class="field"><label>维修人 / 单位</label><input name="repairer" placeholder="内部维修人或外部维修单位" /></div>
         <div class="field"><label>预计费用</label><input name="cost" type="number" min="0" step="0.01" value="0" /></div>
@@ -2151,7 +4175,7 @@ function renderOrderForm() {
   }
   return `
     <form id="scrapOrderForm" class="form-grid">
-      <div class="field"><label>资产</label><select name="assetId" required>${assets}</select></div>
+      ${orderAssetLookupField("scrap")}
       <div class="field"><label>申请人</label><select name="applicantId" required>${userOptions(state.currentUser.id)}</select></div>
       <div class="field"><label>残值</label><input name="residualValue" type="number" min="0" step="0.01" value="0" /></div>
       <div class="field"><label>报废日期</label><input name="scrapDate" type="date" value="${new Date().toISOString().slice(0, 10)}" /></div>
@@ -2181,9 +4205,9 @@ function renderBorrowOrderList() {
             ${orders.map((item) => `
               <tr>
                 <td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${userName(item.borrowerId)}</td><td>${item.quantity || 1}${item.countQuantity === false ? `<div class="mini-meta">不计数</div>` : ""}</td><td>${blank(item.expectedReturnDate)}</td><td>${blank(item.actualReturnDate)}</td><td>${overdueBadge(item)}</td><td>${blank(item.returnCheck)}</td>
-                <td>${can("orders.manage") && item.status !== "已归还" ? `<button class="secondary small" data-return-borrow="${item.id}" type="button">归还验收</button>` : "-"}</td>
+                <td>${can("orders.manage") && item.status === "借用中" ? `<button class="secondary small" data-return-borrow="${item.id}" type="button">归还验收</button>` : "-"}</td>
               </tr>
-            `).join("") || `<tr><td colspan="9" class="empty">暂无领用或借用单</td></tr>`}
+            `).join("") || emptyActionRow(9, "还没有领用或借用单", "通过上方业务办理创建领用单或借用单，后续归还验收会在这里处理。", [{ label: "创建借用单", view: "orders", orderType: "borrow" }, { label: "创建领用单", view: "orders", orderType: "claim" }])}
           </tbody>
         </table>
       </div>
@@ -2200,7 +4224,7 @@ function renderTransferOrderList() {
         <table>
           <thead><tr><th>单号</th><th>资产</th><th>原部门/位置</th><th>新部门/位置</th><th>新责任人</th><th>原因</th><th>状态</th></tr></thead>
           <tbody>
-            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${blank(item.oldDepartment)} / ${blank(item.oldLocation)}</td><td>${blank(item.newDepartment)} / ${blank(item.newLocation)}</td><td>${userName(item.newKeeperId)}</td><td>${blank(item.reason)}</td><td>${requestStatusBadge(item.status)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无调拨单</td></tr>`}
+            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${blank(item.oldDepartment)} / ${blank(item.oldLocation)}</td><td>${blank(item.newDepartment)} / ${blank(item.newLocation)}</td><td>${userName(item.newKeeperId)}</td><td>${blank(item.reason)}</td><td>${requestStatusBadge(item.status)}</td></tr>`).join("") || emptyActionRow(7, "还没有调拨单", "资产跨部门、跨位置或责任人变更时，在业务办理中创建调拨单。", [{ label: "创建调拨单", view: "orders", orderType: "transfer" }, { label: "查看资产台账", view: "assets" }])}
           </tbody>
         </table>
       </div>
@@ -2217,7 +4241,7 @@ function renderRepairOrderList() {
         <table>
           <thead><tr><th>单号</th><th>资产</th><th>状态</th><th>维修人</th><th>费用</th><th>故障/结果</th><th>操作</th></tr></thead>
           <tbody>
-            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.repairer)}</td><td>${Number(item.cost || 0).toFixed(2)}</td><td>${blank(item.result || item.faultDesc)}</td><td>${can("orders.manage") && item.status !== "已完成" ? `<button class="secondary small" data-finish-repair="${item.id}" type="button">完成</button>` : "-"}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无维修单</td></tr>`}
+            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.repairer)}</td><td>${Number(item.cost || 0).toFixed(2)}</td><td>${blank(item.result || item.faultDesc)}</td><td>${can("orders.manage") && item.status !== "已完成" ? `<button class="secondary small" data-finish-repair="${item.id}" type="button">完成</button>` : "-"}</td></tr>`).join("") || emptyActionRow(7, "还没有维修单", "资产故障或保养时，在业务办理中创建维修单并保留维修过程。", [{ label: "创建维修单", view: "orders", orderType: "repair" }, { label: "查看资产台账", view: "assets" }])}
           </tbody>
         </table>
       </div>
@@ -2234,7 +4258,7 @@ function renderScrapOrderList() {
         <table>
           <thead><tr><th>单号</th><th>资产</th><th>申请人</th><th>报废日期</th><th>残值</th><th>状态</th><th>原因</th></tr></thead>
           <tbody>
-            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${userName(item.applicantId)}</td><td>${blank(item.scrapDate)}</td><td>${Number(item.residualValue || 0).toFixed(2)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.reason)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">暂无报废单</td></tr>`}
+            ${orders.map((item) => `<tr><td>${item.orderNo}</td><td>${assetName(item.assetId)}</td><td>${userName(item.applicantId)}</td><td>${blank(item.scrapDate)}</td><td>${Number(item.residualValue || 0).toFixed(2)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.reason)}</td></tr>`).join("") || emptyActionRow(7, "还没有报废单", "资产达到报废条件时，在业务办理中创建报废单并留存处理原因。", [{ label: "创建报废单", view: "orders", orderType: "scrap" }, { label: "查看资产台账", view: "assets" }])}
           </tbody>
         </table>
       </div>
@@ -2245,6 +4269,13 @@ function renderScrapOrderList() {
 function renderBaseData() {
   if (!can("base_data.view")) return "";
   return `
+    <section class="panel">
+      <div class="section-title">
+        <h2>设备归类管理</h2>
+        <span class="hint">可勾选多个设备组保存为同一标准归类；未手动指定的设备仍按系统规则自动归类。</span>
+      </div>
+      ${renderDeviceGroupOverview(assetGroups())}
+    </section>
     <section class="panel">
       <div class="section-title">
         <h2>资产类别管理</h2>
@@ -2293,7 +4324,7 @@ function renderAssetCategoryManager() {
               <td><div class="row-actions"><button class="ghost small" data-category-edit="${category.id}" type="button">编辑</button><button class="danger small" data-category-delete="${category.id}" type="button">删除</button></div></td>
             </tr>
           `;
-        }).join("") || `<tr><td colspan="6" class="empty">暂无分类</td></tr>`}
+        }).join("") || emptyActionRow(6, "还没有资产分类", "先创建分类，后续资产入库、批量归类和报表统计都会使用这套分类。", [{ label: "创建分类", view: "system", systemSection: "baseData" }, { label: "新增入库", view: "records", mode: "manual", action: "inbound" }])}
           </tbody>
         </table>
       </div>
@@ -2341,7 +4372,7 @@ function renderLocationManager() {
                   <td><div class="row-actions"><button class="ghost small" data-location-edit="${location.id}" type="button">编辑</button><button class="danger small" data-location-delete="${location.id}" type="button">删除</button></div></td>
                 </tr>
               `;
-            }).join("") || `<tr><td colspan="8" class="empty">暂无位置</td></tr>`}
+            }).join("") || emptyActionRow(8, "还没有位置数据", "先创建仓库、楼栋、教室或办公室位置，资产入库和调拨时就能直接选择。", [{ label: "创建位置", view: "system", systemSection: "baseData" }, { label: "新增入库", view: "records", mode: "manual", action: "inbound" }])}
           </tbody>
         </table>
       </div>
@@ -2368,7 +4399,8 @@ function renderAssetDrawer() {
   const departmentOptions = departments().map((department) => `<option value="${department}" ${(asset.useDepartment || state.currentUser.department) === department ? "selected" : ""}>${department}</option>`).join("");
   return `
     <div class="drawer-backdrop no-print" id="assetDrawerBackdrop"></div>
-    <aside class="asset-drawer no-print" aria-label="${isEdit ? "编辑资产" : "新增资产"}">
+    <aside class="asset-drawer resizable-drawer no-print" ${drawerWidthStyle("asset-form", 520)} aria-label="${isEdit ? "编辑资产" : "新增资产"}">
+      ${renderDrawerResizeHandle("拖动调整资产表单宽度")}
       <form id="assetForm">
         <input type="hidden" name="assetId" value="${asset.id || ""}" />
         <div class="drawer-head">
@@ -2425,7 +4457,7 @@ function renderAssetLabel(asset) {
         <strong>学校资产标签</strong>
         <span>资产编号：${asset.code}</span>
         <span>资产名称：${asset.name}</span>
-        <span>分类：${asset.category}</span>
+        <span>分类：${displayCategoryText(asset.category)}</span>
         <span>责任人：${userName(asset.keeperId)}</span>
         <span>位置：${blank(asset.location)}</span>
       </div>
@@ -2454,7 +4486,8 @@ function renderAssetDetailDrawer() {
   const showAssetDetailLabel = isAssetDetailLabelEnabled();
   return `
     <div class="drawer-backdrop no-print" id="assetDetailBackdrop"></div>
-    <aside class="asset-drawer asset-detail-drawer no-print" aria-label="资产详情">
+    <aside class="asset-drawer asset-detail-drawer resizable-drawer no-print" ${drawerWidthStyle("asset-detail", 720)} aria-label="资产详情">
+      ${renderDrawerResizeHandle("拖动调整资产详情宽度")}
       <div class="drawer-head">
         <h2>资产详情</h2>
         <button class="ghost icon-button" id="closeAssetDetail" type="button">×</button>
@@ -2465,7 +4498,7 @@ function renderAssetDetailDrawer() {
           <div>
             <span class="hint">${asset.code}</span>
             <h3>${asset.name}</h3>
-            <p>${asset.spec || "未填写规格"} · ${asset.category}</p>
+            <p>${asset.spec || "未填写规格"} · ${displayCategoryText(asset.category)}</p>
           </div>
           ${statusBadge(asset.status)}
         </section>
@@ -2576,7 +4609,7 @@ function renderRecords() {
                 <td>${assetName(record.assetId)}</td><td>${kindBadge(recordKind(record))}</td><td>${record.type === "出库" ? "出库/出借" : record.type}</td><td>${recordDocumentType(record)}</td><td>${record.quantity}</td>${isMultiDepartment() ? `<td>${userDepartment(record.userId)}</td>` : ""}<td>${userName(record.userId)}</td>
                 <td>${fmt(record.inTime)}</td><td>${fmt(record.outTime)}</td><td>${recordPhoto(record)}</td><td>${statusBadge(record.status)}</td><td>${record.paperNo || "-"}</td><td>${recordDisplayNote(record)}</td>
               </tr>
-            `).join("") || `<tr><td colspan="${isMultiDepartment() ? 13 : 12}" class="empty">暂无记录</td></tr>`}
+            `).join("") || emptyActionRow(isMultiDepartment() ? 13 : 12, "还没有出入库流水", "新增入库、划一笔出借、归还登记和耗材领用都会保留完整流水。", recordKindFilter === "耗材" ? consumableEntryActions() : recordEntryActions())}
           </tbody>
         </table>
       </div>
@@ -2586,10 +4619,10 @@ function renderRecords() {
 
 function renderRecordModePanel() {
   return `
-    <section class="panel">
-      <div class="mode-tabs" role="tablist" aria-label="出入库管理方式">
-        <button class="${recordMode === "manual" ? "active" : ""}" data-record-mode="manual" type="button">手动管理</button>
-        <button class="${recordMode === "import" ? "active" : ""}" data-record-mode="import" type="button">批量导入</button>
+    <section class="record-mode-panel">
+      <div class="mode-tabs record-tabs" role="tablist" aria-label="出入库管理方式">
+        <button class="${recordMode === "manual" ? "active" : ""}" data-record-mode="manual" type="button">日常登记</button>
+        <button class="${recordMode === "import" ? "active" : ""}" data-record-mode="import" type="button">电子档导入</button>
       </div>
       ${recordMode === "manual" ? renderRecordFormInner() : renderImportPanelInner()}
     </section>
@@ -2602,33 +4635,32 @@ function renderImportPanel() {
 
 function renderImportPanelInner() {
   const config = importConfig();
+  const fileTypeText = importKind === "word" ? "支持 .docx 格式，可批量上传 Word 出借单" : "支持 .xlsx、.csv 格式，单次导入不超过 5000 条";
   return `
-      <div class="section-title import-title">
-        <h2>批量导入</h2>
-        <button class="secondary" id="downloadInboundTemplate" type="button">下载入库模板</button>
-      </div>
-      <form id="bulkImportForm" class="import-flow">
-        <section class="import-step">
-          <div class="step-head"><span class="step-index">1</span><h3>选择导入类型</h3></div>
-          <div class="import-kind-grid">
-            <button class="kind-card ${importKind === "inbound" ? "active" : ""}" data-import-kind="inbound" type="button">
-              <span><strong>入库记录</strong><em>支持资产/耗材入库，导入后自动归类</em></span>
-              ${importKind === "inbound" ? "<b>✓</b>" : ""}
-            </button>
-            <button class="kind-card ${importKind === "word" ? "active" : ""}" data-import-kind="word" type="button">
-              <span><strong>出库/出借单</strong><em>识别资产领用和耗材领用模板</em></span>
-              ${importKind === "word" ? "<b>✓</b>" : ""}
-            </button>
-          </div>
-        </section>
-        <section class="import-step">
-          <div class="step-head"><span class="step-index">2</span><h3>上传文件</h3></div>
+      <form id="bulkImportForm" class="import-flow import-board">
+        <div class="import-progress">
+          ${[
+            ["1", "上传文件", "选择或拖拽文件上传"],
+            ["2", "预览与校验", "校验数据并预览结果"],
+            ["3", "确认导入", "确认无误后完成导入"]
+          ].map(([index, title, desc], stepIndex) => `
+            <div class="import-progress-step ${stepIndex === 0 ? "active" : ""}">
+              <span>${index}</span>
+              <div><strong>${title}</strong><em>${desc}</em></div>
+            </div>
+          `).join("")}
+        </div>
+        <div class="import-kind-pills" aria-label="导入文件类型">
+          <button class="${importKind === "inbound" ? "active" : ""}" data-import-kind="inbound" type="button">Excel / CSV 入库表</button>
+          <button class="${importKind === "word" ? "active" : ""}" data-import-kind="word" type="button">Word 出借单</button>
+        </div>
+        <section class="import-upload-card">
           <input id="bulkFileInput" name="file" class="visually-hidden" type="file" accept="${config.accept}" multiple />
           <input id="bulkFolderInput" name="folder" class="visually-hidden" type="file" accept="${config.accept}" multiple webkitdirectory directory />
           <div class="upload-zone" data-upload-zone>
             <div class="upload-icon">☁</div>
-            <strong>点击上传或拖拽文件到这里</strong>
-            <p>${config.uploadHint}</p>
+            <strong>拖拽文件到此处，或<span>点击上传</span></strong>
+            <p>${fileTypeText}</p>
             <div class="upload-actions">
               <label class="secondary" for="bulkFileInput">选择文件</label>
               <label class="secondary" for="bulkFolderInput">选择文件夹</label>
@@ -2637,39 +4669,98 @@ function renderImportPanelInner() {
           <div class="selected-files" id="selectedImportFiles">
             <span class="hint">尚未选择文件</span>
           </div>
-        </section>
-        <section class="import-step import-submit-step">
-          <div>
-            <div class="step-head"><span class="step-index">3</span><h3>开始导入</h3></div>
-            <p class="hint">${config.description}</p>
+          <div class="import-submit-row">
+            <span class="hint">${config.description}</span>
+            <button class="primary" type="submit">${config.button}</button>
           </div>
-          <button class="primary" type="submit">${config.button}</button>
         </section>
       </form>
+      <section class="import-guide-panel">
+        <div class="import-guide-copy">
+          <div class="guide-title"><span>i</span><h3>导入说明</h3></div>
+          <ul>
+            <li>请先下载导入模板，按模板格式填写数据后再上传，确保导入顺利完成。</li>
+            <li>支持 .xlsx、.csv 格式文件，单次导入数据不超过 5000 条。</li>
+            <li>系统将自动校验数据的必填项、格式、重复等问题，校验通过后方可导入。</li>
+            <li>重复文件和重复行会自动标记；已存在资产/耗材只更新原记录，不新增重复资产。</li>
+            <li>导入成功后，系统将生成出入库记录并更新库存数量。</li>
+          </ul>
+        </div>
+        <div class="template-download-card">
+          <span class="template-icon">☷</span>
+          <div>
+            <strong>下载导入模板</strong>
+            <p>最新版本：v1.0.0 ｜ 更新于 2026-06-01</p>
+            <p>支持 Excel（.xlsx）或 CSV 格式</p>
+          </div>
+          <button class="secondary" id="downloadInboundTemplate" type="button">下载导入模板</button>
+        </div>
+      </section>
       ${importResult ? renderImportResult("入库导入结果", importResult) : ""}
       ${wordImportResult ? renderImportResult("Word 出借导入结果", wordImportResult) : ""}
       ${renderImportArchives()}
+      ${isPaperModuleEnabled() ? renderPaperQueuePanel() : ""}
   `;
 }
 
+function importProcessedCount(result = {}) {
+  const explicit = Number(result.processedRows || result.processed || 0);
+  if (explicit) return explicit;
+  const imported = Number(result.imported || 0);
+  const created = Number(result.createdAssets || 0);
+  const existing = Number(result.existingAssets || 0);
+  const updated = Number(result.updatedAssets || 0);
+  return Math.max(imported, created) + Math.max(existing, updated);
+}
+
 function renderImportResult(title, result) {
+  const skipped = result.skipped || [];
+  const files = result.files || [];
+  const metrics = [
+    ["处理合计", importProcessedCount(result)],
+    ["生成流水", result.imported],
+    ["新建资产", result.createdAssets],
+    ["已存在", result.existingAssets],
+    ["已更新", result.updatedAssets],
+    ["重复行", result.duplicateRows],
+    ["重复文件", result.duplicateFiles],
+    ["待复核", result.paperCreated],
+    ["错误/异常", skipped.length]
+  ];
   return `
     <div class="import-result">
-      <strong>${title}：成功 ${result.imported} 条${result.createdAssets ? `，新建资产 ${result.createdAssets} 个` : ""}，跳过 ${result.skipped.length} 条${result.paperCreated ? `，待复核 ${result.paperCreated} 条` : ""}</strong>
-      ${result.message ? `<p class="hint">${result.message}</p>` : ""}
-      ${result.files?.length ? `
+      <div class="import-result-head">
+        <strong>${attrText(title)}</strong>
+        <span>${attrText(importResultSummary(result))}</span>
+      </div>
+      <div class="import-result-metrics">
+        ${metrics.map(([label, value]) => `<div><span>${label}</span><strong>${Number(value || 0)}</strong></div>`).join("")}
+      </div>
+      ${result.message ? `<p class="hint">${attrText(result.message)}</p>` : ""}
+      ${files.length ? `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>文件</th><th>成功</th><th>新建资产</th><th>待复核</th><th>跳过</th></tr></thead>
-            <tbody>${result.files.map((item) => `<tr><td>${item.fileName}</td><td>${item.imported}</td><td>${item.createdAssets || 0}</td><td>${item.paperCreated || 0}</td><td>${item.error || item.skipped || 0}</td></tr>`).join("")}</tbody>
+            <thead><tr><th>文件</th><th>处理合计</th><th>生成流水</th><th>新建资产</th><th>已存在</th><th>已更新</th><th>重复行</th><th>重复文件</th><th>待复核</th><th>错误 / 异常</th></tr></thead>
+            <tbody>${files.map((item) => `<tr>
+              <td>${attrText(item.fileName)}</td>
+              <td>${importProcessedCount(item)}</td>
+              <td>${Number(item.imported || 0)}</td>
+              <td>${Number(item.createdAssets || 0)}</td>
+              <td>${Number(item.existingAssets || 0)}</td>
+              <td>${Number(item.updatedAssets || 0)}</td>
+              <td>${Number(item.duplicateRows || 0)}</td>
+              <td>${Number(item.duplicateFiles || 0)}</td>
+              <td>${Number(item.paperCreated || 0)}</td>
+              <td>${item.error ? attrText(item.error) : Number(item.skipped || 0)}</td>
+            </tr>`).join("")}</tbody>
           </table>
         </div>
       ` : ""}
-      ${result.skipped.length ? `
+      ${skipped.length ? `
         <div class="table-wrap">
           <table>
             <thead><tr><th>文件/行号</th><th>原因</th></tr></thead>
-            <tbody>${result.skipped.map((item) => `<tr><td>${item.file ? `${item.file} / ` : ""}${item.row}</td><td>${item.reason}</td></tr>`).join("")}</tbody>
+            <tbody>${skipped.map((item) => `<tr><td>${attrText(item.file ? `${item.file} / ${item.row}` : item.row)}</td><td>${attrText(item.reason)}</td></tr>`).join("")}</tbody>
           </table>
         </div>
       ` : ""}
@@ -2677,9 +4768,24 @@ function renderImportResult(title, result) {
   `;
 }
 
+function importResultSummary(result = {}) {
+  const parts = [
+    `处理 ${importProcessedCount(result)} 行`,
+    `生成流水 ${Number(result.imported || 0)} 条`,
+    `新建 ${Number(result.createdAssets || 0)} 个`,
+    `已存在 ${Number(result.existingAssets || 0)} 个`,
+    `已更新 ${Number(result.updatedAssets || 0)} 个`,
+    `重复行 ${Number(result.duplicateRows || 0)} 条`,
+    `重复文件 ${Number(result.duplicateFiles || 0)} 个`,
+    `错误/异常 ${(result.skipped || []).length} 条`
+  ];
+  if (Number(result.paperCreated || 0)) parts.splice(6, 0, `待复核 ${Number(result.paperCreated || 0)} 条`);
+  return parts.join("，");
+}
+
 function renderImportArchives() {
   if (!state.importArchives?.length) {
-    return `<div class="empty">暂无导入电子档留档</div>`;
+    return renderEmptyAction("还没有电子档留档", "导入 Excel、Word 或纸质单据后，系统会在这里保留原始电子档和处理记录。", [{ label: "导入Word单据", view: "records", mode: "import" }, { label: "新增入库", view: "records", mode: "manual", action: "inbound" }]);
   }
   return `
     <div class="archive-list">
@@ -2694,7 +4800,7 @@ function renderImportArchives() {
                 <td>${item.category}</td>
                 <td>${userName(item.uploadedBy)}</td>
                 <td>${fmt(item.uploadedAt)}</td>
-                <td>成功 ${item.result?.imported || 0} 条，新建资产 ${item.result?.createdAssets || 0} 个，跳过 ${item.result?.skipped?.length || 0} 条${item.result?.paperCreated ? `，待复核 ${item.result.paperCreated} 条` : ""}</td>
+                <td>${attrText(importResultSummary(item.result || {}))}</td>
                 <td><button class="download-link" data-download-archive="${item.id}" type="button">下载</button></td>
               </tr>
             `).join("")}
@@ -2723,40 +4829,82 @@ function renderRecordForm() {
   return `<section class="panel">${renderRecordFormInner()}</section>`;
 }
 
+function recordActionConfig(action = recordActionMode) {
+  return {
+    inbound: { label: "新增入库", type: "入库", inTime: nowLocal(), outTime: "", note: "新增入库" },
+    lend: { label: "划一笔出借", type: "出库", inTime: "", outTime: nowLocal(), note: "划一笔出借" },
+    return: { label: "归还登记", type: "入库", inTime: nowLocal(), outTime: "", note: "归还登记" },
+    consume: { label: "耗材领用", type: "出库", inTime: "", outTime: nowLocal(), note: "耗材领用" }
+  }[action] || { label: "新增入库", type: "入库", inTime: nowLocal(), outTime: "", note: "" };
+}
+
+function recordDefaultGroup(groups) {
+  if (recordPrefillAssetId) {
+    const matched = groups.find((group) => group.assets.some((asset) => asset.id === recordPrefillAssetId));
+    if (matched) return matched;
+  }
+  if (recordActionMode === "consume") {
+    return groups.find((group) => group.assets.some((asset) => assetKind(asset) === "耗材")) || groups[0] || {};
+  }
+  return groups.find((group) => group.assets.some((asset) => assetKind(asset) === "资产")) || groups[0] || {};
+}
+
 function renderRecordFormInner() {
   const deptOptions = [`<option value="all" ${selectedDepartment === "all" ? "selected" : ""}>全部部门</option>`]
     .concat(departments().map((department) => `<option value="${department}" ${selectedDepartment === department ? "selected" : ""}>${department}</option>`))
     .join("");
   const userOptions = activeUsersByDepartment().map((u) => `<option value="${u.id}">${u.name}${isMultiDepartment() ? ` · ${u.department}` : ""}</option>`).join("");
   const groups = assetGroups();
-  const defaultGroup = groups[0] || {};
+  const defaultGroup = recordDefaultGroup(groups);
+  const action = recordActionConfig();
+  const recordAssetOptions = groups
+    .map((group) => `<option value="${attrText(group.model)}" label="${attrText(`${group.category || "-"} · 共 ${group.quantity || 0} 台/件`)}"></option>`)
+    .join("");
   return `
     <form id="recordForm" class="manual-flow">
       <div class="manual-main">
-        <div class="section-title manual-title"><h2>登记出入库</h2><button class="ghost small" type="reset">清空选择</button></div>
+        <div class="section-title manual-title"><h2>日常登记</h2><button class="ghost small" type="reset">清空选择</button></div>
+        <div class="daily-action-grid">
+          ${[
+            ["inbound", "新增入库", "资产入库后默认为在库 / 未出借"],
+            ["lend", "划一笔出借", "不新增资产，只把原资产标记为已借出"],
+            ["return", "归还登记", "已借出的资产归还后回到在库"],
+            ["consume", "耗材领用", "耗材只记录数量和库存流水"]
+          ].map(([key, label, desc]) => `
+            <button class="${recordActionMode === key ? "active" : ""}" data-record-action="${key}" type="button">
+              <strong>${label}</strong><span>${desc}</span>
+            </button>
+          `).join("")}
+        </div>
         <section class="manual-step">
           <div class="step-head"><span class="step-index">1</span><h3>资产信息</h3></div>
-          <div class="field"><label>资产</label><select name="assetId">${groups.map((group) => `<option value="${group.id}">${group.model} · 共 ${group.quantity || 0} 台</option>`).join("")}</select></div>
+          <input type="hidden" name="assetId" value="${defaultGroup.id || ""}" />
+          <div class="field asset-lookup-field">
+            <label>资产</label>
+            <input name="assetLookup" list="recordAssetOptions" value="${attrText(defaultGroup.model || "")}" required placeholder="输入资产名称、编号、规格，或粘贴扫码详情链接" autocomplete="off" />
+            <datalist id="recordAssetOptions">${recordAssetOptions}</datalist>
+            <div class="asset-lookup-hint" id="assetLookupHint">${defaultGroup.model ? `已选：${defaultGroup.model}` : "先录入资产后再登记出入库"}</div>
+          </div>
           <div class="asset-info-grid">
             <div><span>型号/规格</span><strong id="assetCodePreview">${defaultGroup.model || "-"}</strong></div>
             <div><span>分类</span><strong id="assetCategoryPreview">${defaultGroup.category || "-"}</strong></div>
-            <div><span>当前库存</span><strong id="assetQuantityPreview">${defaultGroup.quantity || 0} 台</strong></div>
+            <div><span>当前库存</span><strong id="assetQuantityPreview">${defaultGroup.quantity || 0} 台/件</strong></div>
           </div>
         </section>
         <section class="manual-step">
           <div class="step-head"><span class="step-index">2</span><h3>登记信息</h3></div>
-          <input type="hidden" name="type" value="入库" />
+          <input type="hidden" name="type" value="${action.type}" />
           <div class="manual-grid">
             <div class="field wide"><label>类型</label><div class="type-segments">
-              <button class="active" data-record-type="入库" type="button">入库</button>
-              <button data-record-type="出库" type="button">出库/出借</button>
-              <button data-record-type="入库" type="button">归还</button>
+              <button class="${recordActionMode === "inbound" ? "active" : ""}" data-record-type="入库" data-record-action="inbound" type="button">新增入库</button>
+              <button class="${recordActionMode === "lend" ? "active" : ""}" data-record-type="出库" data-record-action="lend" type="button">划一笔</button>
+              <button class="${recordActionMode === "return" ? "active" : ""}" data-record-type="入库" data-record-action="return" type="button">归还登记</button>
             </div></div>
             <div class="field"><label>数量</label><div class="quantity-stepper"><button data-quantity-step="-1" type="button">−</button><input name="quantity" type="number" min="1" value="1" required /><button data-quantity-step="1" type="button">+</button></div></div>
             <div class="field"><label>借用人 / 归还人</label><select name="userId" required>${userOptions}</select></div>
             ${isMultiDepartment() ? `<div class="field"><label>部门</label><select id="departmentFilter">${deptOptions}</select></div>` : ""}
-            <div class="field"><label>入库时间</label><input name="inTime" type="datetime-local" value="${nowLocal()}" /></div>
-            <div class="field"><label>出库时间（可选）</label><input name="outTime" type="datetime-local" /></div>
+            <div class="field"><label>入库/归还时间</label><input name="inTime" type="datetime-local" value="${action.inTime}" /></div>
+            <div class="field"><label>出库/借出时间</label><input name="outTime" type="datetime-local" value="${action.outTime}" /></div>
             <div class="field"><label>纸质单号</label><input name="paperNo" placeholder="如 SZ-003" /></div>
           </div>
         </section>
@@ -2764,7 +4912,7 @@ function renderRecordFormInner() {
           <div class="step-head"><span class="step-index">3</span><h3>附件与备注</h3></div>
           <div class="manual-grid">
             <div class="field"><label>现场照片（可选）</label><label class="photo-upload"><input name="photoFile" type="file" accept="image/*" capture="environment" /><span>☁</span><strong>点击上传现场照片</strong><em id="photoFileName">支持 JPG、PNG</em></label></div>
-            <div class="field"><label>备注（可选）</label><textarea name="note" maxlength="200" placeholder="来源、用途、验收情况等"></textarea></div>
+            <div class="field"><label>备注（可选）</label><textarea name="note" maxlength="200" placeholder="来源、用途、验收情况等">${action.note}</textarea></div>
           </div>
           <div class="manual-actions">
             <button class="ghost" type="reset">取消</button>
@@ -2780,7 +4928,7 @@ function renderRecordFormInner() {
           <div class="assist-block">
             <strong>当前登记摘要</strong>
             <dl>
-              <dt>类型</dt><dd id="summaryType">入库</dd>
+              <dt>类型</dt><dd id="summaryType">${action.label}</dd>
               <dt>数量</dt><dd id="summaryQuantity">1</dd>
               <dt>经办人</dt><dd id="summaryUser">${selectableUsers()[0]?.name || "-"}</dd>
               <dt>入库时间</dt><dd id="summaryInTime">${fmt(nowLocal())}</dd>
@@ -2796,8 +4944,45 @@ function renderRecordFormInner() {
   `;
 }
 
-function renderPaper() {
+function renderPaperQueuePanel() {
   const canManagePaper = can("paper.manage");
+  return `
+    <section class="embedded-panel">
+      <div class="section-title"><h2>纸质单据电子化</h2><span class="hint">手写材料在这里补录、复核和归档。</span></div>
+      <div class="paper-import-grid">
+        <form id="paperForm" class="form-grid">
+          <div class="field"><label>纸质单号</label><input name="paperNo" required placeholder="SZ-2026-001" /></div>
+          <div class="field"><label>单据来源</label><input name="source" required placeholder="手写入库单 / 出库单" /></div>
+          ${canManagePaper ? `<div class="field"><label>关联用户</label><select name="ownerId">${selectableUsers().map((u) => `<option value="${u.id}">${u.name}</option>`).join("")}</select></div>` : ""}
+          <div class="field wide"><label>识别文本 / 人工摘录</label><textarea name="text" required placeholder="资产、数量、时间、经手人、用途"></textarea></div>
+          <button class="primary" type="submit">加入复核队列</button>
+        </form>
+        <div class="paper-guidance">
+          <strong>处理流程</strong>
+          <span>编号</span>
+          <span>拍照或扫描</span>
+          <span>人工摘录</span>
+          <span>复核后归档</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>单号</th><th>来源</th><th>关联用户</th><th>状态</th><th>识别内容</th>${canManagePaper ? "<th>操作</th>" : ""}</tr></thead>
+          <tbody>
+            ${state.paperQueue.map((item) => `
+              <tr>
+                <td>${item.paperNo}</td><td>${item.source}</td><td>${userName(item.ownerId)}</td><td>${statusBadge(item.status)}</td><td>${item.text}</td>
+                ${canManagePaper ? `<td><button class="secondary small" data-archive-paper="${item.id}" type="button">归档</button></td>` : ""}
+              </tr>
+            `).join("") || `<tr><td colspan="${canManagePaper ? 6 : 5}" class="empty">${renderEmptyAction("还没有纸质单据", "可先录入纸质单号和人工摘录，也可以直接导入 Word 单据。", [{ label: "导入Word单据", view: "records", mode: "import" }])}</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderPaper() {
   return `
     <div class="solution">
       <section class="panel">
@@ -2810,39 +4995,31 @@ function renderPaper() {
           <div class="step"><strong>5. 纸电对应</strong><span>电子记录保留纸质单号、扫描图和复核人，方便追溯和打印。</span></div>
         </div>
       </section>
-      <section class="panel">
-        <div class="section-title"><h2>新增纸质单据</h2></div>
-        <form id="paperForm">
-          <div class="field"><label>纸质单号</label><input name="paperNo" required placeholder="SZ-2026-001" /></div>
-          <div class="field"><label>单据来源</label><input name="source" required placeholder="手写入库单 / 出库单" /></div>
-          ${canManagePaper ? `<div class="field"><label>关联用户</label><select name="ownerId">${selectableUsers().map((u) => `<option value="${u.id}">${u.name}</option>`).join("")}</select></div>` : ""}
-          <div class="field"><label>识别文本 / 人工摘录</label><textarea name="text" required placeholder="资产、数量、时间、经手人、用途"></textarea></div>
-          <button class="primary" type="submit">加入复核队列</button>
-        </form>
-      </section>
     </div>
-    <section class="panel">
-      <div class="section-title"><h2>纸质单据队列</h2></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>单号</th><th>来源</th><th>关联用户</th><th>状态</th><th>识别内容</th>${canManagePaper ? "<th>操作</th>" : ""}</tr></thead>
-          <tbody>
-            ${state.paperQueue.map((item) => `
-              <tr>
-                <td>${item.paperNo}</td><td>${item.source}</td><td>${userName(item.ownerId)}</td><td>${statusBadge(item.status)}</td><td>${item.text}</td>
-                ${canManagePaper ? `<td><button class="secondary" data-archive-paper="${item.id}" type="button">归档</button></td>` : ""}
-              </tr>
-            `).join("") || `<tr><td colspan="${canManagePaper ? 6 : 5}" class="empty">暂无纸质单据</td></tr>`}
-          </tbody>
-        </table>
-      </div>
-    </section>
+    <section class="panel">${renderPaperQueuePanel()}</section>
   `;
 }
 
 function requestStatusBadge(status) {
   const cls = status === "已批准" ? "ok" : status === "待处理" ? "warn" : "bad";
   return `<span class="badge ${cls}">${status || "-"}</span>`;
+}
+
+function renderRequests() {
+  const tabs = [
+    ["asset", "资产申请", canMenu("assetRequests")],
+    ["purchase", "采购需求", canMenu("purchaseWishes")]
+  ].filter(([, , allowed]) => allowed);
+  if (!tabs.length) return "";
+  if (!tabs.some(([key]) => key === requestSection)) requestSection = tabs[0][0];
+  return `
+    <section class="panel merged-page">
+      <div class="mode-tabs" role="tablist" aria-label="申请与采购">
+        ${tabs.map(([key, label]) => `<button class="${requestSection === key ? "active" : ""}" data-request-section="${key}" type="button">${label}</button>`).join("")}
+      </div>
+    </section>
+    ${requestSection === "purchase" ? renderPurchaseWishes() : renderAssetRequests()}
+  `;
 }
 
 function renderAssetRequests() {
@@ -2879,7 +5056,7 @@ function renderAssetRequests() {
                 ${canManageRequests ? `<td>${item.userName || userName(item.userId)}</td>` : ""}<td>${item.assetName}</td><td>${blank(item.category)}</td><td>${blank(item.spec)}</td><td>${item.quantity}</td><td>${blank(item.reason)}</td><td>${fmt(item.createdAt)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.handleNote)}</td>
                 ${canManageRequests ? `<td>${item.status === "待处理" ? `<div class="row-actions"><button class="secondary small" data-approve-asset-request="${item.id}" type="button">批准</button><button class="ghost small" data-reject-asset-request="${item.id}" type="button">驳回</button></div>` : "-"}</td>` : ""}
               </tr>
-            `).join("") || `<tr><td colspan="${canManageRequests ? 10 : 8}" class="empty">暂无资产申请</td></tr>`}
+            `).join("") || emptyActionRow(canManageRequests ? 10 : 8, "还没有资产申请", canManageRequests ? "教师提交资产申请后会汇总到这里，管理员可审批并安排采购或调拨。" : "提交资产申请后，管理员会在这里处理审批状态。", canManageRequests ? [{ label: "查看采购需求", view: "requests", requestSection: "wish" }, { label: "查看资产台账", view: "assets" }] : [{ label: "提交资产申请", view: "requests", requestSection: "asset" }, { label: "查看需求清单", view: "requests", requestSection: "wish" }])}
           </tbody>
         </table>
       </div>
@@ -2897,46 +5074,52 @@ function renderPurchaseWishes() {
   const canManageWishes = can("purchase_wishes.manage");
   const pending = wishes.filter((item) => item.status === "待采购" || item.status === "已采纳").length;
   const totalQuantity = wishes.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+  const totalAmount = wishes.reduce((sum, item) => sum + purchaseWishTotal(item), 0);
   return `
     <section class="panel">
       <div class="section-title">
-        <h2>${canManageWishes ? "下一年度采购需求汇总" : "提交想要的设备"}</h2>
-        <span class="hint">当前 ${wishes.length} 项，数量合计 ${totalQuantity}，待跟进 ${pending} 项</span>
+        <h2>${canManageWishes ? "采购需求汇总" : "提交采购需求"}</h2>
+        <span class="hint">当前 ${wishes.length} 项，数量合计 ${totalQuantity}，金额合计 ${formatMoney(totalAmount)}，待跟进 ${pending} 项</span>
+        <button class="secondary small" id="exportPurchaseWishes" type="button">导出Excel</button>
       </div>
       ${!canManageWishes ? `
         <form id="purchaseWishForm" class="form-grid">
-          <div class="field"><label>设备名称</label><input name="itemName" required placeholder="例如 笔记本、显示器、网线、硬盘" /></div>
-          <div class="field"><label>类别</label><input name="category" placeholder="设备 / 耗材 / 软件 / 工具" /></div>
-          <div class="field"><label>规格配置</label><input name="spec" placeholder="型号、容量、配置或数量规格" /></div>
+          <div class="field"><label>名称（产品名称）</label><input name="itemName" required placeholder="例如 笔记本、显示器、网线、硬盘" /></div>
+          <div class="field"><label>技术参数</label><input name="spec" placeholder="型号、容量、配置或参数要求" /></div>
           <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" required /></div>
-          <div class="field"><label>优先级</label><select name="priority"><option>普通</option><option>高</option><option>紧急</option></select></div>
-          <div class="field"><label>期望时间</label><input name="expectedTime" placeholder="例如 2027 年预算 / 下学期 / 尽快" /></div>
-          <div class="field wide"><label>用途说明</label><textarea name="reason" required placeholder="说明使用场景、项目、课程、竞赛或现有设备不足的问题"></textarea></div>
+          <div class="field"><label>单价</label><input name="unitPrice" type="number" min="0" step="0.01" value="0" /></div>
+          <div class="field"><label>上浮选项</label><select name="upliftPreset"><option value="0">不上浮</option><option value="10">上浮 10%</option><option value="20">上浮 20%</option><option value="30" selected>上浮 30%</option><option value="custom">自定义上浮</option></select></div>
+          <div class="field"><label>自定义上浮（%）</label><input name="upliftRate" type="number" min="0" step="1" value="30" /></div>
+          <div class="field"><label>总价</label><input name="totalAmount" type="number" min="0" step="0.01" value="0.00" readonly data-calculated-total /><span class="field-note">数量 × 单价 ×（1 + 上浮比例）</span></div>
+          <div class="field"><label>品目</label><input name="itemType" placeholder="设备 / 耗材 / 软件 / 工具" /></div>
+          <div class="field wide"><label>备注</label><textarea name="reason" placeholder="使用场景、课程、竞赛、现有设备不足或采购说明"></textarea></div>
           <button class="primary" type="submit">加入需求清单</button>
         </form>
-      ` : `
-        <div class="stats compact">
-          ${["待采购", "已采纳", "暂缓", "已采购", "已关闭"].map((status) => dashboardStatCard(status, wishes.filter((item) => item.status === status).length, "采购需求", "☆")).join("")}
-        </div>
-      `}
+      ` : ""}
     </section>
     <section class="panel">
-      <div class="section-title"><h2>${canManageWishes ? "全部需求" : "我的需求"}</h2></div>
+      <div class="section-title"><h2>${canManageWishes ? "全部需求" : "我的需求"}</h2><span class="hint">导出表格按“名称、技术参数、单位、数量、单价、总价、品目、备注”生成。</span></div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              ${canManageWishes ? `<th>提交人</th>${isMultiDepartment() ? "<th>部门</th>" : ""}` : ""}<th>设备名称</th><th>类别</th><th>规格</th><th>数量</th><th>优先级</th><th>期望时间</th><th>用途说明</th><th>状态</th><th>处理备注</th>${canManageWishes ? "<th>操作</th>" : ""}
+              <th>名称</th><th>技术参数</th><th>单位</th><th>数量</th><th>单价</th><th>总价</th><th>品目</th><th>备注</th>${canManageWishes ? "<th>处理</th>" : ""}
             </tr>
           </thead>
           <tbody>
             ${wishes.map((item) => `
               <tr>
-                ${canManageWishes ? `<td>${item.userName || userName(item.userId)}</td>${isMultiDepartment() ? `<td>${item.userDepartment || userDepartment(item.userId)}</td>` : ""}` : ""}
-                <td>${item.itemName}</td><td>${blank(item.category)}</td><td>${blank(item.spec)}</td><td>${item.quantity}</td><td>${priorityBadge(item.priority)}</td><td>${blank(item.expectedTime)}</td><td>${blank(item.reason)}</td><td>${requestStatusBadge(item.status)}</td><td>${blank(item.handleNote)}</td>
+                <td>${attrText(item.itemName)}</td>
+                <td>${attrText(blank(item.spec))}</td>
+                <td>${attrText(item.unit || "件")}</td>
+                <td>${Number(item.quantity || 0)}</td>
+                <td>${formatMoney(item.unitPrice || 0)}</td>
+                <td>${formatMoney(purchaseWishTotal(item))}</td>
+                <td>${attrText(blank(item.itemType || item.category))}</td>
+                <td>${attrText(blank(item.reason || item.handleNote))}${canManageWishes ? `<div class="mini-meta">${item.userName || userName(item.userId)} · ${requestStatusBadge(item.status)}</div>` : ""}</td>
                 ${canManageWishes ? `<td><div class="row-actions"><button class="secondary small" data-update-wish="${item.id}" data-wish-status="已采纳" type="button">采纳</button><button class="secondary small" data-update-wish="${item.id}" data-wish-status="暂缓" type="button">暂缓</button><button class="secondary small" data-update-wish="${item.id}" data-wish-status="已采购" type="button">已采购</button><button class="ghost small" data-update-wish="${item.id}" data-wish-status="已关闭" type="button">关闭</button></div></td>` : ""}
               </tr>
-            `).join("") || `<tr><td colspan="${canManageWishes ? (isMultiDepartment() ? 12 : 11) : 9}" class="empty">暂无采购需求</td></tr>`}
+            `).join("") || emptyActionRow(canManageWishes ? 9 : 8, "还没有采购需求", canManageWishes ? "教师提交的年度采购需求会汇总到这里，可用于预算和采购跟进。" : "把下一年度想要采购的设备加入需求清单，便于统一汇总。", canManageWishes ? [{ label: "查看资产申请", view: "requests", requestSection: "asset" }] : [{ label: "提交采购需求", view: "requests", requestSection: "purchase" }, { label: "提交资产申请", view: "requests", requestSection: "asset" }])}
           </tbody>
         </table>
       </div>
@@ -2972,7 +5155,7 @@ function renderUsers() {
         <table>
           <thead><tr><th>角色</th><th>说明</th><th>菜单</th><th>权限数</th></tr></thead>
           <tbody>
-            ${(state.roles || []).map((role) => `<tr><td>${role.name}</td><td>${blank(role.description)}</td><td>${(role.menus || []).join(" / ")}</td><td>${(role.permissions || []).length}</td></tr>`).join("") || `<tr><td colspan="4" class="empty">暂无角色数据</td></tr>`}
+            ${(state.roles || []).map((role) => `<tr><td>${role.name}</td><td>${blank(role.description)}</td><td>${(role.menus || []).join(" / ")}</td><td>${(role.permissions || []).length}</td></tr>`).join("") || emptyActionRow(4, "还没有角色数据", "角色权限由系统初始化或后台配置生成，先检查系统设置和初始化状态。", [{ label: "查看系统设置", view: "system", systemSection: "settings" }])}
           </tbody>
         </table>
       </div>
@@ -3007,6 +5190,64 @@ function renderUsers() {
   `;
 }
 
+function purchaseWishTotal(item) {
+  const explicit = Number(item.totalAmount || 0);
+  if (explicit) return explicit;
+  return Number(item.quantity || 0) * Number(item.unitPrice || 0) * (1 + PURCHASE_WISH_DEFAULT_UPLIFT / 100);
+}
+
+function purchaseWishUpliftRate(form) {
+  const rate = Number(form?.upliftRate?.value ?? PURCHASE_WISH_DEFAULT_UPLIFT);
+  return Number.isFinite(rate) ? Math.max(0, rate) : PURCHASE_WISH_DEFAULT_UPLIFT;
+}
+
+function purchaseWishCalculatedTotal(form) {
+  const quantity = Math.max(1, Number(form?.quantity?.value || 1) || 1);
+  const unitPrice = Math.max(0, Number(form?.unitPrice?.value || 0) || 0);
+  return quantity * unitPrice * (1 + purchaseWishUpliftRate(form) / 100);
+}
+
+function updatePurchaseWishTotal(form) {
+  if (!form) return 0;
+  const total = purchaseWishCalculatedTotal(form);
+  if (form.totalAmount) form.totalAmount.value = formatMoney(total);
+  return total;
+}
+
+function formatMoney(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number.toFixed(2) : "0.00";
+}
+
+function isSuperAdmin() {
+  return state.currentUser?.username === "admin" || state.currentUser?.id === "u-admin";
+}
+
+function renderSystemManagement() {
+  const tabs = [
+    ["users", "用户与角色", canMenu("users")],
+    ["baseData", "基础数据", canMenu("baseData")],
+    ["settings", "系统设置", canMenu("settings")],
+    ["audit", "操作记录", canMenu("audit")]
+  ].filter(([, , allowed]) => allowed);
+  if (!tabs.length) return "";
+  if (!tabs.some(([key]) => key === systemSection)) systemSection = tabs[0][0];
+  const renderers = {
+    users: renderUsers,
+    baseData: renderBaseData,
+    settings: renderSettings,
+    audit: renderAudit
+  };
+  return `
+    <section class="panel merged-page">
+      <div class="mode-tabs" role="tablist" aria-label="系统管理">
+        ${tabs.map(([key, label]) => `<button class="${systemSection === key ? "active" : ""}" data-system-section="${key}" type="button">${label}</button>`).join("")}
+      </div>
+    </section>
+    ${(renderers[systemSection] || renderers[tabs[0][0]])()}
+  `;
+}
+
 function renderAdminRequestsPanel(mode = "panel") {
   const requests = state.adminRequests || [];
   const pending = requests.filter((item) => item.status === "待处理");
@@ -3028,7 +5269,7 @@ function renderAdminRequestsPanel(mode = "panel") {
                 <td>${item.status}</td>
                 <td>${item.status === "待处理" ? `<div class="row-actions"><button class="secondary small" data-approve-admin-request="${item.id}" type="button">批准</button><button class="ghost small" data-ignore-admin-request="${item.id}" type="button">忽略</button></div>` : "-"}</td>
               </tr>
-            `).join("") || `<tr><td colspan="6" class="empty">暂无管理员权限申请</td></tr>`}
+            `).join("") || emptyActionRow(6, "还没有管理员权限申请", "普通用户申请管理员权限后会出现在这里，由现有管理员审批。", [{ label: "查看用户列表", view: "system", systemSection: "users" }])}
           </tbody>
         </table>
       </div>
@@ -3111,7 +5352,61 @@ function renderPrintTemplateSetting(kind, title, description) {
 }
 
 function portApplyCommand(port = state.settings?.servicePort || "38280") {
-  return `if (Test-Path .\\docker-compose.yml) { } elseif (Test-Path .\\Warehouse-Management-System\\docker-compose.yml) { Set-Location .\\Warehouse-Management-System } else { Write-Host '请先进入 Warehouse-Management-System 项目目录'; exit 1 }; $env:WAREHOUSE_HOST_PORT='${port}'; docker compose -p warehouse up --build -d`;
+  return `$env:WAREHOUSE_HOST_PORT='${port}'; docker compose -p warehouse up --build -d`;
+}
+
+function updateContainerCommand() {
+  return "docker compose -p warehouse up --build -d";
+}
+
+function healthCheckCommand(port = state.settings?.servicePort || "38280") {
+  return `Invoke-RestMethod http://127.0.0.1:${port}/api/health`;
+}
+
+function renderLaunchReadinessPanel() {
+  const health = systemHealth;
+  const statusTone = health?.ok ? "ok" : health ? "bad" : "warn";
+  const statusTextValue = health?.ok ? "正常" : health ? "异常" : "未检查";
+  return `
+    <div class="maintenance-block launch-panel">
+      <div class="section-title"><h2>上线检查</h2><span class="hint">用于上线前确认容器、后端和数据库是否正常。</span></div>
+      <div class="launch-check-grid">
+        <article class="launch-check-card ${statusTone}">
+          <span>服务状态</span>
+          <strong>${systemHealthLoading ? "检查中..." : statusTextValue}</strong>
+          <p>${health?.ok ? `健康检查通过，版本 ${health.appVersion || APP_VERSION}` : health?.error || "点击检查服务，确认后端和 SQLite 是否可用。"}</p>
+        </article>
+        <article class="launch-check-card">
+          <span>当前访问</span>
+          <strong>${state.settings?.servicePort || "38280"}</strong>
+          <p>浏览器访问端口。修改端口后需要重建 Docker 容器。</p>
+        </article>
+        <article class="launch-check-card">
+          <span>数据状态</span>
+          <strong>${health?.assets ?? state.assets.length} 项资产</strong>
+          <p>用户 ${health?.users ?? state.users.length} 个，数据库 ${health?.database || "/data/warehouse.db"}。</p>
+        </article>
+      </div>
+      <div class="launch-command-box">
+        <div>
+          <strong>更新容器命令</strong>
+          <p class="hint">代码更新或设置变更后，在项目目录执行。</p>
+          <code class="inline-command short-command">${updateContainerCommand()}</code>
+        </div>
+        <div>
+          <strong>健康检查命令</strong>
+          <p class="hint">上线后执行，返回 ok: true 即可继续使用。</p>
+          <code class="inline-command short-command">${healthCheckCommand()}</code>
+        </div>
+      </div>
+      <div class="setting-actions launch-actions">
+        <button class="primary" id="checkSystemHealth" type="button">${systemHealthLoading ? "检查中..." : "检查服务"}</button>
+        <button class="secondary" id="copyUpdateCommand" type="button">复制更新命令</button>
+        <button class="secondary" id="copyHealthCommand" type="button">复制检查命令</button>
+        ${systemHealthCheckedAt ? `<span class="hint">上次检查：${systemHealthCheckedAt}</span>` : ""}
+      </div>
+    </div>
+  `;
 }
 
 function renderSettings() {
@@ -3152,18 +5447,6 @@ function renderSettings() {
         </div>
         <div class="login-bg-preview" ${state.settings?.loginBackgroundImage ? `style="background-image:url('${String(state.settings.loginBackgroundImage).replaceAll("'", "%27")}')"` : ""}></div>
       </form>
-      <form id="servicePortForm" class="setting-row">
-        <div>
-          <strong>后台端口设置</strong>
-          <p class="hint">当前访问端口：${state.settings?.servicePort || "38280"}。修改后需要在宿主机重新执行 Docker 命令，网页不能直接热切换端口。</p>
-          <code class="inline-command">${portApplyCommand()}</code>
-        </div>
-        <div class="port-setting">
-          <input name="port" type="number" min="1" max="65535" required value="${state.settings?.servicePort || "38280"}" />
-          <button class="primary" type="submit">保存端口</button>
-          <button class="secondary" id="copyPortCommand" type="button">复制命令</button>
-        </div>
-      </form>
       ${isDeveloperMode() ? `
       <form id="adminPrefillForm" class="setting-row">
         <div>
@@ -3174,14 +5457,7 @@ function renderSettings() {
           <input name="enabled" type="checkbox" ${isAdminPrefillEnabled() ? "checked" : ""} />
           <span></span>
         </label>
-      </form>
-      <div class="debug-tools">
-        <div>
-          <strong>清空业务数据</strong>
-          <p class="hint">清空资产、出入库记录、导入留档、纸质待复核和操作记录，保留用户、部门和系统设置。当前资产 ${state.assets.length} 个，记录 ${state.records.length} 条，留档 ${state.importArchives.length} 个。</p>
-        </div>
-        <button class="danger" id="clearDebugFiles" type="button">清空业务数据</button>
-      </div>` : ""}
+      </form>` : ""}
     </section>
     <section class="panel">
       <div class="section-title"><h2>实验室功能</h2><span class="hint">放置扫码、预览类等仍在逐步完善的功能。</span></div>
@@ -3210,6 +5486,37 @@ function renderSettings() {
         ${departments().map((department) => `<button class="department-tag" data-department-name="${department}" title="右键删除部门" type="button">${department}</button>`).join("")}
       </div>
     </section>` : ""}
+    ${renderAdvancedMaintenancePanel()}
+  `;
+}
+
+function renderAdvancedMaintenancePanel() {
+  if (!can("settings.view")) return "";
+  return `
+    <section class="panel advanced-maintenance">
+      <div class="section-title"><h2>高级维护</h2><span class="hint">服务健康、Docker 命令、端口配置和危险操作集中放在这里。</span></div>
+      ${renderLaunchReadinessPanel()}
+      <form id="servicePortForm" class="setting-row">
+        <div>
+          <strong>后台端口设置</strong>
+          <p class="hint">当前访问端口：${state.settings?.servicePort || "38280"}。保存后会记录端口，真正生效还需要在 PowerShell 执行复制出来的端口重启命令。</p>
+          <code class="inline-command short-command">${portApplyCommand()}</code>
+        </div>
+        <div class="port-setting">
+          <input name="port" type="number" min="1" max="65535" required value="${state.settings?.servicePort || "38280"}" />
+          <button class="primary" type="submit">保存端口</button>
+          <button class="secondary" id="copyPortCommand" type="button">复制命令</button>
+        </div>
+      </form>
+      ${isSuperAdmin() && isDeveloperMode() ? `
+      <div class="debug-tools danger-zone">
+        <div>
+          <strong>危险操作：清空除登录账号外的全部数据</strong>
+          <p class="hint">清空资产底表、耗材库存、出入库流水、导入留档、纸质待复核、申请采购、盘点、部门、分类、位置、系统设置和操作记录；只保留用户登录账号。当前资产 ${state.assets.length} 个，记录 ${state.records.length} 条，留档 ${state.importArchives.length} 个。</p>
+        </div>
+        <button class="danger" id="clearDebugFiles" type="button">清空，仅保留登录账号</button>
+      </div>` : ""}
+    </section>
   `;
 }
 
@@ -3291,7 +5598,7 @@ function renderAudit() {
         <table>
           <thead><tr><th>时间</th><th>操作人</th><th>来源IP</th><th>动作</th><th>详情</th></tr></thead>
           <tbody>
-            ${audits.map((audit) => `<tr><td>${fmt(audit.time)}</td><td>${userName(audit.user_id || audit.userId)}</td><td>${auditIpDisplay(audit.ip)}</td><td>${audit.action}</td><td>${audit.detail}</td></tr>`).join("") || `<tr><td colspan="5" class="empty">暂无符合筛选条件的操作记录</td></tr>`}
+            ${audits.map((audit) => `<tr><td>${fmt(audit.time)}</td><td>${userName(audit.user_id || audit.userId)}</td><td>${auditIpDisplay(audit.ip)}</td><td>${audit.action}</td><td>${audit.detail}</td></tr>`).join("") || emptyActionRow(5, "没有符合筛选条件的操作记录", "清空筛选后可查看全部登录、导入、登记和系统操作流水。", [{ label: "清空筛选", view: "system", systemSection: "audit", auditClear: true }, { label: "返回总览", view: "dashboard" }])}
           </tbody>
         </table>
       </div>
@@ -3418,7 +5725,7 @@ async function startQrScanner(onResult) {
 }
 
 function renderRecordCards(records) {
-  if (!records.length) return `<div class="empty">暂无出入库记录</div>`;
+  if (!records.length) return renderEmptyAction("还没有出入库记录", "新增入库、划一笔出借、归还登记和耗材领用都会出现在这里。", recordEntryActions());
   return `<div class="record-list">${records.map((record) => `
     <article class="record-card">
       <div class="card-head">
@@ -3436,14 +5743,24 @@ function renderRecordCards(records) {
 function updateManualRecordPreview() {
   const form = document.querySelector("#recordForm");
   if (!form) return;
-  const asset = state.assets.find((item) => item.id === form.assetId?.value) || {};
-  const group = assetGroupById(form.assetId?.value);
+  const lookupValue = form.assetLookup?.value || form.assetId?.value;
+  const resolvedAsset = resolveRecordAsset(lookupValue) || state.assets.find((item) => item.id === form.assetId?.value) || null;
+  if (resolvedAsset?.id && form.assetId) form.assetId.value = resolvedAsset.id;
+  const asset = resolvedAsset || {};
+  const group = assetGroupById(asset.id);
   const user = state.users.find((item) => item.id === form.userId?.value) || {};
   const activeType = form.querySelector("[data-record-type].active");
-  const typeText = activeType?.textContent?.trim() || form.type?.value || "-";
+  const typeText = recordActionConfig().label || activeType?.textContent?.trim() || form.type?.value || "-";
   document.querySelector("#assetCodePreview").textContent = group?.model || assetModelText(asset) || "-";
   document.querySelector("#assetCategoryPreview").textContent = group?.category || asset.category || "-";
-  document.querySelector("#assetQuantityPreview").textContent = `${group?.quantity ?? asset.quantity ?? 0} 台`;
+  document.querySelector("#assetQuantityPreview").textContent = `${group?.quantity ?? asset.quantity ?? 0} 台/件`;
+  const hint = document.querySelector("#assetLookupHint");
+  if (hint) {
+    hint.textContent = resolvedAsset?.id
+      ? `已选：${group?.model || assetModelText(asset)}${asset.code ? `（${asset.code}）` : ""}`
+      : (String(lookupValue || "").trim() ? "未匹配到资产，请检查名称、编号或扫码链接。" : "输入资产名称、编号、规格，或粘贴扫码详情链接。");
+    hint.classList.toggle("warn", !resolvedAsset?.id && Boolean(String(lookupValue || "").trim()));
+  }
   document.querySelector("#summaryType").textContent = typeText;
   document.querySelector("#summaryQuantity").textContent = form.quantity?.value || "1";
   document.querySelector("#summaryUser").textContent = user.name ? `${user.name}${isMultiDepartment() ? ` · ${user.department}` : ""}` : "-";
@@ -3456,12 +5773,40 @@ function updateManualRecordPreview() {
   if (fileName) fileName.textContent = file ? file.name : "支持 JPG、PNG";
 }
 
+function updateOrderAssetLookup(form) {
+  if (!form) return null;
+  const wrapper = form.querySelector(".order-asset-lookup");
+  const input = form.assetLookup;
+  const hidden = form.assetId;
+  const hint = wrapper?.querySelector(".asset-lookup-hint");
+  const kind = wrapper?.dataset.orderAssetKind || orderType;
+  const asset = resolveOrderAsset(input?.value || hidden?.value, kind);
+  if (hidden) hidden.value = asset?.id || "";
+  if (hint) {
+    const hasText = Boolean(String(input?.value || "").trim());
+    hint.textContent = asset
+      ? `已选：${asset.name}（${asset.code}） · ${statusText(asset.status)}`
+      : (hasText ? "未匹配到可办理资产，请检查名称、编号或扫码链接。" : "输入资产名称、编号、规格，或粘贴扫码详情链接。");
+    hint.classList.toggle("warn", !asset && hasText);
+  }
+  return asset;
+}
+
 function withActor(payload = {}) {
-  return { ...payload, actorId: state.currentUser.id };
+  return { ...payload, actorId: state.currentUser.id, sessionToken: sessionToken() };
 }
 
 function formData(form) {
   return Object.fromEntries(new FormData(form));
+}
+
+async function copyText(text, successMessage, promptTitle) {
+  try {
+    await navigator.clipboard.writeText(text);
+    alert(successMessage);
+  } catch {
+    prompt(promptTitle, text);
+  }
 }
 
 function fileToBase64(file) {
@@ -3538,7 +5883,7 @@ function formatFileSize(bytes) {
 }
 
 async function importFilesBatch(files, endpoint, resultKey) {
-  const summary = { imported: 0, createdAssets: 0, paperCreated: 0, skipped: [], files: [] };
+  const summary = { processedRows: 0, imported: 0, createdAssets: 0, existingAssets: 0, updatedAssets: 0, duplicateRows: 0, duplicateFiles: 0, paperCreated: 0, skipped: [], files: [] };
   for (const file of files) {
     const fileName = file.webkitRelativePath || file.name;
     try {
@@ -3550,23 +5895,45 @@ async function importFilesBatch(files, endpoint, resultKey) {
         }))
       });
       const result = response[resultKey] || { imported: 0, skipped: [] };
+      summary.processedRows += importProcessedCount(result);
       summary.imported += Number(result.imported || 0);
       summary.createdAssets += Number(result.createdAssets || 0);
+      summary.existingAssets += Number(result.existingAssets || 0);
+      summary.updatedAssets += Number(result.updatedAssets || 0);
+      summary.duplicateRows += Number(result.duplicateRows || 0);
+      summary.duplicateFiles += Number(result.duplicateFiles || 0);
       summary.paperCreated += Number(result.paperCreated || 0);
       summary.skipped.push(...(result.skipped || []).map((item) => ({ ...item, file: fileName })));
       summary.files.push({
         fileName,
+        processedRows: importProcessedCount(result),
         imported: Number(result.imported || 0),
         createdAssets: Number(result.createdAssets || 0),
+        existingAssets: Number(result.existingAssets || 0),
+        updatedAssets: Number(result.updatedAssets || 0),
+        duplicateRows: Number(result.duplicateRows || 0),
+        duplicateFiles: Number(result.duplicateFiles || 0),
         paperCreated: Number(result.paperCreated || 0),
         skipped: (result.skipped || []).length
       });
     } catch (exc) {
       summary.skipped.push({ row: fileName, reason: exc.message });
-      summary.files.push({ fileName, imported: 0, createdAssets: 0, paperCreated: 0, skipped: 1, error: exc.message });
+      summary.files.push({
+        fileName,
+        processedRows: 0,
+        imported: 0,
+        createdAssets: 0,
+        existingAssets: 0,
+        updatedAssets: 0,
+        duplicateRows: 0,
+        duplicateFiles: 0,
+        paperCreated: 0,
+        skipped: 1,
+        error: exc.message
+      });
     }
   }
-  state = await api(`/api/state?userId=${encodeURIComponent(state.currentUser.id)}${viewRoleParam()}`);
+  state = await api(`/api/state?${authQuery()}`);
   ensureFreshVersion(state);
   applyAssetUrlSelection();
   summary.message = `已处理 ${files.length} 个文件`;
@@ -3638,7 +6005,7 @@ function safeDownloadName(fileName) {
 }
 
 async function downloadImportArchive(archiveId) {
-  const data = await api(`/api/import-archives/content?id=${encodeURIComponent(archiveId)}&userId=${encodeURIComponent(state.currentUser.id)}`);
+  const data = await api(`/api/import-archives/content?id=${encodeURIComponent(archiveId)}&${authQuery()}`);
   downloadBlob(data.fileName || "导入留档文件", base64ToBlob(data.contentBase64));
 }
 
@@ -3650,8 +6017,28 @@ function fileNameFromDisposition(disposition, fallback) {
   return plainMatch ? plainMatch[1] : fallback;
 }
 
+async function throwDownloadError(response, fallback) {
+  let data = {};
+  try {
+    data = await response.json();
+  } catch {}
+  if (data.code === "SESSION_EXPIRED") throw handleSessionExpired(data.error);
+  const error = new Error(data.error || fallback || "下载失败");
+  error.status = response.status;
+  error.code = data.code || "";
+  throw error;
+}
+
+async function downloadAuthorizedUrl(url, fallbackName, fallbackError = "下载失败") {
+  const response = await fetch(url);
+  if (!response.ok) await throwDownloadError(response, fallbackError);
+  const blob = await response.blob();
+  const fileName = fileNameFromDisposition(response.headers.get("Content-Disposition"), fallbackName);
+  downloadBlob(fileName, blob);
+}
+
 async function downloadAssetPrintTemplates() {
-  const assetIds = filteredAssets().map((asset) => asset.id);
+  const assetIds = (view === "assets" ? selectedLedgerAssets() : filteredAssets()).map((asset) => asset.id);
   if (!assetIds.length) {
     alert("没有可打印的资产数据。");
     return;
@@ -3661,14 +6048,7 @@ async function downloadAssetPrintTemplates() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(withActor({ assetIds }))
   });
-  if (!response.ok) {
-    let message = "生成模板失败";
-    try {
-      const data = await response.json();
-      message = data.error || message;
-    } catch {}
-    throw new Error(message);
-  }
+  if (!response.ok) await throwDownloadError(response, "生成模板失败");
   const blob = await response.blob();
   const fileName = fileNameFromDisposition(response.headers.get("Content-Disposition"), "资产申请确认单.docx");
   downloadBlob(fileName, blob);
@@ -3680,7 +6060,7 @@ function filteredAssets() {
 
 function downloadAssetsTable() {
   const headers = ["序号", "资产编号", "物品名称", "品牌", "类别", "规格", "单位", "数量", "单价", "总金额", "购置日期", "入库日期", "供应商", "使用部门", "使用人", "位置", "状态", "资产来源", "创建人", "更新时间", "备注"];
-  const rows = filteredAssets().map((asset, index) => [
+  const rows = (view === "assets" ? selectedLedgerAssets() : filteredAssets()).map((asset, index) => [
     index + 1,
     asset.code,
     asset.name,
@@ -3891,10 +6271,13 @@ function bindContextMenu() {
         view = "records";
         recordMode = "import";
         render();
-        requestAnimationFrame(() => document.querySelector("#inboundImportForm")?.scrollIntoView({ behavior: "smooth", block: "center" }));
+        requestAnimationFrame(() => document.querySelector("#bulkImportForm")?.scrollIntoView({ behavior: "smooth", block: "center" }));
         return;
       }
-      view = action;
+      view = normalizeViewKey(action);
+      if (["users", "baseData", "settings", "audit"].includes(action)) systemSection = action;
+      if (action === "assetRequests") requestSection = "asset";
+      if (action === "purchaseWishes") requestSection = "purchase";
       if (action === "records") recordMode = "manual";
       if (action === "assets") assetDrawerOpen = true;
       render();
@@ -4124,7 +6507,7 @@ async function changeMyPassword() {
 async function toggleViewMode() {
   if (!isRealAdmin()) return;
   const nextMode = isUserViewMode() ? "admin" : "user";
-  if (nextMode === "user" && ["users", "baseData", "settings", "audit"].includes(view)) {
+  if (nextMode === "user" && ["system", "users", "baseData", "settings", "audit"].includes(view)) {
     view = "dashboard";
   }
   if (nextMode === "user") {
@@ -4209,7 +6592,40 @@ function closeUserContextMenu() {
   menu.setAttribute("aria-hidden", "true");
 }
 
+function bindResizableDrawers() {
+  document.querySelectorAll("[data-drawer-resize-handle]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      const drawer = handle.closest(".asset-drawer");
+      if (!drawer) return;
+      event.preventDefault();
+      const kind = drawer.dataset.drawerKind || "default";
+      const startX = event.clientX;
+      const startWidth = drawer.getBoundingClientRect().width;
+      const minWidth = Math.min(360, Math.max(280, window.innerWidth - 32));
+      const maxWidth = Math.max(minWidth, window.innerWidth - 32);
+      document.body.classList.add("drawer-resizing");
+      const resize = (moveEvent) => {
+        const nextWidth = Math.min(maxWidth, Math.max(minWidth, startWidth + startX - moveEvent.clientX));
+        drawer.style.setProperty("--drawer-width", `${Math.round(nextWidth)}px`);
+      };
+      const stop = () => {
+        const finalWidth = Math.round(drawer.getBoundingClientRect().width);
+        localStorage.setItem(drawerWidthStorageKey(kind), String(finalWidth));
+        document.body.classList.remove("drawer-resizing");
+        window.removeEventListener("pointermove", resize);
+        window.removeEventListener("pointerup", stop);
+        window.removeEventListener("pointercancel", stop);
+      };
+      window.addEventListener("pointermove", resize);
+      window.addEventListener("pointerup", stop);
+      window.addEventListener("pointercancel", stop);
+    });
+  });
+}
+
 function bindEvents() {
+  bindResizableDrawers();
+
   document.querySelector("#loginForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const error = document.querySelector("#loginError");
@@ -4219,13 +6635,8 @@ function bindEvents() {
       const rememberLogin = Boolean(payload.rememberLogin);
       delete payload.rememberLogin;
       const data = await api("/api/login", { method: "POST", body: JSON.stringify(payload) });
-      localStorage.removeItem(USER_KEY);
-      sessionStorage.removeItem(SESSION_USER_KEY);
-      if (rememberLogin) {
-        localStorage.setItem(USER_KEY, data.user.id);
-      } else {
-        sessionStorage.setItem(SESSION_USER_KEY, data.user.id);
-      }
+      saveStoredSession(data.user.id, data.sessionToken, rememberLogin);
+      loginNotice = "";
       state.currentUser = data.user;
       view = "dashboard";
       await refresh();
@@ -4236,16 +6647,34 @@ function bindEvents() {
 
   document.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => {
-      view = button.dataset.view;
+      view = normalizeViewKey(button.dataset.view);
       render();
     });
   });
 
-  document.querySelector("#logoutBtn")?.addEventListener("click", () => {
-    localStorage.removeItem(USER_KEY);
-    sessionStorage.removeItem(SESSION_USER_KEY);
+  document.querySelectorAll("[data-request-section]").forEach((button) => {
+    button.addEventListener("click", () => {
+      requestSection = button.dataset.requestSection || "asset";
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-system-section]").forEach((button) => {
+    button.addEventListener("click", () => {
+      systemSection = button.dataset.systemSection || "users";
+      render();
+    });
+  });
+
+  document.querySelector("#logoutBtn")?.addEventListener("click", async () => {
+    try {
+      await api("/api/logout", { method: "POST", body: JSON.stringify(withActor({})) });
+    } catch {}
+    loginNotice = "";
+    clearStoredSession();
     localStorage.removeItem(VIEW_MODE_KEY);
     state.currentUser = null;
+    view = "dashboard";
     render();
   });
 
@@ -4270,18 +6699,309 @@ function bindEvents() {
     try {
       await downloadAssetPrintTemplates();
     } catch (error) {
-      alert(error.message || "生成模板失败");
+      if (error.code !== "SESSION_EXPIRED") alert(error.message || "生成模板失败");
     }
   });
   document.querySelector("#downloadAssets")?.addEventListener("click", downloadAssetsTable);
+
+  document.querySelectorAll("[data-empty-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      let action = {};
+      try {
+        action = JSON.parse(button.dataset.emptyAction || "{}");
+      } catch {}
+      if (action.view) view = normalizeViewKey(action.view);
+      if (action.mode) recordMode = action.mode;
+      if (action.action) recordActionMode = action.action;
+      if (action.importKind) importKind = action.importKind;
+      if (action.assetStatusFilter) assetStatusFilter = action.assetStatusFilter;
+      if (action.requestSection) requestSection = action.requestSection;
+      if (action.systemSection) systemSection = action.systemSection;
+      if (action.orderType) orderType = action.orderType;
+      if (action.inventoryView) inventoryView = action.inventoryView;
+      if (action.auditClear) {
+        auditFilterField = "all";
+        auditKeyword = "";
+        auditStartTime = "";
+        auditEndTime = "";
+      }
+      render();
+    });
+  });
 
   bindSearchInput("#dashboardSearch", (value) => {
     dashboardSearch = value;
   });
 
+  document.querySelectorAll("[data-dashboard-usage]").forEach((button) => {
+    button.addEventListener("click", () => {
+      dashboardUsageOpen = true;
+      ledgerDrawerKey = "";
+      ledgerDrawerMode = "";
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-dashboard-person]").forEach((button) => {
+    button.addEventListener("click", () => {
+      dashboardUsageUserId = button.dataset.dashboardPerson || "";
+      render();
+    });
+  });
+
+  document.querySelector("#closeDashboardUsage")?.addEventListener("click", () => {
+    dashboardUsageOpen = false;
+    dashboardUsageUserId = "";
+    render();
+  });
+
+  document.querySelector("#dashboardUsageBackdrop")?.addEventListener("click", () => {
+    dashboardUsageOpen = false;
+    dashboardUsageUserId = "";
+    render();
+  });
+
   bindSearchInput("#assetSearch", (value) => {
     assetFilter = value;
     assetPage = 1;
+  });
+
+  bindSearchInput("#deviceGroupSearch", (value) => {
+    deviceGroupFilter = value;
+  });
+
+  document.querySelectorAll("[data-device-family]").forEach((button) => {
+    button.addEventListener("click", () => {
+      assetFamilyFilter = button.dataset.deviceFamily || "all";
+      assetPage = 1;
+      render();
+    });
+  });
+
+  document.querySelector("[data-asset-select-all]")?.addEventListener("change", (event) => {
+    const visibleKeys = [...document.querySelectorAll("[data-asset-group-select]")].map((input) => input.dataset.assetGroupSelect);
+    if (event.target.checked) {
+      visibleKeys.forEach((key) => selectedAssetGroupKeys.add(key));
+    } else {
+      visibleKeys.forEach((key) => selectedAssetGroupKeys.delete(key));
+    }
+    render();
+  });
+
+  document.querySelectorAll("[data-asset-group-select]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const key = input.dataset.assetGroupSelect;
+      if (input.checked) selectedAssetGroupKeys.add(key);
+      else selectedAssetGroupKeys.delete(key);
+      render();
+    });
+  });
+
+  document.querySelector("#clearAssetGroupSelectionInline")?.addEventListener("click", () => {
+    selectedAssetGroupKeys.clear();
+    render();
+  });
+
+  document.querySelector("#batchExportAssets")?.addEventListener("click", downloadAssetsTable);
+  document.querySelector("#batchPrintAssetLabels")?.addEventListener("click", async () => {
+    try {
+      await downloadAssetPrintTemplates();
+    } catch (error) {
+      if (error.code !== "SESSION_EXPIRED") alert(error.message || "生成模板失败");
+    }
+  });
+  document.querySelector("#batchClassifyAssets")?.addEventListener("click", () => {
+    const groups = selectedAssetGroups();
+    if (!groups.length) {
+      alert("请先勾选要批量归类的资产组。");
+      return;
+    }
+    selectedDeviceGroupKeys = new Set(groups.flatMap((group) => group.assets.map((asset) => assetAutoGroupKey(asset))));
+    view = "system";
+    systemSection = "baseData";
+    render();
+  });
+  document.querySelector("#batchInventoryCheck")?.addEventListener("click", () => {
+    view = "checks";
+    render();
+  });
+
+  document.querySelectorAll("[data-asset-primary-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      recordPrefillAssetId = button.dataset.assetId || "";
+      recordActionMode = button.dataset.assetPrimaryAction === "return" ? "return" : "lend";
+      recordMode = "manual";
+      view = "records";
+      render();
+      requestAnimationFrame(() => document.querySelector("#recordForm")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    });
+  });
+
+  document.querySelectorAll("[data-ledger-open-group]").forEach((button) => {
+    button.addEventListener("click", () => {
+      ledgerDrawerKey = button.dataset.ledgerOpenGroup || "";
+      ledgerDrawerMode = "group";
+      selectedAssetDetailId = "";
+      dashboardUsageOpen = false;
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-ledger-status]").forEach((button) => {
+    button.addEventListener("click", () => {
+      ledgerDrawerKey = button.dataset.ledgerGroup || "";
+      ledgerDrawerMode = button.dataset.ledgerStatus || "group";
+      selectedAssetDetailId = "";
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-ledger-drawer-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      ledgerDrawerKey = button.dataset.ledgerGroup || ledgerDrawerKey;
+      ledgerDrawerMode = button.dataset.ledgerDrawerTab || "group";
+      render();
+    });
+  });
+
+  document.querySelector("#closeLedgerDetail")?.addEventListener("click", () => {
+    ledgerDrawerKey = "";
+    ledgerDrawerMode = "";
+    render();
+  });
+  document.querySelector("#ledgerDetailBackdrop")?.addEventListener("click", () => {
+    ledgerDrawerKey = "";
+    ledgerDrawerMode = "";
+    render();
+  });
+
+  document.querySelectorAll("[data-ledger-focus-asset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const form = document.querySelector(`[data-ledger-checkout-form="${CSS.escape(button.dataset.ledgerFocusAsset || "")}"]`);
+      const select = form?.querySelector("select[name='userId']");
+      select?.focus();
+    });
+  });
+
+  document.querySelectorAll("[data-ledger-checkout-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const payload = withActor(formData(event.currentTarget));
+      if (!payload.userId) {
+        alert("请选择要划到名下的使用人。");
+        return;
+      }
+      payload.type = "出库";
+      payload.quantity = 1;
+      payload.outTime = nowLocal();
+      payload.inTime = "";
+      payload.paperNo = "";
+      payload.note = "资产台账划一笔";
+      try {
+        state = await api("/api/records", { method: "POST", body: JSON.stringify(payload) });
+        ledgerDrawerMode = "checked_out";
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-device-group-select]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const groupKey = input.dataset.deviceGroupSelect;
+      const group = deviceGroupByKey(groupKey);
+      if (input.checked) {
+        selectedDeviceGroupKeys.add(groupKey);
+        if (!deviceGroupDraftName && group) deviceGroupDraftName = group.manualName || group.model || "";
+        if (!deviceGroupDraftFamily && group) deviceGroupDraftFamily = group.familyId || "";
+      } else {
+        selectedDeviceGroupKeys.delete(groupKey);
+        if (!selectedDeviceGroupKeys.size) {
+          deviceGroupDraftName = "";
+          deviceGroupDraftFamily = "";
+        }
+      }
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-assign-device-group]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const group = deviceGroupByKey(button.dataset.assignDeviceGroup);
+      if (!group) return;
+      selectedDeviceGroupKeys = new Set([group.key]);
+      deviceGroupDraftName = group.manualName || group.model || "";
+      deviceGroupDraftFamily = group.familyId || "";
+      render();
+      setTimeout(() => document.querySelector("#deviceGroupAssignForm")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+    });
+  });
+
+  document.querySelector("#clearDeviceGroupSelection")?.addEventListener("click", () => {
+    selectedDeviceGroupKeys.clear();
+    deviceGroupDraftName = "";
+    deviceGroupDraftFamily = "";
+    render();
+  });
+
+  document.querySelector("#deviceGroupAssignForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload = withActor(formData(event.target));
+    payload.sourceKeys = selectedDeviceSourceKeys();
+    if (!payload.sourceKeys.length) {
+      alert("请先勾选要归到一起的设备组。");
+      return;
+    }
+    try {
+      state = await api("/api/device-groups/assign", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      selectedDeviceGroupKeys.clear();
+      deviceGroupDraftName = "";
+      deviceGroupDraftFamily = "";
+      assetPage = 1;
+      render();
+    } catch (exc) {
+      alert(exc.message);
+    }
+  });
+
+  document.querySelectorAll("[data-unassign-device-group]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const group = deviceGroupByKey(button.dataset.unassignDeviceGroup);
+      if (!group) return;
+      if (!confirm(`确定取消“${group.model}”的手动归类吗？`)) return;
+      try {
+        state = await api("/api/device-groups/unassign", {
+          method: "POST",
+          body: JSON.stringify(withActor({ sourceKeys: group.sourceKeyList || [] }))
+        });
+        selectedDeviceGroupKeys.delete(group.key);
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-unassign-manual-name]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const groupName = button.dataset.unassignManualName;
+      if (!groupName) return;
+      if (!confirm(`确定取消“${groupName}”下的全部手动归类吗？`)) return;
+      try {
+        state = await api("/api/device-groups/unassign", {
+          method: "POST",
+          body: JSON.stringify(withActor({ groupName }))
+        });
+        selectedDeviceGroupKeys.clear();
+        render();
+      } catch (exc) {
+        alert(exc.message);
+      }
+    });
   });
 
   document.querySelector("#assetStatusFilter")?.addEventListener("change", (event) => {
@@ -4333,6 +7053,12 @@ function bindEvents() {
     render();
   });
 
+  document.querySelector("#assetFamilyFilter")?.addEventListener("change", (event) => {
+    assetFamilyFilter = event.target.value;
+    assetPage = 1;
+    render();
+  });
+
   document.querySelector("#assetKeeperFilter")?.addEventListener("change", (event) => {
     assetKeeperFilter = event.target.value;
     assetPage = 1;
@@ -4371,6 +7097,8 @@ function bindEvents() {
   document.querySelector("#clearAssetSelection")?.addEventListener("click", () => {
     selectedAssetId = "";
     assetFilter = "";
+    assetFamilyFilter = "all";
+    deviceGroupFilter = "";
     assetStatusFilter = "all";
     assetCategoryFilters = [];
     assetCategoryPanelOpen = false;
@@ -4379,6 +7107,8 @@ function bindEvents() {
     assetBorrowerFilter = "all";
     assetSortField = "outTime";
     assetSortDir = "desc";
+    ledgerDrawerKey = "";
+    ledgerDrawerMode = "";
     assetPage = 1;
     render();
   });
@@ -4414,6 +7144,13 @@ function bindEvents() {
   document.querySelector("#clearInventorySearch")?.addEventListener("click", () => {
     inventoryFilter = "";
     render();
+  });
+
+  document.querySelectorAll("[data-inventory-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      inventoryView = button.dataset.inventoryView || "status";
+      render();
+    });
   });
 
   document.querySelector("#inventoryAdjustForm")?.addEventListener("submit", async (event) => {
@@ -4606,6 +7343,8 @@ function bindEvents() {
   document.querySelectorAll("[data-view-asset]").forEach((button) => {
     button.addEventListener("click", () => {
       selectedAssetDetailId = button.dataset.viewAsset;
+      ledgerDrawerKey = "";
+      ledgerDrawerMode = "";
       render();
     });
   });
@@ -4704,10 +7443,40 @@ function bindEvents() {
         method: "POST",
         body: JSON.stringify(withActor(formData(event.target)))
       });
+      selectedCheckTaskId = state.inventoryCheckTasks?.[0]?.id || "";
+      selectedCheckGroupKey = "";
+      activeCheckItemId = "";
       render();
     } catch (exc) {
       alert(exc.message);
     }
+  });
+
+  document.querySelectorAll("[data-select-check-task]").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectedCheckTaskId = button.dataset.selectCheckTask || "";
+      selectedCheckGroupKey = "";
+      activeCheckItemId = "";
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-check-group]").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectedCheckGroupKey = button.dataset.checkGroup || "";
+      const activeTask = currentCheckTask();
+      const group = checkGroupsForActiveTask(activeTask).find((entry) => entry.key === selectedCheckGroupKey);
+      activeCheckItemId = firstPendingCheckItem(group)?.id || "";
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-check-active-item]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activeCheckItemId = button.dataset.checkActiveItem || "";
+      selectedCheckGroupKey = button.dataset.checkGroup || selectedCheckGroupKey;
+      render();
+    });
   });
 
   document.querySelectorAll("[data-save-check-item]").forEach((button) => {
@@ -4724,7 +7493,12 @@ function bindEvents() {
             remark: document.querySelector(`[data-check-remark="${itemId}"]`)?.value || ""
           }))
         });
+        selectNextCheckItem(itemId);
         render();
+        requestAnimationFrame(() => {
+          const target = document.querySelector(`[data-check-active-item="${CSS.escape(activeCheckItemId || "")}"]`);
+          target?.closest("tr")?.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
       } catch (exc) {
         alert(exc.message);
       }
@@ -4782,15 +7556,43 @@ function bindEvents() {
   });
 
   document.querySelectorAll("[data-export-check]").forEach((button) => {
-    button.addEventListener("click", () => {
-      window.location.href = `/api/inventory-checks/export?taskId=${encodeURIComponent(button.dataset.exportCheck)}&userId=${encodeURIComponent(state.currentUser.id)}`;
+    button.addEventListener("click", async () => {
+      try {
+        await downloadAuthorizedUrl(
+          `/api/inventory-checks/export?taskId=${encodeURIComponent(button.dataset.exportCheck)}&${authQuery()}`,
+          "盘点报告.csv",
+          "导出盘点报告失败"
+        );
+      } catch (exc) {
+        if (exc.code !== "SESSION_EXPIRED") alert(exc.message);
+      }
     });
   });
 
   document.querySelectorAll("[data-export-report]").forEach((button) => {
-    button.addEventListener("click", () => {
-      window.location.href = `/api/reports/export?type=${encodeURIComponent(button.dataset.exportReport)}&userId=${encodeURIComponent(state.currentUser.id)}`;
+    button.addEventListener("click", async () => {
+      try {
+        await downloadAuthorizedUrl(
+          `/api/reports/export?type=${encodeURIComponent(button.dataset.exportReport)}&${authQuery()}`,
+          "资产报表.csv",
+          "导出报表失败"
+        );
+      } catch (exc) {
+        if (exc.code !== "SESSION_EXPIRED") alert(exc.message);
+      }
     });
+  });
+
+  document.querySelector("#exportPurchaseWishes")?.addEventListener("click", async () => {
+    try {
+      await downloadAuthorizedUrl(
+        `/api/purchase-wishes/export?${authQuery()}`,
+        "采购需求表.xlsx",
+        "导出采购需求失败"
+      );
+    } catch (exc) {
+      if (exc.code !== "SESSION_EXPIRED") alert(exc.message);
+    }
   });
 
   document.querySelector("#recordKindFilter")?.addEventListener("change", (event) => {
@@ -4843,7 +7645,7 @@ function bindEvents() {
       try {
         await downloadImportArchive(button.dataset.downloadArchive);
       } catch (exc) {
-        alert(`下载失败：${exc.message}`);
+        if (exc.code !== "SESSION_EXPIRED") alert(`下载失败：${exc.message}`);
       }
     });
   });
@@ -4854,6 +7656,10 @@ function bindEvents() {
   });
 
   document.querySelector("#downloadInboundTemplate")?.addEventListener("click", downloadInboundTemplate);
+  document.querySelector("#recordStatsPeriod")?.addEventListener("change", (event) => {
+    recordStatsPeriod = event.target.value || nowLocal().slice(0, 7);
+  });
+  document.querySelector("#refreshRecordsBtn")?.addEventListener("click", refresh);
 
   document.querySelectorAll("[data-import-kind]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -4869,6 +7675,10 @@ function bindEvents() {
   });
 
   const uploadZone = document.querySelector("[data-upload-zone]");
+  uploadZone?.addEventListener("click", (event) => {
+    if (event.target.closest("label, button")) return;
+    document.querySelector("#bulkFileInput")?.click();
+  });
   uploadZone?.addEventListener("dragover", (event) => {
     event.preventDefault();
     uploadZone.classList.add("dragging");
@@ -4923,12 +7733,23 @@ function bindEvents() {
   document.querySelector("#recordForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const payload = withActor(formData(event.target));
+    const asset = resolveRecordAsset(payload.assetLookup || payload.assetId);
+    if (!asset) {
+      alert("没有匹配到资产。请确认输入的是资产名称、编号、规格，或有效资产详情链接。");
+      return;
+    }
+    payload.assetId = asset.id;
+    delete payload.assetLookup;
     payload.quantity = Number(payload.quantity);
     const photoFile = event.target.photoFile?.files?.[0];
     delete payload.photoFile;
     payload.photo = await imageToDataUrl(photoFile);
-    state = await api("/api/records", { method: "POST", body: JSON.stringify(payload) });
-    render();
+    try {
+      state = await api("/api/records", { method: "POST", body: JSON.stringify(payload) });
+      render();
+    } catch (exc) {
+      alert(exc.message);
+    }
   });
 
   document.querySelector("#recordForm")?.addEventListener("input", updateManualRecordPreview);
@@ -4938,8 +7759,18 @@ function bindEvents() {
       const form = document.querySelector("#recordForm");
       form?.querySelectorAll("[data-record-type]").forEach((item, index) => item.classList.toggle("active", index === 0));
       if (form?.type) form.type.value = "入库";
+      recordActionMode = "inbound";
+      recordPrefillAssetId = "";
       updateManualRecordPreview();
     }, 0);
+  });
+
+  document.querySelectorAll("[data-record-action]:not([data-record-type])").forEach((button) => {
+    button.addEventListener("click", () => {
+      recordActionMode = button.dataset.recordAction || "inbound";
+      render();
+      requestAnimationFrame(() => document.querySelector("#recordForm")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    });
   });
 
   document.querySelectorAll("[data-record-type]").forEach((button) => {
@@ -4947,7 +7778,12 @@ function bindEvents() {
       const form = document.querySelector("#recordForm");
       form.querySelectorAll("[data-record-type]").forEach((item) => item.classList.remove("active"));
       button.classList.add("active");
+      recordActionMode = button.dataset.recordAction || (button.dataset.recordType === "出库" ? "lend" : "inbound");
+      const action = recordActionConfig();
       form.type.value = button.dataset.recordType;
+      if (form.inTime) form.inTime.value = action.inTime;
+      if (form.outTime) form.outTime.value = action.outTime;
+      if (form.note && (!form.note.value || ["新增入库", "划一笔出借", "归还登记", "耗材领用"].includes(form.note.value))) form.note.value = action.note;
       updateManualRecordPreview();
     });
   });
@@ -4984,10 +7820,36 @@ function bindEvents() {
     }
   });
 
-  document.querySelector("#purchaseWishForm")?.addEventListener("submit", async (event) => {
+  const purchaseWishForm = document.querySelector("#purchaseWishForm");
+  if (purchaseWishForm) {
+    updatePurchaseWishTotal(purchaseWishForm);
+    purchaseWishForm.addEventListener("input", (event) => {
+      if (event.target.name === "upliftRate" && purchaseWishForm.upliftPreset) {
+        purchaseWishForm.upliftPreset.value = "custom";
+      }
+      if (["quantity", "unitPrice", "upliftRate"].includes(event.target.name)) {
+        updatePurchaseWishTotal(purchaseWishForm);
+      }
+    });
+    purchaseWishForm.addEventListener("change", (event) => {
+      if (event.target.name === "upliftPreset" && event.target.value !== "custom" && purchaseWishForm.upliftRate) {
+        purchaseWishForm.upliftRate.value = event.target.value;
+      }
+      if (["quantity", "unitPrice", "upliftRate", "upliftPreset"].includes(event.target.name)) {
+        updatePurchaseWishTotal(purchaseWishForm);
+      }
+    });
+  }
+
+  purchaseWishForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const payload = withActor(formData(event.target));
-    payload.quantity = Number(payload.quantity);
+    payload.quantity = Math.max(1, Number(payload.quantity || 1) || 1);
+    payload.unitPrice = Math.max(0, Number(payload.unitPrice || 0) || 0);
+    payload.upliftRate = purchaseWishUpliftRate(event.target);
+    payload.totalAmount = Number(updatePurchaseWishTotal(event.target).toFixed(2));
+    payload.unit = "件";
+    delete payload.upliftPreset;
     try {
       state = await api("/api/purchase-wishes", { method: "POST", body: JSON.stringify(payload) });
       alert("需求已加入清单。");
@@ -5232,14 +8094,31 @@ function bindEvents() {
     render();
   });
 
+  document.querySelector("#checkSystemHealth")?.addEventListener("click", async () => {
+    systemHealthLoading = true;
+    render();
+    try {
+      systemHealth = await api("/api/health");
+    } catch (exc) {
+      systemHealth = { ok: false, error: exc.message || "健康检查失败" };
+    } finally {
+      systemHealthCheckedAt = nowLocal();
+      systemHealthLoading = false;
+      render();
+    }
+  });
+
+  document.querySelector("#copyUpdateCommand")?.addEventListener("click", async () => {
+    await copyText(updateContainerCommand(), "更新容器命令已复制。", "复制下面的命令，在 PowerShell 里执行：");
+  });
+
+  document.querySelector("#copyHealthCommand")?.addEventListener("click", async () => {
+    await copyText(healthCheckCommand(), "健康检查命令已复制。", "复制下面的命令，在 PowerShell 里执行：");
+  });
+
   document.querySelector("#copyPortCommand")?.addEventListener("click", async () => {
     const command = portApplyCommand();
-    try {
-      await navigator.clipboard.writeText(command);
-      alert("端口重启命令已复制。");
-    } catch {
-      prompt("复制下面的命令，在 PowerShell 里执行：", command);
-    }
+    await copyText(command, "端口重启命令已复制。", "复制下面的命令，在 PowerShell 里执行：");
   });
 
   document.querySelectorAll("[data-order-type]").forEach((button) => {
@@ -5260,12 +8139,25 @@ function bindEvents() {
     document.querySelector(selector)?.addEventListener("submit", async (event) => {
       event.preventDefault();
       try {
-        state = await api(endpoint, { method: "POST", body: JSON.stringify(withActor(formData(event.target))) });
+        const asset = updateOrderAssetLookup(event.target);
+        if (!asset) {
+          alert("没有匹配到可办理资产。请确认输入的是资产名称、编号、规格，或有效资产详情链接。");
+          return;
+        }
+        const payload = withActor(formData(event.target));
+        payload.assetId = asset.id;
+        delete payload.assetLookup;
+        state = await api(endpoint, { method: "POST", body: JSON.stringify(payload) });
         render();
       } catch (exc) {
         alert(exc.message);
       }
     });
+  });
+
+  document.querySelectorAll(".order-asset-lookup input[name='assetLookup']").forEach((input) => {
+    input.addEventListener("input", () => updateOrderAssetLookup(input.form));
+    input.addEventListener("change", () => updateOrderAssetLookup(input.form));
   });
 
   document.querySelectorAll("[data-return-borrow]").forEach((button) => {
@@ -5314,12 +8206,14 @@ function bindEvents() {
   document.querySelector("#startQrScanner")?.addEventListener("click", startQrScanner);
 
   document.querySelector("#clearDebugFiles")?.addEventListener("click", async () => {
+    const confirmation = prompt("危险操作：将清空除登录账号外的全部数据，包括资产、流水、导入留档、部门、分类、位置、系统设置和操作记录。请输入“只保留登录账号”确认。", "");
+    if (confirmation !== "只保留登录账号") return;
     try {
       state = await api("/api/debug/clear-files", {
         method: "POST",
         body: JSON.stringify(withActor())
       });
-      alert("业务数据已清空，用户已保留。");
+      alert("已清空除登录账号外的全部数据。");
       render();
     } catch (exc) {
       alert(exc.message);

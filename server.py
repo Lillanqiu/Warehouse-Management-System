@@ -2,12 +2,15 @@ import json
 import os
 import sqlite3
 import uuid
+import secrets
 import base64
 import csv
 import io
 import zipfile
 import contextvars
 import copy
+import traceback
+import hashlib
 from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,11 +31,15 @@ PUBLIC_PORT = os.environ.get("PUBLIC_PORT") or os.environ.get("WAREHOUSE_HOST_PO
 DEFAULT_ADMIN_PASSWORD = os.environ.get("WAREHOUSE_ADMIN_PASSWORD", "admin")
 DEFAULT_IMPORTED_USER_PASSWORD = os.environ.get("WAREHOUSE_IMPORTED_USER_PASSWORD", "change-me-before-use")
 BEIJING_TZ = timezone(timedelta(hours=8))
-APP_VERSION = "20260608-school-rbac-flow-v96"
+APP_VERSION = "20260612-dashboard-overview-v134"
 REQUEST_IP = contextvars.ContextVar("request_ip", default="")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
 ElementTree.register_namespace("w", W_NS)
+
+
+class AuthError(PermissionError):
+    pass
 
 ROLE_DEFINITIONS = [
     ("admin", "系统管理员", "拥有全部菜单、数据和系统设置权限"),
@@ -891,7 +898,7 @@ def find_duplicate_record(conn, asset_id, record_type, quantity, user_id, in_tim
             asset_code,
             asset_name,
         ),
-    )
+    ).fetchone()
     return row["id"] if row else ""
 
 
@@ -1304,6 +1311,13 @@ def init_db():
               active integer not null default 1
             );
 
+            create table if not exists user_sessions (
+              token text primary key,
+              user_id text not null references users(id),
+              created_at text not null,
+              last_seen_at text not null
+            );
+
             create table if not exists roles (
               id text primary key,
               name text unique not null,
@@ -1444,6 +1458,20 @@ def init_db():
               content blob not null
             );
 
+            create table if not exists import_row_fingerprints (
+              id text primary key,
+              file_hash text not null,
+              row_hash text not null unique,
+              file_name text not null,
+              row_number integer not null,
+              target_type text,
+              target_id text,
+              result text not null,
+              archive_id text,
+              imported_by text,
+              created_at text not null
+            );
+
             create table if not exists system_settings (
               key text primary key,
               value text not null
@@ -1480,7 +1508,11 @@ def init_db():
               item_name text not null,
               category text,
               spec text,
+              unit text not null default '',
               quantity integer not null default 1,
+              unit_price real not null default 0,
+              total_amount real not null default 0,
+              item_type text not null default '',
               priority text,
               expected_time text,
               reason text,
@@ -1619,6 +1651,17 @@ def init_db():
               note text,
               created_at text not null
             );
+
+            create table if not exists device_group_rules (
+              id text primary key,
+              source_key text unique not null,
+              group_name text not null,
+              family_id text,
+              active integer not null default 1,
+              created_by text,
+              created_at text not null,
+              updated_at text not null
+            );
             """
         )
         conn.execute("insert or ignore into system_settings values ('multi_department_enabled', '0')")
@@ -1678,6 +1721,13 @@ def init_db():
         ensure_column(conn, "locations", "active", "integer not null default 1")
         ensure_column(conn, "locations", "created_at", "text not null default ''")
         ensure_column(conn, "locations", "updated_at", "text not null default ''")
+        ensure_column(conn, "purchase_wishes", "unit", "text not null default ''")
+        ensure_column(conn, "purchase_wishes", "unit_price", "real not null default 0")
+        ensure_column(conn, "purchase_wishes", "total_amount", "real not null default 0")
+        ensure_column(conn, "purchase_wishes", "item_type", "text not null default ''")
+        conn.execute("update purchase_wishes set unit = '件' where unit is null or unit = ''")
+        conn.execute("update purchase_wishes set item_type = category where (item_type is null or item_type = '') and category <> ''")
+        conn.execute("update purchase_wishes set total_amount = quantity * unit_price where (total_amount is null or total_amount = 0) and unit_price > 0")
         migrate_server_times_to_beijing(conn)
         migrate_multi_department_default_off(conn)
         migrate_factory_blank_config(conn)
@@ -1813,6 +1863,17 @@ def require_permission(conn, user, permission_code):
         raise PermissionError("没有执行该操作的权限")
 
 
+def has_view_permission(conn, user, permission_code, view_role=""):
+    if view_role == "user" and has_permission(conn, user, "assets.view.all"):
+        return permission_code in ROLE_PERMISSION_MAP["teacher"]
+    return has_permission(conn, user, permission_code)
+
+
+def require_view_permission(conn, user, permission_code, view_role=""):
+    if not has_view_permission(conn, user, permission_code, view_role):
+        raise PermissionError("没有执行该操作的权限")
+
+
 def department_scope_filter(user, field="department"):
     if role_id_for_user(user) == "department_head":
         return f" and {field} = ? ", [user["department"]]
@@ -1838,15 +1899,49 @@ def get_user(conn, user_id):
     return conn.execute("select * from users where id = ? and active = 1", (user_id,)).fetchone()
 
 
-def require_user(conn, payload=None, query=None):
-    user_id = None
+def cleanup_old_sessions(conn):
+    cutoff = (datetime.now(BEIJING_TZ).replace(tzinfo=None, microsecond=0) - timedelta(days=30)).isoformat(timespec="minutes")
+    conn.execute("delete from user_sessions where last_seen_at < ?", (cutoff,))
+
+
+def create_session(conn, user_id):
+    cleanup_old_sessions(conn)
+    token = secrets.token_urlsafe(32)
+    now = now_local()
+    conn.execute(
+        "insert into user_sessions (token, user_id, created_at, last_seen_at) values (?, ?, ?, ?)",
+        (token, user_id, now, now),
+    )
+    return token
+
+
+def request_session_token(payload=None, query=None):
+    token = ""
     if payload:
-        user_id = payload.get("actorId") or payload.get("userId")
+        token = str(payload.get("sessionToken") or "").strip()
+    if not token and query:
+        token = str(query.get("sessionToken", [""])[0] or "").strip()
+    return token
+
+
+def require_user(conn, payload=None, query=None):
+    user_id = ""
+    if payload:
+        user_id = str(payload.get("actorId") or payload.get("userId") or "").strip()
     if not user_id and query:
-        user_id = query.get("userId", [""])[0]
-    user = get_user(conn, user_id)
+        user_id = str(query.get("userId", [""])[0] or "").strip()
+    token = request_session_token(payload, query)
+    if not token:
+        raise AuthError("登录已过期，请重新登录。")
+    session = conn.execute("select * from user_sessions where token = ?", (token,)).fetchone()
+    if not session:
+        raise AuthError("登录已过期，请重新登录。")
+    if user_id and user_id != session["user_id"]:
+        raise AuthError("登录身份不一致，请重新登录。")
+    user = get_user(conn, session["user_id"])
     if not user:
-        raise PermissionError("请先登录")
+        raise AuthError("请先登录。")
+    conn.execute("update user_sessions set last_seen_at = ? where token = ?", (now_local(), token))
     return user
 
 
@@ -2011,6 +2106,189 @@ def save_import_archive(conn, actor, file_name, file_type, category, content, re
     return archive_id
 
 
+def sha256_hex(value):
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    return hashlib.sha256(value or b"").hexdigest()
+
+
+def normalized_row_payload(row, scope=""):
+    items = {}
+    for key, value in sorted((row or {}).items(), key=lambda item: str(item[0])):
+        clean_key = clean_docx_text(key)
+        clean_value = clean_docx_text(value)
+        if clean_key or clean_value:
+            items[clean_key] = clean_value
+    return {"scope": scope, "row": items}
+
+
+def import_row_hash(row, scope=""):
+    return sha256_hex(json.dumps(normalized_row_payload(row, scope), ensure_ascii=False, sort_keys=True))
+
+
+def imported_row(conn, row_hash):
+    prune_orphan_import_fingerprints(conn)
+    return conn.execute(
+        """
+        select *
+        from import_row_fingerprints f
+        where f.row_hash = ?
+          and (
+            (f.target_type = 'asset' and exists (select 1 from assets a where a.id = f.target_id))
+            or (f.target_type = 'record' and exists (select 1 from records r where r.id = f.target_id))
+            or (f.target_type = 'file' and (
+              exists (select 1 from import_archives a where a.id = f.archive_id)
+              or exists (select 1 from import_archives a where a.id = f.target_id)
+            ))
+          )
+        """,
+        (row_hash,),
+    ).fetchone()
+
+
+def register_import_row(conn, file_hash, row_hash, file_name, row_number, target_type, target_id, result, actor_id, archive_id=""):
+    conn.execute(
+        """
+        insert or ignore into import_row_fingerprints
+        (id, file_hash, row_hash, file_name, row_number, target_type, target_id, result, archive_id, imported_by, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            new_id("improw"),
+            file_hash,
+            row_hash,
+            file_name,
+            int(row_number or 0),
+            target_type,
+            target_id,
+            result,
+            archive_id,
+            actor_id,
+            now_local(),
+        ),
+    )
+
+
+def import_file_seen(conn, file_hash):
+    if not file_hash:
+        return None
+    prune_orphan_import_fingerprints(conn)
+    return conn.execute(
+        """
+        select file_name, created_at
+        from import_row_fingerprints f
+        where f.file_hash = ?
+          and (
+            (f.target_type = 'asset' and exists (select 1 from assets a where a.id = f.target_id))
+            or (f.target_type = 'record' and exists (select 1 from records r where r.id = f.target_id))
+            or (f.target_type = 'file' and (
+              exists (select 1 from import_archives a where a.id = f.archive_id)
+              or exists (select 1 from import_archives a where a.id = f.target_id)
+            ))
+          )
+        order by f.created_at limit 1
+        """,
+        (file_hash,),
+    ).fetchone()
+
+
+def prune_orphan_import_fingerprints(conn):
+    conn.execute(
+        """
+        delete from import_row_fingerprints
+        where not (
+          (target_type = 'asset' and exists (select 1 from assets a where a.id = import_row_fingerprints.target_id))
+          or (target_type = 'record' and exists (select 1 from records r where r.id = import_row_fingerprints.target_id))
+          or (target_type = 'file' and (
+            exists (select 1 from import_archives a where a.id = import_row_fingerprints.archive_id)
+            or exists (select 1 from import_archives a where a.id = import_row_fingerprints.target_id)
+          ))
+        )
+        """
+    )
+
+
+def import_file_marker(conn, file_hash):
+    if not file_hash:
+        return None
+    prune_orphan_import_fingerprints(conn)
+    return conn.execute(
+        """
+        select f.*, a.file_type, a.result_json
+        from import_row_fingerprints f
+        left join import_archives a on a.id = f.archive_id
+        where f.file_hash = ? and f.target_type = 'file'
+        order by f.created_at desc, f.id desc
+        limit 1
+        """,
+        (file_hash,),
+    ).fetchone()
+
+
+def word_file_retry_allowed(conn, file_hash):
+    marker = import_file_marker(conn, file_hash)
+    if not marker or marker["file_type"] != "docx":
+        return False
+    try:
+        result = json.loads(marker["result_json"] or "{}")
+    except json.JSONDecodeError:
+        return False
+    skipped_count = len(result.get("skipped") or [])
+    return bool(result.get("paperCreated")) or skipped_count > 0 or int(result.get("imported") or 0) == 0
+
+
+def register_import_file(conn, file_hash, file_name, category, actor_id, archive_id=""):
+    if not file_hash:
+        return
+    register_import_row(
+        conn,
+        file_hash,
+        sha256_hex(f"file:{file_hash}"),
+        file_name,
+        0,
+        "file",
+        archive_id,
+        f"archived:{category or 'import'}",
+        actor_id,
+        archive_id,
+    )
+
+
+def tag_import_rows_with_archive(conn, file_hash, archive_id):
+    if not file_hash or not archive_id:
+        return
+    conn.execute(
+        """
+        update import_row_fingerprints
+        set archive_id = ?
+        where file_hash = ? and (archive_id is null or archive_id = '')
+        """,
+        (archive_id, file_hash),
+    )
+
+
+def ensure_import_result_stats(result):
+    result.setdefault("imported", 0)
+    result.setdefault("createdAssets", 0)
+    result.setdefault("existingAssets", 0)
+    result.setdefault("updatedAssets", 0)
+    result.setdefault("processedRows", int(result.get("imported") or 0) + int(result.get("existingAssets") or 0))
+    result.setdefault("duplicateRows", 0)
+    result.setdefault("duplicateFiles", 0)
+    result.setdefault("paperCreated", 0)
+    result.setdefault("skipped", [])
+    return result
+
+
+def attach_import_archive(conn, actor, file_name, content, file_type, category, result, file_hash=""):
+    ensure_import_result_stats(result)
+    archive_id = save_import_archive(conn, actor, file_name, file_type, category, content, result)
+    result["archiveId"] = archive_id
+    register_import_file(conn, file_hash, file_name, category, actor["id"], archive_id)
+    tag_import_rows_with_archive(conn, file_hash, archive_id)
+    return archive_id
+
+
 def cell_text(cell, shared_strings):
     cell_type = cell.attrib.get("t")
     value = cell.find("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v")
@@ -2040,7 +2318,7 @@ def cell_index(cell):
 
 
 def parse_xlsx(content):
-    rows = []
+    parsed_rows = []
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         shared_strings = []
         if "xl/sharedStrings.xml" in archive.namelist():
@@ -2048,20 +2326,30 @@ def parse_xlsx(content):
             for item in root.findall("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si"):
                 texts = [node.text or "" for node in item.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")]
                 shared_strings.append("".join(texts).strip())
-        sheet_name = "xl/worksheets/sheet1.xml"
-        root = ElementTree.fromstring(archive.read(sheet_name))
-        for row in root.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row"):
-            values = []
-            for cell in row.findall("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"):
-                index = cell_index(cell)
-                if index is None:
-                    index = len(values)
-                while len(values) <= index:
-                    values.append("")
-                values[index] = cell_text(cell, shared_strings)
-            if any(values):
-                rows.append(values)
-    return table_to_dicts(rows)
+        sheet_names = sorted(
+            (name for name in archive.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)),
+            key=lambda name: int(re.search(r"sheet(\d+)\.xml", name).group(1)),
+        )
+        for sheet_name in sheet_names:
+            parsed_rows.extend(table_to_dicts(xlsx_sheet_rows(archive, sheet_name, shared_strings)))
+    return parsed_rows
+
+
+def xlsx_sheet_rows(archive, sheet_name, shared_strings):
+    rows = []
+    root = ElementTree.fromstring(archive.read(sheet_name))
+    for row in root.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row"):
+        values = []
+        for cell in row.findall("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"):
+            index = cell_index(cell)
+            if index is None:
+                index = len(values)
+            while len(values) <= index:
+                values.append("")
+            values[index] = cell_text(cell, shared_strings)
+        if any(values):
+            rows.append(values)
+    return rows
 
 
 def parse_csv(content):
@@ -2092,8 +2380,14 @@ def parse_docx(content):
             for row in table.findall(".//w:tr", ns):
                 values = []
                 for cell in row.findall(".//w:tc", ns):
-                    texts = [node.text or "" for node in cell.findall(".//w:t", ns)]
-                    values.append(clean_docx_text("".join(texts)))
+                    cell_lines = []
+                    for paragraph in cell.findall(".//w:p", ns):
+                        line = "".join(node.text or "" for node in paragraph.findall(".//w:t", ns)).strip()
+                        if line:
+                            cell_lines.append(line)
+                    if not cell_lines:
+                        cell_lines = ["".join(node.text or "" for node in cell.findall(".//w:t", ns))]
+                    values.append(clean_docx_text(" ".join(cell_lines)))
                 if any(values):
                     table_rows.append(values)
                     current_table.append(values)
@@ -2130,9 +2424,15 @@ INVALID_FIELD_VALUES = {
     "预计归还时间",
     "归还日期",
     "备注",
+    "申请缘由",
     "审核",
     "负责人审核",
     "项目负责人审核",
+    "资产管理负责人审核",
+    "领用人确认领用签名",
+    "领用人确认归还签名",
+    "资产管理负责人确认归还签名",
+    "确认归还签名",
 }
 
 
@@ -2154,6 +2454,8 @@ def is_template_noise_row(*values):
 def clean_person_value(value):
     text = clean_docx_text(value).strip(":： ")
     if is_invalid_field_value(text):
+        return ""
+    if any(label in text for label in ("签名", "审核", "确认", "日期")):
         return ""
     if len(text) > 20:
         return ""
@@ -2177,8 +2479,9 @@ def value_after_time_label(text, label):
         match = re.search(rf"{re.escape(label)}[:：]?[ \t]*([^，。；;]*)", clean)
         if match:
             value = clean_docx_text(match.group(1))
-            if not is_invalid_field_value(value):
-                return value
+            normalized = normalize_time(value)
+            if normalized:
+                return normalized
     return ""
 
 
@@ -2204,10 +2507,23 @@ def table_label_value(parsed, *labels):
 
 def document_time_value(parsed, *labels):
     full_text = parsed.get("text", "")
-    return (
-        table_label_value(parsed, *labels)
-        or next((value_after_time_label(full_text, label) for label in labels if value_after_time_label(full_text, label)), "")
-    )
+    table_value = table_label_value(parsed, *labels)
+    normalized = normalize_time(table_value)
+    if normalized:
+        return normalized
+    return next((value_after_time_label(full_text, label) for label in labels if value_after_time_label(full_text, label)), "")
+
+
+def extract_asset_codes(value):
+    text = clean_docx_text(value)
+    codes = re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+", text)
+    if codes:
+        return codes
+    return [text] if text else []
+
+
+def append_import_note(note, value):
+    return append_unique_note(note, value) if value else note
 
 
 def clean_doc_no(value):
@@ -2242,6 +2558,39 @@ def parse_requisition_docx(parsed):
     default_receive_time = document_time_value(parsed, "领用时间", "领用日期", "出库时间", "出库日期", "借出时间", "借出日期", "申请日期")
     default_return_time = document_time_value(parsed, "预计归还时间", "预期归还日期", "预计归还日期", "归还日期")
     rows = []
+
+    def add_requisition_row(sequence, name, code, config, quantity, receiver, receive_time, return_time, category, row_remark):
+        note = "；".join(
+            item
+            for item in (
+                f"单据类型：{document_type}",
+                "Word领用单导入",
+                f"负责人：{owner}" if owner else "",
+                f"出借人：{receiver}" if receiver else "",
+                f"申请人：{applicant}" if applicant and applicant != receiver else "",
+                row_remark if row_remark and not is_invalid_field_value(row_remark) else "",
+            )
+            if item
+        )
+        if not receive_time:
+            note = append_import_note(note, "原单未填写领用日期")
+        rows.append(
+            {
+                "资产名称": name,
+                "资产编号": code,
+                "模板序号": sequence,
+                "规格型号": config,
+                "数量": quantity or "1",
+                "借用人": receiver,
+                "出库时间": receive_time,
+                "归还时间": return_time,
+                "类别": category or ("耗材" if document_type == "耗材领用" else "资产"),
+                "纸质单号": doc_no,
+                "备注": note,
+                "类型": "出库",
+            }
+        )
+
     for table in parsed["tables"]:
         header_index = None
         headers = []
@@ -2266,44 +2615,35 @@ def parse_requisition_docx(parsed):
             return_time = get("预计归还时间", "预期归还日期", "预计归还日期", "归还日期") or default_return_time
             row_remark = get("备注")
             category = get("类别") or detect_category("".join(row))
-            invalid_item_names = {"领用日期", "归还日期", "备注", "项目负责人审核", "负责人审核", "审核", "申请人", "申领人", "序号"}
-            if field_key(name) in {field_key(item) for item in invalid_item_names}:
+            invalid_item_names = {"领用日期", "归还日期", "备注", "项目负责人审核", "负责人审核", "审核", "申请人", "申领人", "序号", "申请缘由"}
+            invalid_item_keys = {field_key(item) for item in invalid_item_names}
+            if field_key(name) in invalid_item_keys or field_key(sequence) in invalid_item_keys:
                 continue
             if is_template_noise_row(sequence, name, code, config, quantity, receive_time, return_time):
                 continue
             if not name and is_invalid_field_value(code):
                 continue
-            if not any([name, code, config, receive_time, return_time]):
+            if not any([name, code, config, quantity, receive_time, return_time]):
                 continue
             if not name:
                 continue
-            rows.append(
-                {
-                    "资产名称": name,
-                    "资产编号": code,
-                    "模板序号": sequence,
-                    "规格型号": config,
-                    "数量": quantity or "1",
-                    "借用人": receiver,
-                    "出库时间": receive_time,
-                    "归还时间": return_time,
-                    "类别": category or ("耗材" if document_type == "耗材领用" else "资产"),
-                    "纸质单号": doc_no,
-                    "备注": "；".join(
-                        item
-                        for item in (
-                            f"单据类型：{document_type}",
-                            "Word领用单导入",
-                            f"负责人：{owner}" if owner else "",
-                            f"出借人：{receiver}" if receiver else "",
-                            f"申请人：{applicant}" if applicant and applicant != receiver else "",
-                            row_remark if row_remark and not is_invalid_field_value(row_remark) else "",
-                        )
-                        if item
-                    ),
-                    "类型": "出库",
-                }
-            )
+            codes = extract_asset_codes(code)
+            if len(codes) > 1:
+                for code_index, item_code in enumerate(codes, start=1):
+                    add_requisition_row(
+                        f"{sequence}.{code_index}" if sequence else str(code_index),
+                        name,
+                        item_code,
+                        config,
+                        "1",
+                        receiver,
+                        receive_time,
+                        return_time,
+                        category,
+                        row_remark,
+                    )
+            else:
+                add_requisition_row(sequence, name, code, config, quantity, receiver, receive_time, return_time, category, row_remark)
     return rows
 
 
@@ -2348,14 +2688,83 @@ def is_blank_requisition_template(parsed):
     return False
 
 
+FIELD_ALIASES = {
+    "资产编号": ("资产编码", "资产代码", "固定资产编号", "国资编号", "资产条码", "条码", "编号", "asset_code", "code", "__synthetic_asset_code"),
+    "资产名称": ("名称", "物品名称", "设备名称", "耗材名称", "品名", "产品名称", "asset_name", "name"),
+    "规格型号": ("规格", "型号", "配置", "规格/型号", "规格型号配置", "spec", "model"),
+    "资产分类": ("分类", "类别", "资产类别", "物品类别", "category"),
+    "数量": ("件数", "库存数量", "领用数量", "qty", "quantity"),
+    "单位": ("计量单位", "unit"),
+    "单价": ("价格", "资产原值", "资产原值（元）", "资产原值(元)", "原值", "金额", "unit_price"),
+    "总金额": ("总价", "合计", "合计金额", "总计", "total_amount"),
+    "取得日期": ("购置日期", "购买日期", "采购日期", "入账日期", "入库日期", "日期", "purchase_date"),
+    "部门": ("使用部门", "所属部门", "当前部门", "领用部门", "department"),
+    "具体存放地点": ("更新后的具体存放地点", "存放地点", "当前位置", "位置", "地点", "location"),
+    "使用人": ("责任人", "保管人", "借用人", "领用人", "申领人", "姓名", "当前使用人", "user", "name"),
+    "清查盘点情况": ("盘点情况", "盘点结果", "清查情况", "清查盘点"),
+    "清查盘盈情况": ("盘盈情况", "盘盈结果", "清查盘盈"),
+    "出入库取用情况": ("出入库取用情况（记录取用日期）", "取用情况", "领用情况", "借用情况"),
+    "入库时间": ("入库日期", "取得日期", "in_time"),
+    "出库时间": ("借出时间", "领用时间", "领用日期", "out_time"),
+    "纸质单号": ("单号", "单据编号", "纸质编号", "paper_no"),
+    "备注": ("说明", "用途", "note"),
+}
+
+
+def normalize_header_key(value):
+    text = field_key(value).strip(":：")
+    return re.sub(r"[（）()\[\]【】<>《》:：,，、/\\|_\-]", "", text).lower()
+
+
+def aliases_for_field(name):
+    aliases = [name]
+    key = field_key(name).strip(":：")
+    aliases.extend(FIELD_ALIASES.get(key, ()))
+    normalized = normalize_header_key(name)
+    for canonical, values in FIELD_ALIASES.items():
+        if normalize_header_key(canonical) == normalized or normalized in {normalize_header_key(item) for item in values}:
+            aliases.append(canonical)
+            aliases.extend(values)
+    result = []
+    seen = set()
+    for alias in aliases:
+        alias_key = normalize_header_key(alias)
+        if alias_key and alias_key not in seen:
+            result.append(alias)
+            seen.add(alias_key)
+    return result
+
+
+def header_matches_alias(header, alias):
+    header_key = normalize_header_key(header)
+    alias_key = normalize_header_key(alias)
+    if not header_key or not alias_key:
+        return False
+    if header_key == alias_key:
+        return True
+    # Long aliases safely cover headers with prefixes/suffixes, such as "4月12日清查盘点情况".
+    return len(alias_key) >= 4 and (alias_key in header_key or header_key in alias_key)
+
+
+def header_matches_field(header, field_name):
+    return any(header_matches_alias(header, alias) for alias in aliases_for_field(field_name))
+
+
+def table_header_score(row):
+    marker_fields = ("资产编号", "资产名称", "规格型号", "资产分类", "数量", "部门", "具体存放地点", "资产原值", "取得日期")
+    score = 0
+    for field_name in marker_fields:
+        if any(header_matches_field(cell, field_name) for cell in row):
+            score += 1
+    return score
+
+
 def table_to_dicts(rows):
     if not rows:
         return []
     header_index = 0
-    header_markers = {"资产编号", "资产名称", "规格型号", "资产分类", "数量", "部门"}
-    for index, row in enumerate(rows[:20]):
-        normalized = {str(item).strip() for item in row}
-        if len(header_markers.intersection(normalized)) >= 2:
+    for index, row in enumerate(rows[:30]):
+        if table_header_score(row) >= 2:
             header_index = index
             break
     headers = [str(item).strip().replace("\n", "") for item in rows[header_index]]
@@ -2371,9 +2780,16 @@ def table_to_dicts(rows):
 
 
 def first_value(row, names):
+    if not isinstance(row, dict):
+        return ""
     for name in names:
-        if row.get(name):
-            return row[name].strip()
+        for alias in aliases_for_field(name):
+            direct = row.get(alias)
+            if direct:
+                return str(direct).strip()
+            for header, value in row.items():
+                if value and header_matches_alias(header, alias):
+                    return str(value).strip()
     return ""
 
 
@@ -2411,14 +2827,14 @@ def normalize_time(value):
     return text[:16]
 
 
-def find_asset(conn, row):
+def find_asset(conn, row, allow_name_match=True):
     code = first_value(row, ("资产编号", "资产编码", "编号", "资产代码", "asset_code", "code"))
     name = first_value(row, ("资产名称", "名称", "物品名称", "asset_name", "name"))
     if code:
         asset = conn.execute("select * from assets where code = ?", (code,)).fetchone()
         if asset:
             return asset
-    if name:
+    if allow_name_match and name:
         return conn.execute("select * from assets where name = ?", (name,)).fetchone()
     return None
 
@@ -2433,8 +2849,92 @@ def number_value(value, default=1):
     return int(float(match.group(0)))
 
 
-def ensure_asset(conn, row, actor):
-    asset = find_asset(conn, row)
+def import_asset_values(conn, row, actor):
+    code = first_value(row, ("资产编号", "资产编码", "编号", "资产代码", "asset_code", "code"))
+    name = first_value(row, ("资产名称", "名称", "物品名称", "asset_name", "name"))
+    category = first_value(row, ("资产分类", "分类", "类别", "category")) or "未分类"
+    spec = first_value(row, ("规格型号", "规格", "型号", "spec"))
+    quantity = safe_asset_quantity(row, default=1)
+    unit_price = money_value(first_value(row, ("单价", "价格", "资产原值", "资产原值（元）", "资产原值(元)")), 0)
+    total_amount = money_value(first_value(row, ("总金额", "金额", "合计金额")), 0) or unit_price * quantity
+    location = first_value(row, ("更新后的具体存放地点", "具体存放地点", "存放地点", "位置", "location"))
+    department = first_value(row, ("部门", "使用部门", "department")) or actor["department"]
+    ensure_department(conn, department)
+    use_user_name = first_value(row, ("使用人", "责任人", "保管人", "借用人", "姓名"))
+    keeper = conn.execute("select * from users where name = ? and active = 1", (use_user_name,)).fetchone() if use_user_name else None
+    if not keeper:
+        keeper = conn.execute("select * from users where department = ? and active = 1 order by role desc, name limit 1", (department,)).fetchone()
+    keeper_id = keeper["id"] if keeper else actor["id"]
+    remark_parts = []
+    sequence = first_value(row, ("模板序号", "序号"))
+    if sequence:
+        remark_parts.append(f"模板序号：{sequence}")
+    paper_no = first_value(row, ("纸质单号", "单号", "paper_no"))
+    if paper_no:
+        remark_parts.append(f"单号：{paper_no}")
+    inbound_date = clean_date_text(first_value(row, ("入库日期", "入库时间", "取得日期")))
+    purchase_date = clean_date_text(first_value(row, ("购置日期", "购买日期", "采购日期", "取得日期")))
+    return {
+        "code": code,
+        "name": name,
+        "category": category,
+        "spec": spec,
+        "quantity": quantity,
+        "brand": first_value(row, ("品牌", "brand")),
+        "unit": first_value(row, ("单位", "unit")) or "件",
+        "unit_price": unit_price,
+        "total_amount": total_amount,
+        "purchase_date": purchase_date,
+        "inbound_date": inbound_date,
+        "supplier": first_value(row, ("供应商", "供货商", "supplier")),
+        "use_department": department,
+        "use_user_id": keeper_id,
+        "source": first_value(row, ("资产来源", "来源", "source")),
+        "location": location,
+        "keeper_id": keeper_id,
+        "remark": "；".join(remark_parts),
+    }
+
+
+def incremental_update_asset_from_row(conn, asset, row, actor, source_type="", source_id="", file_name=""):
+    values = import_asset_values(conn, row, actor)
+    updates = {}
+    for key in ("name", "category", "spec", "brand", "unit", "supplier", "use_department", "use_user_id", "source", "location", "keeper_id"):
+        value = values.get(key)
+        if value and str(asset[key] or "") != str(value):
+            updates[key] = value
+    for key in ("quantity", "unit_price", "total_amount"):
+        value = values.get(key)
+        if value not in ("", None) and float(asset[key] or 0) != float(value or 0):
+            updates[key] = value
+    for key in ("purchase_date", "inbound_date"):
+        value = values.get(key)
+        if value and str(asset[key] or "") != str(value):
+            updates[key] = value
+    remark = values.get("remark")
+    if file_name:
+        remark = append_unique_note(remark, f"导入文件：{file_name}")
+    if remark:
+        merged = append_unique_note(asset["remark"], remark)
+        if merged != (asset["remark"] or ""):
+            updates["remark"] = merged
+    if not updates:
+        return asset, False
+    updated = update_asset_fields(
+        conn,
+        asset["id"],
+        updates,
+        actor["id"],
+        "incremental_import",
+        source_type=source_type,
+        source_id=source_id,
+        note=f"增量导入更新：{file_name}" if file_name else "增量导入更新",
+    )
+    return updated, True
+
+
+def ensure_asset(conn, row, actor, allow_name_match=True):
+    asset = find_asset(conn, row, allow_name_match=allow_name_match)
     if asset:
         return asset, False
     code = first_value(row, ("资产编号", "资产编码", "编号", "资产代码", "asset_code", "code"))
@@ -2566,24 +3066,52 @@ def ensure_import_user(conn, row, actor):
     return conn.execute("select * from users where id = ?", (user_id,)).fetchone()
 
 
-def import_records_from_rows(conn, actor, rows, default_type="", allowed_type="", create_missing_assets=False, create_missing_users=False):
+def import_records_from_rows(conn, actor, rows, default_type="", allowed_type="", create_missing_assets=False, create_missing_users=False, file_hash="", file_name="", row_scope=""):
     imported = 0
     created_assets = 0
+    existing_assets = 0
+    updated_assets = 0
+    duplicate_rows = 0
     record_ids = []
     skipped = []
+    ledger_increment = create_missing_assets and (normalize_record_type(allowed_type) == "入库" or normalize_record_type(default_type) == "入库")
     for index, row in enumerate(rows, start=2):
+        row_hash = import_row_hash(row, row_scope or allowed_type or default_type or "records")
+        previous_row = imported_row(conn, row_hash)
+        if previous_row:
+            duplicate_rows += 1
+            continue
+        row = dict(row)
+        source_row_code = first_value(row, ("资产编号", "资产编码", "编号", "资产代码", "asset_code", "code"))
+        if ledger_increment and not source_row_code:
+            seed = f"{file_hash or 'file'}:{index}:{row_hash}"
+            row["__synthetic_asset_code"] = f"IMPORT-{sha256_hex(seed)[:12].upper()}"
         row_code = first_value(row, ("资产编号", "资产编码", "编号", "资产代码", "asset_code", "code"))
         row_name = first_value(row, ("资产名称", "名称", "物品名称", "asset_name", "name"))
         row_department = first_value(row, ("部门", "使用部门", "department"))
+        record_type = allowed_type or normalize_record_type(first_value(row, ("类型", "出入库类型", "操作类型", "type"))) or default_type
+        allow_name_match = not ledger_increment and not (create_missing_assets and normalize_record_type(record_type) == "出库")
         if create_missing_assets:
-            asset, created = ensure_asset(conn, row, actor)
-            if created:
-                created_assets += 1
+            existing_asset = find_asset(conn, row, allow_name_match=allow_name_match)
+            if existing_asset and ledger_increment:
+                existing_assets += 1
+                asset, updated = incremental_update_asset_from_row(conn, existing_asset, row, actor, source_type="import_row", source_id=row_hash, file_name=file_name)
+                if updated:
+                    updated_assets += 1
+                    register_import_row(conn, file_hash, row_hash, file_name, index, "asset", asset["id"], "updated", actor["id"])
+                else:
+                    register_import_row(conn, file_hash, row_hash, file_name, index, "asset", asset["id"], "existing", actor["id"])
+                continue
+            if existing_asset:
+                asset = existing_asset
+            else:
+                asset, created = ensure_asset(conn, row, actor, allow_name_match=allow_name_match)
+                if created:
+                    created_assets += 1
         else:
             asset = find_asset(conn, row)
         ensure_department(conn, row_department)
         user = ensure_import_user(conn, row, actor) if create_missing_users else find_user(conn, row)
-        record_type = allowed_type or normalize_record_type(first_value(row, ("类型", "出入库类型", "操作类型", "type"))) or default_type
         if not asset:
             skipped.append({"row": index, "reason": f"找不到资产，请检查资产编号或资产名称；解析到编号：{row_code or '-'}，名称：{row_name or '-'}"})
             continue
@@ -2631,7 +3159,8 @@ def import_records_from_rows(conn, actor, rows, default_type="", allowed_type=""
             record_note,
         )
         if duplicate_id:
-            skipped.append({"row": index, "reason": "同一资产、单号和时间的出入库记录已存在，已跳过重复导入"})
+            duplicate_rows += 1
+            register_import_row(conn, file_hash, row_hash, file_name, index, "record", duplicate_id, "duplicate", actor["id"])
             continue
         record_id = new_id("record")
         conn.execute(
@@ -2673,7 +3202,18 @@ def import_records_from_rows(conn, actor, rows, default_type="", allowed_type=""
             conn.execute("delete from records where id = ?", (record_id,))
             continue
         imported += 1
-    return {"imported": imported, "createdAssets": created_assets, "skipped": skipped, "_recordIds": record_ids}
+        register_import_row(conn, file_hash, row_hash, file_name, index, "record", record_id, "imported", actor["id"])
+    return {
+        "imported": imported,
+        "createdAssets": created_assets,
+        "existingAssets": existing_assets,
+        "updatedAssets": updated_assets,
+        "processedRows": imported + existing_assets,
+        "duplicateRows": duplicate_rows,
+        "duplicateFiles": 0,
+        "skipped": skipped,
+        "_recordIds": record_ids,
+    }
 
 
 def tag_records_with_archive(conn, record_ids, file_name, archive_id):
@@ -2691,38 +3231,94 @@ def tag_records_with_archive(conn, record_ids, file_name, archive_id):
 
 def import_records(conn, actor, file_name, content, default_type="", allowed_type=""):
     lower_name = file_name.lower()
+    file_hash = sha256_hex(content)
     rows = parse_xlsx(content) if lower_name.endswith(".xlsx") else parse_csv(content)
-    result = import_records_from_rows(conn, actor, rows, default_type=default_type, allowed_type=allowed_type, create_missing_assets=allowed_type == "入库")
-    result["archiveId"] = save_import_archive(conn, actor, file_name, "xlsx" if lower_name.endswith(".xlsx") else "csv", allowed_type or "出入库", content, result)
-    add_audit(conn, actor["id"], "批量导入出入库", f"{file_name} 导入 {result['imported']} 条，新建资产 {result.get('createdAssets', 0)} 个，跳过 {len(result['skipped'])} 条")
+    seen_file = import_file_seen(conn, file_hash)
+    if seen_file:
+        return ensure_import_result_stats({
+            "imported": 0,
+            "createdAssets": 0,
+            "existingAssets": 0,
+            "updatedAssets": 0,
+            "processedRows": len(rows),
+            "duplicateRows": len(rows),
+            "duplicateFiles": 1,
+            "skipped": [],
+            "_recordIds": [],
+            "message": f"已识别为重复文件：此前已导入 {seen_file['file_name']}。本次只做防重识别，未重复写入台账或流水。",
+        })
+    create_missing_assets = normalize_record_type(allowed_type) == "入库" or normalize_record_type(default_type) == "入库"
+    result = import_records_from_rows(
+        conn,
+        actor,
+        rows,
+        default_type=default_type,
+        allowed_type=allowed_type,
+        create_missing_assets=create_missing_assets,
+        file_hash=file_hash,
+        file_name=file_name,
+    )
+    attach_import_archive(
+        conn,
+        actor,
+        file_name,
+        content,
+        "xlsx" if lower_name.endswith(".xlsx") else "csv",
+        allowed_type or "出入库",
+        result,
+        file_hash,
+    )
+    add_audit(
+        conn,
+        actor["id"],
+        "批量导入出入库",
+        f"{file_name} 导入 {result['imported']} 条，新建资产 {result.get('createdAssets', 0)} 个，更新 {result.get('updatedAssets', 0)} 个，重复 {result.get('duplicateRows', 0)} 条，跳过 {len(result['skipped'])} 条",
+    )
     return result
 
 
 def import_word_checkout(conn, actor, file_name, content):
+    file_hash = sha256_hex(content)
+    seen_file = import_file_seen(conn, file_hash)
+    if seen_file and not word_file_retry_allowed(conn, file_hash):
+        return ensure_import_result_stats({
+            "processedRows": 0,
+            "duplicateFiles": 1,
+            "skipped": [],
+            "_recordIds": [],
+            "message": f"已识别为重复 Word 文件：此前已导入 {seen_file['file_name']}。本次未再次生成出借流水或待复核单。",
+        })
     parsed = parse_docx(content)
     requisition_rows = parse_requisition_docx(parsed)
     if requisition_rows:
-        timed_requisition_rows = [row for row in requisition_rows if row_record_time(row)]
-        if not timed_requisition_rows:
-            result = {"imported": 0, "createdAssets": 0, "skipped": [{"row": "-", "reason": "Word 单据未填写领用/出库日期，已转入待复核"}], "paperCreated": 0, "message": "Word 单据缺少领用/出库日期，未自动生成出库流水"}
-            result["archiveId"] = save_import_archive(conn, actor, file_name, "docx", "缺少日期的领用申请Word", content, result)
-            add_audit(conn, actor["id"], "忽略缺少日期的Word领用申请", file_name)
-            return {**result, "paperCreated": 0}
-        result = import_records_from_rows(conn, actor, timed_requisition_rows, default_type="出库", allowed_type="出库", create_missing_assets=True, create_missing_users=True)
-        result["archiveId"] = save_import_archive(conn, actor, file_name, "docx", "领用申请Word", content, result)
+        fallback_time = now_local()
+        missing_time_count = 0
+        rows_to_import = []
+        for row in requisition_rows:
+            item = dict(row)
+            if not row_record_time(item):
+                missing_time_count += 1
+                item["出库时间"] = fallback_time
+                item["备注"] = append_import_note(item.get("备注", ""), f"原单未填写领用日期，按导入时间 {fallback_time} 生成流水")
+            rows_to_import.append(item)
+        result = import_records_from_rows(conn, actor, rows_to_import, default_type="出库", allowed_type="出库", create_missing_assets=True, create_missing_users=True, file_hash=file_hash, file_name=file_name, row_scope="word-checkout-v116")
+        attach_import_archive(conn, actor, file_name, content, "docx", "领用申请Word", result, file_hash)
         tag_records_with_archive(conn, result.get("_recordIds", []), file_name, result["archiveId"])
         add_audit(conn, actor["id"], "识别Word领用申请", f"{file_name} 识别并导入 {result['imported']} 条，跳过 {len(result['skipped'])} 条")
-        return {**result, "paperCreated": 0, "message": "已识别耗材/物品领用申请模板并导入出借记录"}
+        message = "已识别耗材/物品领用申请模板并导入出借记录"
+        if missing_time_count:
+            message += f"；{missing_time_count} 条原单未填写领用日期，已按导入时间生成流水"
+        return {**result, "paperCreated": 0, "message": message}
     if is_blank_requisition_template(parsed):
         result = {"imported": 0, "createdAssets": 0, "skipped": [], "paperCreated": 0, "message": "识别为空白领用申请模板，已忽略，不计入跳过"}
-        result["archiveId"] = save_import_archive(conn, actor, file_name, "docx", "空白领用模板", content, result)
+        attach_import_archive(conn, actor, file_name, content, "docx", "空白领用模板", result, file_hash)
         add_audit(conn, actor["id"], "忽略空白Word模板", file_name)
         return result
     if parsed["rows"]:
         timed_rows = [row for row in parsed["rows"] if row_record_time(row)]
         if timed_rows:
-            result = import_records_from_rows(conn, actor, timed_rows, default_type="出库", allowed_type="出库")
-            result["archiveId"] = save_import_archive(conn, actor, file_name, "docx", "出库/出借Word", content, result)
+            result = import_records_from_rows(conn, actor, timed_rows, default_type="出库", allowed_type="出库", file_hash=file_hash, file_name=file_name, row_scope="word-table-v116")
+            attach_import_archive(conn, actor, file_name, content, "docx", "出库/出借Word", result, file_hash)
             tag_records_with_archive(conn, result.get("_recordIds", []), file_name, result["archiveId"])
             add_audit(conn, actor["id"], "导入Word出借记录", f"{file_name} 自动导入 {result['imported']} 条，跳过 {len(result['skipped'])} 条")
             return {**result, "paperCreated": 0, "message": "Word 表格文字已按出借记录导入"}
@@ -2737,7 +3333,7 @@ def import_word_checkout(conn, actor, file_name, content):
         (new_id("paper"), file_name, "Word手写出借单", actor["id"], "待复核", summary),
     )
     result = {"imported": 0, "skipped": [], "paperCreated": 1, "message": "Word 文档已进入纸质单据待复核队列"}
-    result["archiveId"] = save_import_archive(conn, actor, file_name, "docx", "出库/出借Word", content, result)
+    attach_import_archive(conn, actor, file_name, content, "docx", "出库/出借Word", result, file_hash)
     add_audit(conn, actor["id"], "导入Word手写出借单", f"{file_name} 已进入待复核队列")
     return result
 
@@ -2774,6 +3370,7 @@ def get_state(conn, user, view_role=""):
     departments = rows_to_list(conn.execute("select name from departments where active = 1 order by name"))
     asset_categories = rows_to_list(conn.execute("select * from asset_categories where active = 1 order by category_type, parent_id, name"))
     locations = rows_to_list(conn.execute("select * from locations where active = 1 order by name"))
+    device_group_rules = rows_to_list(conn.execute("select * from device_group_rules where active = 1 order by group_name, source_key"))
     multi_department = setting_value(conn, "multi_department_enabled", "0")
     developer_mode = setting_value(conn, "developer_mode_enabled", "0")
     admin_prefill = setting_value(conn, "admin_prefill_enabled", "0")
@@ -2975,6 +3572,7 @@ def get_state(conn, user, view_role=""):
             "assetCategories": [item["name"] for item in asset_categories],
             "assetCategoryItems": asset_categories,
             "locations": locations,
+            "deviceGroupRules": [normalize_device_group_rule(item) for item in device_group_rules],
             "multiDepartmentEnabled": bool(int(multi_department)),
             "developerModeEnabled": bool(int(developer_mode)),
             "adminPrefillEnabled": bool(int(admin_prefill)),
@@ -3003,6 +3601,17 @@ def normalize_asset(item):
     data["useDepartment"] = data.pop("use_department", "")
     data["useUserId"] = data.pop("use_user_id", "")
     data["creatorId"] = data.pop("creator_id", "")
+    data["createdAt"] = data.pop("created_at", "")
+    data["updatedAt"] = data.pop("updated_at", "")
+    return data
+
+
+def normalize_device_group_rule(item):
+    data = dict(item)
+    data["sourceKey"] = data.pop("source_key", "")
+    data["groupName"] = data.pop("group_name", "")
+    data["familyId"] = data.pop("family_id", "")
+    data["createdBy"] = data.pop("created_by", "")
     data["createdAt"] = data.pop("created_at", "")
     data["updatedAt"] = data.pop("updated_at", "")
     return data
@@ -3091,6 +3700,9 @@ def normalize_purchase_wish(item):
     data = dict(item)
     data["userId"] = data.pop("user_id")
     data["itemName"] = data.pop("item_name")
+    data["unitPrice"] = data.pop("unit_price", 0)
+    data["totalAmount"] = data.pop("total_amount", 0)
+    data["itemType"] = data.pop("item_type", "")
     data["expectedTime"] = data.pop("expected_time")
     data["createdAt"] = data.pop("created_at")
     data["handledBy"] = data.pop("handled_by", None)
@@ -3260,6 +3872,115 @@ def send_csv(handler, file_name, headers, rows):
     handler.send_binary(200, safe_download_name(file_name), "text/csv; charset=utf-8", csv_bytes(headers, rows))
 
 
+def xml_escape(value):
+    return (
+        str(value if value is not None else "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def column_name(index):
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def xlsx_bytes(headers, rows, sheet_name="Sheet1"):
+    def cell_xml(row_index, col_index, value, header=False):
+        ref = f"{column_name(col_index)}{row_index}"
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f'<c r="{ref}" s="{1 if header else 0}"><v>{value}</v></c>'
+        return f'<c r="{ref}" t="inlineStr" s="{1 if header else 0}"><is><t>{xml_escape(value)}</t></is></c>'
+
+    sheet_rows = []
+    sheet_rows.append(
+        f'<row r="1">{"".join(cell_xml(1, index, header, True) for index, header in enumerate(headers, start=1))}</row>'
+    )
+    for row_index, row in enumerate(rows, start=2):
+        sheet_rows.append(
+            f'<row r="{row_index}">{"".join(cell_xml(row_index, index, value) for index, value in enumerate(row, start=1))}</row>'
+        )
+    widths = "".join(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index, width in enumerate((24, 36, 10, 10, 12, 12, 18, 42), start=1))
+    sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <cols>{widths}</cols>
+  <sheetData>{"".join(sheet_rows)}</sheetData>
+</worksheet>'''
+    workbook_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="{xml_escape(sheet_name)[:31] or "Sheet1"}" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2"><font><sz val="11"/><name val="Microsoft YaHei"/></font><font><b/><sz val="11"/><name val="Microsoft YaHei"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0"/></cellXfs>
+</styleSheet>'''
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>''')
+        archive.writestr("_rels/.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>''')
+        archive.writestr("xl/_rels/workbook.xml.rels", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>''')
+        archive.writestr("xl/workbook.xml", workbook_xml)
+        archive.writestr("xl/styles.xml", styles_xml)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return output.getvalue()
+
+
+def send_xlsx(handler, file_name, headers, rows, sheet_name="Sheet1"):
+    handler.send_binary(
+        200,
+        safe_download_name(file_name),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        xlsx_bytes(headers, rows, sheet_name),
+    )
+
+
+def purchase_wish_export_rows(conn, user):
+    headers = ["名称", "技术参数", "单位", "数量", "单价", "总价", "品目", "备注"]
+    if has_permission(conn, user, "purchase_wishes.manage"):
+        wishes = rows_to_list(conn.execute("select * from purchase_wishes order by created_at desc, id desc"))
+    else:
+        wishes = rows_to_list(conn.execute("select * from purchase_wishes where user_id = ? order by created_at desc, id desc", (user["id"],)))
+    rows = []
+    for item in wishes:
+        unit_price = float(item["unit_price"] or 0)
+        quantity = int(item["quantity"] or 0)
+        total_amount = float(item["total_amount"] or 0) or unit_price * quantity
+        rows.append([
+            item["item_name"],
+            item["spec"],
+            item["unit"] or "件",
+            quantity,
+            unit_price,
+            total_amount,
+            item["item_type"] or item["category"],
+            item["reason"],
+        ])
+    return headers, rows
+
+
 def asset_report_rows(conn, report_type, user):
     assets = rows_to_list(conn.execute("select * from assets order by code")) if has_permission(conn, user, "assets.view.all") else rows_to_list(
         conn.execute(
@@ -3272,6 +3993,7 @@ def asset_report_rows(conn, report_type, user):
             (user["id"], user["id"], user["id"]),
         )
     )
+    asset_map = {item["id"]: item for item in assets}
     records = rows_to_list(conn.execute("select * from records order by coalesce(in_time, out_time) desc, id desc"))
     if report_type == "ledger":
         headers = ["资产编号", "名称", "品牌", "类别", "规格", "单位", "数量", "单价", "总金额", "购置日期", "入库日期", "供应商", "使用部门", "使用人", "位置", "状态", "资产来源", "创建人", "更新时间", "备注"]
@@ -3306,15 +4028,13 @@ def asset_report_rows(conn, report_type, user):
         headers = ["维度", "资产条目", "数量合计", "金额合计"]
         rows = [[key, value["count"], value["quantity"], round(value["amount"], 2)] for key, value in sorted(groups.items())]
         return f"{ {'category':'分类统计','department':'部门统计','location':'位置统计','keeper':'保管人统计','responsible':'责任人统计'}[report_type] }.csv", headers, rows
-    if report_type in ("claim", "borrow", "inbound", "outbound"):
+    if report_type in ("inbound", "outbound"):
         headers = ["时间", "资产编号", "资产名称", "类型", "数量", "人员", "部门", "单号", "备注"]
-        filtered = records
         if report_type == "inbound":
             filtered = [item for item in records if item["type"] == "入库"]
-        elif report_type in ("claim", "borrow", "outbound"):
+        else:
             filtered = [item for item in records if item["type"] == "出库"]
         rows = []
-        asset_map = {item["id"]: item for item in assets}
         for record in filtered:
             asset = asset_map.get(record["asset_id"])
             if not asset:
@@ -3330,23 +4050,143 @@ def asset_report_rows(conn, report_type, user):
                 record["paper_no"],
                 record_display_note(record["note"]),
             ])
-        title = {"claim": "领用明细", "borrow": "借还明细", "inbound": "入库明细", "outbound": "出库明细"}[report_type]
+        title = {"inbound": "入库明细", "outbound": "出库明细"}[report_type]
         return f"{title}.csv", headers, rows
+    if report_type == "claim":
+        headers = ["时间", "资产编号", "资产名称", "业务类型", "数量", "是否扣减库存", "领用人", "部门", "单号", "审批状态", "备注"]
+        rows = []
+        for order in rows_to_list(conn.execute("select * from borrow_orders order by created_at desc, id desc")):
+            asset = asset_map.get(order["asset_id"])
+            if not asset or not (str(order["order_no"] or "").startswith("LY") or order["status"] == "已领用"):
+                continue
+            rows.append([
+                order["created_at"],
+                asset["code"],
+                asset["name"],
+                "领用单",
+                order["quantity"],
+                "是" if int(order["count_quantity"] or 0) else "否",
+                user_name_by_id(conn, order["borrower_id"]),
+                user_department_by_id(conn, order["borrower_id"]),
+                order["order_no"],
+                order["approval_status"],
+                order["note"],
+            ])
+        for record in records:
+            asset = asset_map.get(record["asset_id"])
+            if not asset or record["type"] != "出库":
+                continue
+            rows.append([
+                record["out_time"] or record["in_time"],
+                asset["code"],
+                asset["name"],
+                "旧出库记录",
+                record["quantity"],
+                "按耗材规则",
+                user_name_by_id(conn, record["user_id"]),
+                user_department_by_id(conn, record["user_id"]),
+                record["paper_no"],
+                record["status"],
+                record_display_note(record["note"]),
+            ])
+        return "领用明细.csv", headers, rows
+    if report_type == "borrow":
+        headers = ["借用时间", "资产编号", "资产名称", "数量", "是否扣减库存", "借用人", "部门", "预计归还", "实际归还", "状态", "单号", "验收", "备注"]
+        rows = []
+        for order in rows_to_list(conn.execute("select * from borrow_orders order by created_at desc, id desc")):
+            asset = asset_map.get(order["asset_id"])
+            if not asset or str(order["order_no"] or "").startswith("LY") or order["status"] == "已领用":
+                continue
+            rows.append([
+                order["created_at"],
+                asset["code"],
+                asset["name"],
+                order["quantity"],
+                "是" if int(order["count_quantity"] or 0) else "否",
+                user_name_by_id(conn, order["borrower_id"]),
+                user_department_by_id(conn, order["borrower_id"]),
+                order["expected_return_date"],
+                order["actual_return_date"],
+                order["status"],
+                order["order_no"],
+                order["return_check"],
+                order["note"],
+            ])
+        for record in records:
+            asset = asset_map.get(record["asset_id"])
+            if not asset or record["type"] != "出库":
+                continue
+            rows.append([
+                record["out_time"] or record["in_time"],
+                asset["code"],
+                asset["name"],
+                record["quantity"],
+                "按耗材规则",
+                user_name_by_id(conn, record["user_id"]),
+                user_department_by_id(conn, record["user_id"]),
+                "",
+                "",
+                record["status"],
+                record["paper_no"],
+                "",
+                record_display_note(record["note"]),
+            ])
+        return "借还明细.csv", headers, rows
+    if report_type == "stock-flow":
+        headers = ["时间", "资产编号", "资产名称", "流水类型", "变动数量", "变动前", "变动后", "关联业务", "经办人", "备注"]
+        rows = []
+        for item in rows_to_list(conn.execute("select * from stock_records order by created_at desc, id desc")):
+            asset = asset_map.get(item["asset_id"])
+            if not asset:
+                continue
+            related = " / ".join(part for part in (item["related_type"], item["related_id"]) if part)
+            rows.append([item["created_at"], asset["code"], asset["name"], item["flow_type"], item["quantity"], item["before_quantity"], item["after_quantity"], related, user_name_by_id(conn, item["operator_id"]), item["note"]])
+        return "库存流水.csv", headers, rows
+    if report_type == "transfer":
+        headers = ["调拨日期", "单号", "资产编号", "资产名称", "原部门", "新部门", "原位置", "新位置", "原责任人", "新责任人", "状态", "原因", "经办人"]
+        rows = []
+        for item in rows_to_list(conn.execute("select * from transfer_orders order by created_at desc, id desc")):
+            asset = asset_map.get(item["asset_id"])
+            if not asset:
+                continue
+            rows.append([item["transfer_date"], item["order_no"], asset["code"], asset["name"], item["old_department"], item["new_department"], item["old_location"], item["new_location"], user_name_by_id(conn, item["old_keeper_id"]), user_name_by_id(conn, item["new_keeper_id"]), item["status"], item["reason"], user_name_by_id(conn, item["operator_id"])])
+        return "调拨明细.csv", headers, rows
+    if report_type == "repair":
+        headers = ["开始时间", "完成时间", "单号", "资产编号", "资产名称", "报修人", "维修人/单位", "状态", "费用", "故障描述", "维修结果", "经办人"]
+        rows = []
+        for item in rows_to_list(conn.execute("select * from repair_orders order by created_at desc, id desc")):
+            asset = asset_map.get(item["asset_id"])
+            if not asset:
+                continue
+            rows.append([item["start_time"], item["end_time"], item["order_no"], asset["code"], asset["name"], user_name_by_id(conn, item["reporter_id"]), item["repairer"], item["status"], item["cost"], item["fault_desc"], item["result"], user_name_by_id(conn, item["operator_id"])])
+        return "维修明细.csv", headers, rows
+    if report_type == "asset-flow":
+        headers = ["时间", "资产编号", "资产名称", "动作", "业务单号", "来源", "经办人", "备注"]
+        rows = []
+        for item in rows_to_list(conn.execute("select * from asset_flow_logs order by created_at desc, id desc")):
+            asset = asset_map.get(item["asset_id"])
+            if not asset:
+                continue
+            source = " / ".join(part for part in (item["source_type"], item["source_id"]) if part)
+            rows.append([item["created_at"], asset["code"], asset["name"], item["action"], item["business_no"], source, user_name_by_id(conn, item["operator_id"]), item["note"]])
+        return "资产流转日志.csv", headers, rows
     if report_type == "scrap":
         headers = ["报废单号", "资产编号", "资产名称", "申请人", "报废日期", "残值", "审批状态", "原因"]
         rows = []
         for item in rows_to_list(conn.execute("select * from scrap_orders order by created_at desc")):
-            asset = conn.execute("select * from assets where id = ?", (item["asset_id"],)).fetchone()
+            asset = asset_map.get(item["asset_id"])
+            if not asset:
+                continue
             rows.append([item["order_no"], asset["code"] if asset else item["asset_id"], asset["name"] if asset else "", user_name_by_id(conn, item["applicant_id"]), item["scrap_date"], item["residual_value"], item["approval_status"], item["reason"]])
         return "报废资产清单.csv", headers, rows
-    if report_type == "consumable-warning":
-        headers = ["资产编号", "耗材名称", "规格", "当前库存", "安全库存", "位置"]
+    if report_type in ("consumable-warning", "consumable-status"):
+        headers = ["资产编号", "耗材名称", "规格", "状态", "位置", "备注"]
         rows = [
-            [item["code"], item["name"], item["spec"], item["quantity"], item["safe_stock"], item["location"]]
+            [item["code"], item["name"], item["spec"], STATUS_LABELS.get(item["status"], item["status"]), item["location"], item["remark"]]
             for item in assets
-            if is_consumable_text(item["category"], item["name"], item["remark"]) and int(item["quantity"] or 0) <= int(item["safe_stock"] or 0)
+            if is_consumable_text(item["category"], item["name"], item["remark"]) and item["status"] in ("repair", "retired")
         ]
-        return "耗材库存预警.csv", headers, rows
+        return "耗材状态异常清单.csv", headers, rows
     return "资产报表.csv", ["提示"], [["未知报表类型"]]
 
 
@@ -3681,6 +4521,45 @@ def reset_db():
     init_db()
 
 
+def clear_data_preserving_login_accounts(conn):
+    tables = [
+        "inventory_check_items",
+        "inventory_check_tasks",
+        "stock_records",
+        "asset_flow_logs",
+        "borrow_orders",
+        "transfer_orders",
+        "repair_orders",
+        "scrap_orders",
+        "records",
+        "import_row_fingerprints",
+        "import_archives",
+        "paper_queue",
+        "asset_requests",
+        "purchase_wishes",
+        "admin_requests",
+        "device_group_rules",
+        "assets",
+        "locations",
+        "asset_categories",
+        "departments",
+        "system_settings",
+        "audits",
+    ]
+    counts = {}
+    existing = {
+        row["name"]
+        for row in rows_to_list(conn.execute("select name from sqlite_master where type = 'table'"))
+    }
+    for table in tables:
+        if table not in existing:
+            counts[table] = 0
+            continue
+        counts[table] = conn.execute(f"select count(*) from {table}").fetchone()[0]
+        conn.execute(f"delete from {table}")
+    return counts
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(BASE_DIR), **kwargs)
@@ -3702,6 +4581,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def send_auth_error(self, exc):
+        self.send_json(401, {"error": str(exc) or "登录已过期，请重新登录。", "code": "SESSION_EXPIRED"})
 
     def send_binary(self, status, file_name, content_type, content):
         self.send_response(status)
@@ -3735,7 +4617,34 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self.send_json(200, {"ok": True, "database": str(DB_PATH)})
+            try:
+                with db() as conn:
+                    conn.execute("select 1").fetchone()
+                    user_count = conn.execute("select count(*) from users").fetchone()[0]
+                    asset_count = conn.execute("select count(*) from assets").fetchone()[0]
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "appVersion": APP_VERSION,
+                        "database": str(DB_PATH),
+                        "publicPort": str(PUBLIC_PORT),
+                        "users": user_count,
+                        "assets": asset_count,
+                        "time": now_local(),
+                    },
+                )
+            except Exception as exc:
+                self.send_json(
+                    503,
+                    {
+                        "ok": False,
+                        "appVersion": APP_VERSION,
+                        "database": str(DB_PATH),
+                        "error": str(exc),
+                        "time": now_local(),
+                    },
+                )
             return
         if parsed.path == "/api/login-settings":
             with db() as conn:
@@ -3754,7 +4663,8 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 with db() as conn:
                     user = require_user(conn, query=query)
-                    require_permission(conn, user, "records.manage")
+                    view_role = query.get("viewRole", [""])[0]
+                    require_view_permission(conn, user, "records.manage", view_role)
                     archive_id = query.get("id", [""])[0]
                     archive = conn.execute("select * from import_archives where id = ?", (archive_id,)).fetchone()
                     if not archive:
@@ -3770,6 +4680,8 @@ class Handler(SimpleHTTPRequestHandler):
                     self.send_header("Content-Length", str(len(content)))
                     self.end_headers()
                     self.wfile.write(content)
+            except AuthError as exc:
+                self.send_auth_error(exc)
             except PermissionError:
                 self.send_response(403)
                 self.end_headers()
@@ -3779,7 +4691,8 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 with db() as conn:
                     user = require_user(conn, query=query)
-                    require_permission(conn, user, "records.manage")
+                    view_role = query.get("viewRole", [""])[0]
+                    require_view_permission(conn, user, "records.manage", view_role)
                     archive_id = query.get("id", [""])[0]
                     archive = conn.execute("select id, file_name, content from import_archives where id = ?", (archive_id,)).fetchone()
                     if not archive:
@@ -3793,6 +4706,8 @@ class Handler(SimpleHTTPRequestHandler):
                             "contentBase64": base64.b64encode(archive["content"]).decode("ascii"),
                         },
                     )
+            except AuthError as exc:
+                self.send_auth_error(exc)
             except PermissionError as exc:
                 self.send_json(403, {"error": str(exc)})
             return
@@ -3801,10 +4716,27 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 with db() as conn:
                     user = require_user(conn, query=query)
-                    require_permission(conn, user, "reports.export")
+                    view_role = query.get("viewRole", [""])[0]
+                    require_view_permission(conn, user, "reports.export", view_role)
                     report_type = query.get("type", ["ledger"])[0]
                     file_name, headers, rows = asset_report_rows(conn, report_type, user)
                     send_csv(self, file_name, headers, rows)
+            except AuthError as exc:
+                self.send_auth_error(exc)
+            except PermissionError:
+                self.send_response(403)
+                self.end_headers()
+            return
+        if parsed.path == "/api/purchase-wishes/export":
+            query = parse_qs(parsed.query)
+            try:
+                with db() as conn:
+                    user = require_user(conn, query=query)
+                    require_view_permission(conn, user, "purchase_wishes.view", query.get("viewRole", [""])[0])
+                    headers, rows = purchase_wish_export_rows(conn, user)
+                    send_xlsx(self, "采购需求表.xlsx", headers, rows, "采购需求")
+            except AuthError as exc:
+                self.send_auth_error(exc)
             except PermissionError:
                 self.send_response(403)
                 self.end_headers()
@@ -3814,10 +4746,13 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 with db() as conn:
                     user = require_user(conn, query=query)
-                    require_permission(conn, user, "reports.export")
+                    view_role = query.get("viewRole", [""])[0]
+                    require_view_permission(conn, user, "reports.export", view_role)
                     task_id = query.get("taskId", [""])[0]
                     file_name, headers, rows = inventory_check_report_rows(conn, task_id)
                     send_csv(self, file_name, headers, rows)
+            except AuthError as exc:
+                self.send_auth_error(exc)
             except PermissionError:
                 self.send_response(403)
                 self.end_headers()
@@ -3831,6 +4766,8 @@ class Handler(SimpleHTTPRequestHandler):
                     user = require_user(conn, query=query)
                     view_role = query.get("viewRole", [""])[0]
                     self.send_json(200, get_state(conn, user, view_role=view_role))
+            except AuthError as exc:
+                self.send_auth_error(exc)
             except PermissionError as exc:
                 self.send_json(403, {"error": str(exc)})
             return
@@ -3856,8 +4793,21 @@ class Handler(SimpleHTTPRequestHandler):
                     if not user:
                         self.send_json(401, {"error": "账号或密码错误，或用户已停用。"})
                         return
+                    session_token = create_session(conn, user["id"])
                     add_audit(conn, user["id"], "登录", f"{user['name']} 登录系统")
-                    self.send_json(200, {"user": public_user(user)})
+                    self.send_json(200, {"user": public_user(user), "sessionToken": session_token})
+                    return
+
+                if parsed.path == "/api/logout":
+                    token = request_session_token(payload=payload)
+                    if token:
+                        session = conn.execute("select * from user_sessions where token = ?", (token,)).fetchone()
+                        if session:
+                            user = get_user(conn, session["user_id"])
+                            if user:
+                                add_audit(conn, user["id"], "退出登录", f"{user['name']} 退出系统")
+                        conn.execute("delete from user_sessions where token = ?", (token,))
+                    self.send_json(200, {"ok": True})
                     return
 
                 user = require_user(conn, payload=payload)
@@ -4091,16 +5041,14 @@ class Handler(SimpleHTTPRequestHandler):
                         self.send_json(404, {"error": "耗材不存在"})
                         return
                     if not is_consumable_text(asset["category"], asset["name"], asset["remark"]):
-                        self.send_json(400, {"error": "库存调整只支持耗材"})
+                        self.send_json(400, {"error": "耗材流水登记只支持耗材"})
                         return
                     mode = str(payload.get("mode", "increase")).strip()
                     quantity = max(1, int(payload.get("quantity") or 1))
-                    reason = str(payload.get("reason", "")).strip() or "库存调整"
+                    reason = str(payload.get("reason", "")).strip() or "耗材流水登记"
                     record_type = "入库" if mode == "increase" else "出库"
-                    next_quantity = int(asset["quantity"] or 0) + (quantity if mode == "increase" else -quantity)
-                    if next_quantity < 0:
-                        self.send_json(400, {"error": "调整后库存不能小于 0"})
-                        return
+                    current_quantity = int(asset["quantity"] or 0)
+                    next_quantity = max(0, current_quantity + (quantity if mode == "increase" else -quantity))
                     record_id = new_id("record")
                     current_time = now_local()
                     operator_target = payload.get("userId") or asset["keeper_id"]
@@ -4117,7 +5065,7 @@ class Handler(SimpleHTTPRequestHandler):
                             current_time if record_type == "出库" else "",
                             "已入库" if record_type == "入库" else "使用中",
                             payload.get("paperNo", ""),
-                            f"库存调整：{reason}",
+                            f"耗材流水登记：{reason}",
                             "",
                         ),
                     )
@@ -4144,7 +5092,7 @@ class Handler(SimpleHTTPRequestHandler):
                         conn.execute("delete from records where id = ?", (record_id,))
                         self.send_json(400, {"error": str(exc)})
                         return
-                    audit_change(conn, user["id"], "库存调整", "record", record_id, f"{asset['name']} {record_type} {quantity}，当前库存 {next_quantity}", before=asset, after=updated, business_no=payload.get("paperNo", ""))
+                    audit_change(conn, user["id"], "耗材流水登记", "record", record_id, f"{asset['name']} {record_type} {quantity}，仓库数量留痕 {current_quantity}->{next_quantity}", before=asset, after=updated, business_no=payload.get("paperNo", ""))
                     self.send_json(200, get_state(conn, user))
                     return
                 if parsed.path == "/api/inventory/safe-stock":
@@ -4480,18 +5428,32 @@ class Handler(SimpleHTTPRequestHandler):
                     except (TypeError, ValueError):
                         self.send_json(400, {"error": "数量必须是大于 0 的数字"})
                         return
+                    unit = clean_docx_text(payload.get("unit") or "件") or "件"
+                    unit_price = money_value(payload.get("unitPrice"), 0)
+                    uplift_rate = max(0, money_value(payload.get("upliftRate"), 30))
+                    total_amount = money_value(payload.get("totalAmount"), 0) or unit_price * quantity * (1 + uplift_rate / 100)
+                    item_type = clean_docx_text(payload.get("itemType") or payload.get("category") or "")
                     priority = clean_docx_text(payload.get("priority") or "普通") or "普通"
                     if priority not in ("普通", "高", "紧急"):
                         priority = "普通"
                     conn.execute(
-                        "insert into purchase_wishes values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        """
+                        insert into purchase_wishes
+                        (id, user_id, item_name, category, spec, unit, quantity, unit_price, total_amount, item_type,
+                         priority, expected_time, reason, status, created_at, handled_by, handled_at, handle_note)
+                        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
                         (
                             new_id("wish"),
                             user["id"],
                             item_name,
-                            clean_docx_text(payload.get("category") or ""),
+                            item_type,
                             clean_docx_text(payload.get("spec") or ""),
+                            unit,
                             quantity,
+                            unit_price,
+                            total_amount,
+                            item_type,
                             priority,
                             clean_docx_text(payload.get("expectedTime") or ""),
                             clean_docx_text(payload.get("reason") or ""),
@@ -4658,6 +5620,9 @@ class Handler(SimpleHTTPRequestHandler):
                     order = conn.execute("select * from borrow_orders where id = ?", (order_id,)).fetchone()
                     if not order:
                         self.send_json(404, {"error": "借用单不存在"})
+                        return
+                    if order["status"] != "借用中":
+                        self.send_json(400, {"error": "只有借用中的单据可以办理归还"})
                         return
                     asset = conn.execute("select * from assets where id = ?", (order["asset_id"],)).fetchone()
                     if not asset:
@@ -4929,15 +5894,15 @@ class Handler(SimpleHTTPRequestHandler):
                     if not task or task["status"] == "已完成":
                         self.send_json(400, {"error": "盘点任务已完成，不能继续修改"})
                         return
-                    actual_location = str(payload.get("actualLocation", "")).strip() or item["system_location"]
-                    actual_status = str(payload.get("actualStatus", "")).strip() or item["system_status"]
-                    actual_keeper_id = str(payload.get("actualKeeperId", "")).strip() or item["system_keeper_id"]
+                    actual_location = str(payload.get("actualLocation", "")).strip()
+                    actual_status = str(payload.get("actualStatus", "")).strip()
+                    actual_keeper_id = str(payload.get("actualKeeperId", "")).strip()
                     diffs = []
-                    if actual_location != item["system_location"]:
+                    if actual_location and actual_location != item["system_location"]:
                         diffs.append("位置不符")
-                    if actual_status != item["system_status"]:
+                    if actual_status and actual_status != item["system_status"]:
                         diffs.append("状态不符")
-                    if actual_keeper_id != item["system_keeper_id"]:
+                    if actual_keeper_id and actual_keeper_id != item["system_keeper_id"]:
                         diffs.append("责任人不符")
                     diff_type = "正常" if not diffs else "、".join(diffs)
                     conn.execute(
@@ -4978,15 +5943,15 @@ class Handler(SimpleHTTPRequestHandler):
                     if not item:
                         self.send_json(400, {"error": "该资产不在当前盘点任务范围内，可使用盘盈录入"})
                         return
-                    actual_location = str(payload.get("actualLocation") or asset["location"]).strip()
-                    actual_status = str(payload.get("actualStatus") or asset["status"]).strip()
-                    actual_keeper_id = str(payload.get("actualKeeperId") or asset["keeper_id"]).strip()
+                    actual_location = str(payload.get("actualLocation", "")).strip()
+                    actual_status = str(payload.get("actualStatus", "")).strip()
+                    actual_keeper_id = str(payload.get("actualKeeperId", "")).strip()
                     diffs = []
-                    if actual_location != item["system_location"]:
+                    if actual_location and actual_location != item["system_location"]:
                         diffs.append("位置不符")
-                    if actual_status != item["system_status"]:
+                    if actual_status and actual_status != item["system_status"]:
                         diffs.append("状态不符")
-                    if actual_keeper_id != item["system_keeper_id"]:
+                    if actual_keeper_id and actual_keeper_id != item["system_keeper_id"]:
                         diffs.append("责任人不符")
                     diff_type = "正常" if not diffs else "、".join(diffs)
                     conn.execute(
@@ -5060,6 +6025,67 @@ class Handler(SimpleHTTPRequestHandler):
                         conn.execute("update inventory_check_items set diff_type = '盘亏' where task_id = ? and checked = 0", (task_id,))
                     conn.execute("update inventory_check_tasks set status = '已完成', end_time = ? where id = ?", (now_local(), task_id))
                     add_audit(conn, user["id"], "完成盘点任务", f"{task['check_no']}，已盘 {checked} 项，盘亏 {unchecked} 项")
+                    self.send_json(200, get_state(conn, user))
+                    return
+                if parsed.path == "/api/device-groups/assign":
+                    require_permission(conn, user, "base_data.manage")
+                    group_name = str(payload.get("groupName", "")).strip()
+                    family_id = str(payload.get("familyId", "")).strip()
+                    source_keys = []
+                    for source_key in payload.get("sourceKeys", []):
+                        clean = str(source_key).strip()
+                        if clean and clean not in source_keys:
+                            source_keys.append(clean)
+                    if not group_name:
+                        self.send_json(400, {"error": "请填写标准归类名称"})
+                        return
+                    if not source_keys:
+                        self.send_json(400, {"error": "请先选择要归到一起的设备组"})
+                        return
+                    now = now_local()
+                    for source_key in source_keys:
+                        conn.execute(
+                            """
+                            insert into device_group_rules
+                            (id, source_key, group_name, family_id, active, created_by, created_at, updated_at)
+                            values (?, ?, ?, ?, 1, ?, ?, ?)
+                            on conflict(source_key) do update set
+                              group_name = excluded.group_name,
+                              family_id = excluded.family_id,
+                              active = 1,
+                              updated_at = excluded.updated_at
+                            """,
+                            (new_id("dgrp"), source_key, group_name, family_id, user["id"], now, now),
+                        )
+                    add_audit(conn, user["id"], "更新设备手动归类", f"{group_name}：{len(source_keys)} 个设备组")
+                    self.send_json(200, get_state(conn, user))
+                    return
+                if parsed.path == "/api/device-groups/unassign":
+                    require_permission(conn, user, "base_data.manage")
+                    source_keys = []
+                    for source_key in payload.get("sourceKeys", []):
+                        clean = str(source_key).strip()
+                        if clean and clean not in source_keys:
+                            source_keys.append(clean)
+                    group_name = str(payload.get("groupName", "")).strip()
+                    if not source_keys and not group_name:
+                        self.send_json(400, {"error": "请指定要取消的设备归类"})
+                        return
+                    now = now_local()
+                    if source_keys:
+                        placeholders = ",".join("?" for _ in source_keys)
+                        conn.execute(
+                            f"update device_group_rules set active = 0, updated_at = ? where source_key in ({placeholders})",
+                            [now] + source_keys,
+                        )
+                        detail = f"{len(source_keys)} 个设备组"
+                    else:
+                        conn.execute(
+                            "update device_group_rules set active = 0, updated_at = ? where group_name = ?",
+                            (now, group_name),
+                        )
+                        detail = group_name
+                    add_audit(conn, user["id"], "取消设备手动归类", detail)
                     self.send_json(200, get_state(conn, user))
                     return
                 if parsed.path == "/api/settings/departments":
@@ -5398,10 +6424,11 @@ class Handler(SimpleHTTPRequestHandler):
                     except OSError as exc:
                         self.send_json(500, {"error": f"端口配置写入失败：{exc}"})
                         return
-                    command = f"if (Test-Path .\\docker-compose.yml) {{ }} elseif (Test-Path .\\Warehouse-Management-System\\docker-compose.yml) {{ Set-Location .\\Warehouse-Management-System }} else {{ Write-Host '请先进入 Warehouse-Management-System 项目目录'; exit 1 }}; $env:WAREHOUSE_HOST_PORT='{port}'; docker compose -p warehouse up --build -d"
+                    command = f"$env:WAREHOUSE_HOST_PORT='{port}'; docker compose -p warehouse up --build -d"
                     add_audit(conn, user["id"], "更新系统设置", f"服务端口改为 {port}，重启 Docker 后生效")
                     data = get_state(conn, user)
-                    data["portNotice"] = f"端口已保存为 {port}。请在 PowerShell 执行：\n{command}\n然后打开 http://127.0.0.1:{port}/"
+                    data["portNotice"] = f"端口已保存为 {port}。请在项目目录的 PowerShell 执行端口重启命令，然后打开 http://127.0.0.1:{port}/"
+                    data["portCommand"] = command
                     self.send_json(200, data)
                     return
                 if parsed.path == "/api/debug/clear-files":
@@ -5410,27 +6437,15 @@ class Handler(SimpleHTTPRequestHandler):
                     if not developer_mode or developer_mode["value"] != "1":
                         self.send_json(400, {"error": "请先在设置中开启开发者模式"})
                         return
-                    archive_count = conn.execute("select count(*) from import_archives").fetchone()[0]
-                    asset_count = conn.execute("select count(*) from assets").fetchone()[0]
-                    record_count = conn.execute("select count(*) from records").fetchone()[0]
-                    paper_count = conn.execute("select count(*) from paper_queue").fetchone()[0]
-                    audit_count = conn.execute("select count(*) from audits").fetchone()[0]
-                    asset_request_count = conn.execute("select count(*) from asset_requests").fetchone()[0]
-                    wish_count = conn.execute("select count(*) from purchase_wishes").fetchone()[0]
-                    conn.execute("delete from import_archives")
-                    conn.execute("delete from paper_queue")
-                    conn.execute("delete from asset_requests")
-                    conn.execute("delete from purchase_wishes")
-                    conn.execute("delete from records")
-                    conn.execute("delete from assets")
-                    conn.execute("delete from audits")
-                    add_audit(
-                        conn,
-                        user["id"],
-                        "调试清空业务数据",
-                        f"已清空资产 {asset_count} 个、出入库记录 {record_count} 条、导入留档 {archive_count} 个、纸质待复核 {paper_count} 条、资产申请 {asset_request_count} 条、采购需求 {wish_count} 条、旧操作记录 {audit_count} 条；用户保留",
-                    )
-                    self.send_json(200, get_state(conn, user))
+                    counts = clear_data_preserving_login_accounts(conn)
+                    data = get_state(conn, user)
+                    data["clearSummary"] = {
+                        "assets": counts.get("assets", 0),
+                        "records": counts.get("records", 0),
+                        "importArchives": counts.get("import_archives", 0),
+                        "audits": counts.get("audits", 0),
+                    }
+                    self.send_json(200, data)
                     return
                 if parsed.path == "/api/settings/departments/delete":
                     require_permission(conn, user, "settings.manage")
@@ -5488,6 +6503,9 @@ class Handler(SimpleHTTPRequestHandler):
                     return
         except sqlite3.IntegrityError as exc:
             self.send_json(400, {"error": f"数据重复或关联不存在：{exc}"})
+            return
+        except AuthError as exc:
+            self.send_auth_error(exc)
             return
         except PermissionError as exc:
             self.send_json(403, {"error": str(exc)})

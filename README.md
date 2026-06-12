@@ -22,7 +22,7 @@ http://127.0.0.1:38280
 - 资产状态：按资产/耗材归类展示，支持状态筛选、分类筛选、责任人/出借人筛选、分页、排序、资产详情抽屉和独立详情链接。
 - 二维码与标签：资产详情页可生成二维码标签，扫码/链接可进入资产详情；资产状况里的标签显示可在“设置 -> 实验室功能”里单独开关。
 - 出入库与出借：支持手动登记、Excel 入库导入、Word 出库/出借单导入、按人员查看领取资产和耗材；导入记录优先使用文档里的业务时间，导入时间只作为留档信息。
-- 库存管理：耗材库存支持安全库存、库存预警、入库/出库流水、库存调整；库存调整可以输入耗材名称、编号、规格或资产详情链接，不需要长列表滚动选择。
+- 库存管理：耗材按可出借状态管理，仓库数量统一显示为“-”；支持入库/出库流水登记，登记时可输入耗材名称、编号、规格或资产详情链接，不需要长列表滚动选择。
 - 盘点管理：支持创建盘点任务、录入明细、自动识别数量差异、位置异常和状态异常。
 - 业务单据：支持资产申请、领用/借用、调拨、维修、报废等流程雏形，部分流程已接入审批状态和资产流转日志。
 - 纸质单据：纸质/手写材料电子化待复核队列可在“设置 -> 实验室功能”里单独开关。
@@ -60,6 +60,26 @@ docker compose -p warehouse up --build -d
 git pull origin main
 docker compose -p warehouse up --build -d
 ```
+
+## 快速上线
+
+这套项目可以先按 Docker 单机方式上线，优先保证能登录、能导入、能查台账、能查看健康状态。已经在项目目录里时，执行：
+
+```powershell
+Copy-Item .env.example .env -ErrorAction SilentlyContinue
+docker compose -p warehouse up --build -d
+docker compose -p warehouse ps
+Invoke-RestMethod http://127.0.0.1:38280/api/health
+```
+
+看到 `docker compose ps` 里的 `warehouse-system` 为 `Up`，并且健康检查接口返回 `"ok": true`，就说明容器、后端和 SQLite 数据库都已经正常。
+
+上线前建议至少确认：
+
+- 能用 `admin / admin` 登录。
+- 打开“资产状态”“库存管理”“出入库登记”“设置”四个页面没有报错。
+- `http://127.0.0.1:38280/api/health` 返回 `ok: true`。
+- 正式使用前把 `.env` 里的 `WAREHOUSE_ADMIN_PASSWORD` 改成强密码，再重新执行 `docker compose -p warehouse up --build -d`。
 
 ## 更新容器命令
 

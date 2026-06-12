@@ -103,6 +103,8 @@ create table if not exists borrow_orders (
   order_no text unique not null,
   asset_id text not null references assets(id),
   borrower_id text not null references users(id),
+  quantity integer not null default 1,
+  count_quantity integer not null default 1,
   operator_id text not null references users(id),
   expected_return_date text,
   actual_return_date text,
@@ -183,6 +185,17 @@ create table if not exists asset_flow_logs (
   created_at text not null
 );
 
+create table if not exists device_group_rules (
+  id text primary key,
+  source_key text unique not null,
+  group_name text not null,
+  family_id text,
+  active integer not null default 1,
+  created_by text,
+  created_at text not null,
+  updated_at text not null
+);
+
 create table if not exists audits (
   id text primary key,
   time text not null,
@@ -247,6 +260,20 @@ create table if not exists import_archives (
   content blob not null
 );
 
+create table if not exists import_row_fingerprints (
+  id text primary key,
+  file_hash text not null,
+  row_hash text not null unique,
+  file_name text not null,
+  row_number integer not null,
+  target_type text,
+  target_id text,
+  result text not null,
+  archive_id text,
+  imported_by text,
+  created_at text not null
+);
+
 create table if not exists system_settings (
   key text primary key,
   value text not null
@@ -283,7 +310,11 @@ create table if not exists purchase_wishes (
   item_name text not null,
   category text,
   spec text,
+  unit text not null default '',
   quantity integer not null default 1,
+  unit_price real not null default 0,
+  total_amount real not null default 0,
+  item_type text not null default '',
   priority text,
   expected_time text,
   reason text,
