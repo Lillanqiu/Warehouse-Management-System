@@ -4,7 +4,8 @@ const TOKEN_KEY = "warehouse-current-session-token";
 const SESSION_TOKEN_KEY = "warehouse-session-token";
 const VIEW_MODE_KEY = "warehouse-view-mode";
 const SUSPECT_DUPLICATE_MODE_KEY = "warehouse-suspect-duplicate-mode";
-const APP_VERSION = "20260612-dashboard-overview-v134";
+const APP_VERSION = "20260613-user-checkbox-v158";
+const IMPORT_PREVIEW_ROW_LIMIT = 50;
 const PURCHASE_WISH_DEFAULT_UPLIFT = 30;
 const DRAWER_WIDTH_STORAGE_PREFIX = "warehouse-drawer-width";
 
@@ -54,7 +55,8 @@ let assetDrawerOpen = false;
 let editingAssetId = "";
 let selectedAssetDetailId = "";
 let dashboardSearch = "";
-let dashboardUsageOpen = false;
+let dashboardMode = "list";
+let dashboardCategory = "";
 let dashboardUsageUserId = "";
 let recordFilter = "all";
 let recordKindFilter = "all";
@@ -64,6 +66,8 @@ let recordStatsPeriod = nowLocal().slice(0, 7);
 let importKind = "inbound";
 let importResult = null;
 let wordImportResult = null;
+let assetLocationUpdateResult = null;
+let assetImageUpdateResult = null;
 let auditFilterField = "all";
 let auditFilterQuery = "";
 let auditStartTime = "";
@@ -92,6 +96,8 @@ let systemHealth = null;
 let systemHealthCheckedAt = "";
 let systemHealthLoading = false;
 let loginNotice = "";
+let userRepairState = null;
+let userRepairOptions = { includeInactive: false, skipAdmin: true, skipReferenced: true };
 
 function drawerWidthStorageKey(kind) {
   return `${DRAWER_WIDTH_STORAGE_PREFIX}-${kind || "default"}`;
@@ -331,6 +337,24 @@ function userDepartment(userId) {
   return state.users.find((user) => user.id === userId)?.department || "-";
 }
 
+function isLikelyPersonName(value) {
+  const text = String(value || "").trim();
+  if (text.length < 2) return false;
+  if (/\d/.test(text)) return false;
+  if (!/[\u4e00-\u9fffA-Za-z]/.test(text)) return false;
+  if (/[ _\-\/\\#@%:]/.test(text)) return false;
+  const lower = text.toLowerCase();
+  if (/\b(?:cpu|gpu|ssd|hdd|nvme|m\.2|m2|usb|hdmi|vga|dvi)\b/.test(lower)) return false;
+  const assetHints = [
+    "资产", "耗材", "设备", "办公", "办公椅", "办公桌", "台式", "台式机", "电脑", "显示器", "显示屏",
+    "电源", "电源线", "键盘", "鼠标", "主机", "笔记本", "服务器", "路由器", "交换机", "打印机", "硬盘", "内存",
+    "网线", "网卡", "网关", "网口", "数据线", "线缆", "适配器", "转换", "插线板", "机箱", "机柜", "显卡", "摄像头",
+    "耳机", "音箱", "投影", "投影仪", "扫描", "复印", "复印机"
+  ];
+  if (assetHints.some((hint) => text.includes(hint) || lower.includes(hint))) return false;
+  return true;
+}
+
 function departments() {
   const configured = state.settings?.departments || [];
   if (configured.length) return configured;
@@ -387,7 +411,9 @@ function treeLabel(items, item, parentKey = "parent_id") {
 }
 
 function selectableUsers() {
-  return state.users.filter((user) => user.active === true);
+  return (state.users || [])
+    .filter((user) => user.id === state.currentUser?.id || isLikelyPersonName(user.name))
+    .filter((user) => user.active === true);
 }
 
 function activeUsersByDepartment() {
@@ -570,13 +596,6 @@ function assetComparableName(asset) {
   return text;
 }
 
-function assetComparableSpec(asset) {
-  const spec = stripCapacityText(compactAssetText(asset?.spec));
-  const familyId = deviceFamily(asset)?.id || "";
-  if (["display", "storage", "peripheral", "teaching", "consumable"].includes(familyId)) return "";
-  return spec;
-}
-
 function assetDeviceType(asset) {
   const raw = rawAssetComparableText(asset);
   const compact = compactAssetText(raw);
@@ -715,10 +734,6 @@ function assetGroupById(assetId) {
   return assetGroups().find((group) => group.key === assetGroupKey(asset)) || null;
 }
 
-function assetGroupIsAsset(group) {
-  return group.assets.some((asset) => assetKind(asset) === "资产");
-}
-
 function ledgerField(value, fallback) {
   const text = String(value || "").trim();
   return text || fallback;
@@ -829,11 +844,6 @@ function allAssetLedgerGroups() {
 
 function assetLedgerGroupByKey(key) {
   return allAssetLedgerGroups().find((group) => group.key === key) || null;
-}
-
-function assetLedgerGroupByAssetId(assetId) {
-  const asset = state.assets.find((item) => item.id === assetId);
-  return asset ? assetLedgerGroupByKey(assetLedgerGroupKey(asset)) : null;
 }
 
 function assetLedgerGroups() {
@@ -1153,84 +1163,7 @@ function assetGroupRecordDetail(group, type, mode = "html") {
   `;
 }
 
-function borrowerRecordsForUser(userId) {
-  if (!userId || userId === "all") return [];
-  return state.records
-    .filter((record) => record.type === "出库" && record.userId === userId)
-    .sort((a, b) => recordMillis(b) - recordMillis(a));
-}
 
-function borrowerAssetsForUser(userId) {
-  if (!userId || userId === "all") return [];
-  const recordAssetIds = new Set(borrowerRecordsForUser(userId).map((record) => record.assetId));
-  return state.assets
-    .filter((asset) => asset.keeperId === userId || asset.useUserId === userId || assetFlow(asset).borrowerId === userId || recordAssetIds.has(asset.id))
-    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh-Hans-CN", { numeric: true, sensitivity: "base" }));
-}
-
-function borrowerDetailRows(userId, kind) {
-  const assets = borrowerAssetsForUser(userId).filter((asset) => assetKind(asset) === kind);
-  return assets.map((asset) => {
-    const records = state.records
-      .filter((record) => record.assetId === asset.id && record.userId === userId && record.type === "出库")
-      .sort((a, b) => recordMillis(b) - recordMillis(a));
-    const latest = records[0] || {};
-    return { asset, latest, records };
-  });
-}
-
-function renderBorrowerDetailTable(rows, emptyText) {
-  if (!rows.length) return `<div class="empty compact-empty">${emptyText}</div>`;
-  return `
-    <div class="table-wrap compact-table">
-      <table>
-        <thead><tr><th>名称</th><th>规格/类别</th><th>数量</th><th>领取/出借时间</th><th>单号</th><th>来源</th><th>状态</th></tr></thead>
-        <tbody>
-          ${rows.map(({ asset, latest }) => `
-            <tr>
-              <td><strong>${asset.name}</strong><div class="mini-meta">${asset.code}</div></td>
-              <td>${blank(asset.spec || asset.category)}</td>
-              <td>${latest.quantity || asset.quantity || 1}</td>
-              <td>${fmt(latest.outTime)}</td>
-              <td>${blank(latest.paperNo)}</td>
-              <td>${blank(sourceFilesFromText(`${asset.remark || ""}；${latest.note || ""}`).join("；"))}</td>
-              <td>${statusBadge(asset.status)}</td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
-function renderBorrowerDetailPanel() {
-  if (!assetBorrowerFilter || assetBorrowerFilter === "all") return "";
-  const person = state.users.find((user) => user.id === assetBorrowerFilter);
-  const assetRows = borrowerDetailRows(assetBorrowerFilter, "资产");
-  const consumableRows = borrowerDetailRows(assetBorrowerFilter, "耗材");
-  const records = borrowerRecordsForUser(assetBorrowerFilter);
-  return `
-    <section class="borrower-detail-panel no-print">
-      <div class="asset-list-title">
-        <div>
-          <h3>${userName(assetBorrowerFilter)}的出借详情</h3>
-          <span>${person?.department ? `${person.department} · ` : ""}资产 ${assetRows.length} 项 / 耗材 ${consumableRows.length} 项 / 出库记录 ${records.length} 条</span>
-        </div>
-        <button class="ghost small" id="clearBorrowerDetail" type="button">关闭详情</button>
-      </div>
-      <div class="borrower-detail-grid">
-        <section>
-          <div class="section-title compact-title"><h2>领取 / 借用资产</h2><span class="hint">${assetRows.length} 项</span></div>
-          ${renderBorrowerDetailTable(assetRows, "这个人暂无资产领取或借用记录")}
-        </section>
-        <section>
-          <div class="section-title compact-title"><h2>耗材领用</h2><span class="hint">${consumableRows.length} 项</span></div>
-          ${renderBorrowerDetailTable(consumableRows, "这个人暂无耗材领用记录")}
-        </section>
-      </div>
-    </section>
-  `;
-}
 
 function assetGroupSourceFiles(group) {
   const files = group.assets.flatMap((asset) => {
@@ -1241,15 +1174,6 @@ function assetGroupSourceFiles(group) {
     return [...fromAsset, ...fromRecords];
   });
   return blank([...new Set(files)].join("；"));
-}
-
-function assetGroupSourceCell(group) {
-  const value = assetGroupSourceFiles(group);
-  if (value === "-") return "-";
-  const files = value.split("；").map((item) => item.trim()).filter(Boolean);
-  const visible = files.slice(0, 2).join("；");
-  const extra = files.length > 2 ? ` 等 ${files.length} 个` : "";
-  return `<span class="source-file-cell" title="${attrText(value)}">${visible}${extra}</span>`;
 }
 
 function groupMetric(group, status) {
@@ -1561,28 +1485,22 @@ function recordDocumentType(record) {
   const asset = state.assets.find((item) => item.id === record.assetId);
   if (record.documentType) return record.documentType;
   if (record.note?.includes("耗材")) return "耗材领用";
-  if (asset?.category?.includes("耗材")) return "耗材领用";
+  if (assetKind(asset) === "耗材") return "耗材领用";
   if (record.note?.includes("Word领用单导入")) return "资产领用";
   return "-";
 }
 
+function hasRealAssetCode(asset) {
+  const code = String(asset?.code || "").trim();
+  return Boolean(code) && !/^(IMPORT|CONSUMABLE)-/i.test(code);
+}
+
 function assetKind(asset) {
-  const category = String(asset?.category || "").trim();
-  const name = String(asset?.name || "").trim();
-  const remark = String(asset?.remark || "");
-  const templateNoise = ["固定资产", "低值易耗品", "耗材", "购进软件"].every((label) => category.includes(label));
-  const sourceConsumable = remark
-    .split(/导入文件：|；|;/)
-    .some((part) => part.includes("耗材") && /\.(docx?|xlsx?)\b/i.test(part));
-  if (name.includes("耗材") || category === "耗材" || category === "耗材领用" || sourceConsumable) return "耗材";
-  if (category.includes("耗材") && !templateNoise) return "耗材";
-  return "资产";
+  return hasRealAssetCode(asset) ? "资产" : "耗材";
 }
 
 function recordKind(record) {
   const asset = state.assets.find((item) => item.id === record.assetId);
-  const type = recordDocumentType(record);
-  if (type.includes("耗材")) return "耗材";
   return assetKind(asset);
 }
 
@@ -1733,28 +1651,39 @@ function sourceFilesFromText(value) {
   return [...new Set(files)];
 }
 
-function sourceFiles(value) {
-  return blank(sourceFilesFromText(value).join("；"));
-}
-
-function assetSourceFiles(asset) {
-  const flow = assetFlow(asset);
-  const userId = flow.borrowerId || asset.keeperId;
-  const relatedRecords = state.records
-    .filter((record) => record.assetId === asset.id && (!userId || record.userId === userId))
-    .sort((a, b) => recordMillis(b) - recordMillis(a));
-  for (const record of relatedRecords) {
-    const files = sourceFilesFromText(record.note);
-    if (files.length) return files[files.length - 1];
+function personNameFromImportFileName(value) {
+  const base = fileBaseName(value).replace(/\.[^.]+$/, "");
+  const withoutDate = base
+    .replace(/[（(][^）)]*[）)]/g, " ")
+    .replace(/\b20\d{2}[.\-_/年]\d{1,2}(?:[.\-_/月]\d{1,2})?日?\b/g, " ");
+  const parts = withoutDate.split(/[-—_]+/).map((item) => item.trim()).filter(Boolean);
+  const candidates = [];
+  for (const part of parts.length ? parts : [withoutDate]) {
+    if (part.includes("资产")) candidates.push(part.split("资产")[0]);
+    if (part.includes("耗材")) candidates.push(part.split("耗材")[0]);
+    candidates.push(part);
   }
-
-  const ownerName = userName(userId);
-  const compactOwner = ownerName.replace(/\s+/g, "");
-  const fromAsset = sourceFilesFromText(asset.remark);
-  const matched = compactOwner && ownerName !== "未知用户"
-    ? fromAsset.filter((file) => file.replace(/\s+/g, "").includes(compactOwner))
-    : [];
-  return matched.length ? matched[matched.length - 1] : "-";
+  const generic = new Set(["资产", "资产表", "资产清单", "使用表", "领用表", "耗材", "耗材表", "耗材清单", "清单", "底表", "项目内系统清点", "系统清点", "清点", "盘点", "表格", "表", "新"]);
+  for (const item of candidates) {
+    let clean = item
+      .replace(/(人员)?(资产|耗材)(使用|领用)?(表|清单)?$/g, "")
+      .replace(/(项目内)?系统清点$/g, "")
+      .replace(/(清点|盘点|清单|表格|表)$/g, "")
+      .replace(/^[\s\-—_：:（）()[\]【】]+|[\s\-—_：:（）()[\]【】]+$/g, "");
+    for (const label of ["老师", "教师", "同学"]) {
+      if (clean.includes(label)) {
+        const prefix = clean.split(label)[0];
+        if (prefix.length > 1 && prefix.length <= 8) {
+          clean = prefix;
+          break;
+        }
+      }
+    }
+    clean = clean.replace(/(老师|教师|同学)$/g, "");
+    if (!clean || clean.length > 20 || /^\d+$/.test(clean) || generic.has(clean)) continue;
+    return clean;
+  }
+  return "";
 }
 
 function statusBadge(status) {
@@ -1800,21 +1729,6 @@ function latestAssetRecord(asset, type) {
   return state.records
     .filter((record) => record.assetId === asset.id && record.type === type)
     .sort((a, b) => recordMillis(b) - recordMillis(a))[0];
-}
-
-function assetRecordDetail(asset, type, mode = "html") {
-  const record = latestAssetRecord(asset, type);
-  if (!record) return "-";
-  const time = type === "入库" ? fmt(record.inTime) : fmt(record.outTime);
-  const actorLabel = type === "入库" ? "经办" : "使用";
-  const parts = [
-    `${type}：${time}`,
-    `${actorLabel}人：${userName(record.userId)}`,
-    `数量：${record.quantity || "-"}`,
-    `单号：${record.paperNo || "-"}`
-  ];
-  if (mode === "text") return parts.join("；");
-  return `<div class="flow-detail">${parts.map((item) => `<span>${item}</span>`).join("")}</div>`;
 }
 
 function includesQuery(values, query) {
@@ -2002,12 +1916,14 @@ function canView(viewKey) {
 }
 
 function activeNavKey() {
+  if (view === "inventory") return "records";
   if (["assetRequests", "purchaseWishes"].includes(view)) return "requests";
   if (["users", "baseData", "settings", "audit"].includes(view)) return "system";
   return view;
 }
 
 function normalizeViewKey(viewKey) {
+  if (viewKey === "inventory") return "records";
   if (viewKey === "paper") return "records";
   if (["assetRequests", "purchaseWishes"].includes(viewKey)) return "requests";
   if (["users", "baseData", "settings", "audit"].includes(viewKey)) return "system";
@@ -2016,11 +1932,11 @@ function normalizeViewKey(viewKey) {
 
 function renderShell() {
   const user = state.currentUser;
+  if (view === "dashboard") normalizeDashboardModeState();
   const pendingAdminRequests = (state.adminRequests || []).filter((item) => item.status === "待处理").length;
   const navItems = [
     ["dashboard", "总览", "⌂"],
     ["assets", "资产台账", "▦"],
-    ["inventory", "耗材库存", "▥"],
     ["records", can("records.manage") ? "出入库登记" : "我的出入库", "⇄"],
     ["orders", "业务办理", "▧"],
     ["checks", "盘点管理", "☑"],
@@ -2029,6 +1945,8 @@ function renderShell() {
     ["system", pendingAdminRequests ? `系统管理(${pendingAdminRequests})` : "系统管理", "⚙"]
   ].filter(([key]) => canView(key));
   const activeKey = activeNavKey();
+  const contentClasses = ["content", `content-${activeKey}`];
+  if (view === "dashboard") contentClasses.push(`dashboard-mode-${dashboardMode}`);
   return `
     <section class="layout">
       <aside class="sidebar">
@@ -2058,7 +1976,7 @@ function renderShell() {
           <button class="ghost" id="logoutBtn" type="button">退出登录</button>
         </div>
       </aside>
-      <section class="content">
+      <section class="${contentClasses.join(" ")}">
         <header class="topbar">
           <div>
             <h1>${pageTitle()}</h1>
@@ -2132,7 +2050,7 @@ function pageTitle() {
   return {
     dashboard: "资产底账总览",
     assets: "资产台账",
-    inventory: "耗材库存",
+    inventory: "出入库登记",
     checks: "盘点管理",
     orders: "业务办理",
     reports: "报表统计",
@@ -2151,9 +2069,9 @@ function pageTitle() {
 
 function pageSubtitle() {
   return {
-    dashboard: "以学校资产底表为核心，串联资产台账、人员使用、耗材库存、出入库流水和盘点结果。",
+    dashboard: "以学校资产底表为核心，串联资产台账、人员使用、耗材流转、出入库流水和盘点结果。",
     assets: "资产只展示台账、当前位置、当前状态和状态驱动操作。",
-    inventory: "耗材按库存数量和库存流水管理，支持入库、领用、退回和盘点修正。",
+    inventory: "耗材入库、领用、退回和盘点修正统一在出入库登记中处理。",
     checks: "按位置、分类、责任人或状态生成盘点任务，录入实际结果并生成差异。",
     orders: "办理资产出借、归还、调拨、维修和报废等正式业务流程。",
     reports: "按资产总账、分类、部门、位置、责任人、流水和盘点差异导出报表。",
@@ -2209,12 +2127,17 @@ function renderDashboard() {
   const matchedAssets = state.assets.filter((asset) => assetMatches(asset, dashboardSearch));
   const matchedRecords = state.records.filter((record) => recordMatches(record, dashboardSearch));
   const metrics = dashboardMetrics(matchedAssets, matchedRecords);
+  normalizeDashboardModeState();
   return `
     ${renderDashboardOverviewCards(metrics)}
-    ${renderDashboardLedgerGroupsPanel(metrics)}
-    ${dashboardUsageOpen ? renderDashboardUsageDrawer(metrics) : ""}
+    ${renderDashboardContent(metrics)}
     ${ledgerDrawerKey ? renderLedgerDetailDrawer() : ""}
   `;
+}
+
+function normalizeDashboardModeState() {
+  if (dashboardMode === "usage") dashboardMode = "assetUsage";
+  if (!["list", "category", "assetUsage", "consumableUsage", "stock"].includes(dashboardMode)) dashboardMode = "list";
 }
 
 function dashboardMetrics(assets, records) {
@@ -2222,30 +2145,37 @@ function dashboardMetrics(assets, records) {
   const consumables = assets.filter((asset) => assetKind(asset) === "耗材");
   const assetIds = new Set(assets.map((asset) => asset.id));
   const checkItems = (state.inventoryCheckItems || []).filter((item) => assetIds.has(item.assetId));
-  const groupRows = dashboardLedgerGroups(fixedAssets);
-  const currentUsingAssets = fixedAssets.filter((asset) => asset.status === "checked_out" || Boolean(assetFlow(asset).borrowerId));
+  const groupRows = dashboardLedgerGroups(assets);
+  const categoryRows = dashboardCategoryRows(groupRows);
+  const assetPeopleRows = dashboardPeopleRows(assets, records, "asset");
+  const consumablePeopleRows = dashboardPeopleRows(assets, records, "consumable");
+  const currentUsingAssets = fixedAssets.filter((asset) => dashboardAssetInPersonalUse(asset) && dashboardUsageUserValid(dashboardAssetUsageUserId(asset)));
   const consumableRecords = records.filter((record) => recordKind(record) === "耗材" && record.type === "出库");
   const unavailable = fixedAssets.filter((asset) => ["repair", "retired"].includes(asset.status));
   const checkAbnormal = checkItems.filter((item) => item.diffType && item.diffType !== "正常" && item.diffType !== "未盘点");
   const importExceptionCount = (state.importArchives || []).reduce((sum, item) => sum + Number((item.result?.skipped || []).length || 0), 0);
   const codeCount = fixedAssets.filter((asset) => String(asset.code || "").trim()).length;
   const totalAmount = fixedAssets.reduce((sum, asset) => sum + dashboardAssetAmount(asset), 0);
-  const inStockCount = fixedAssets.filter((asset) => (asset.status || "in_stock") === "in_stock").length;
+  const inStockCount = assets.filter((asset) => (asset.status || "in_stock") === "in_stock").length;
   return {
     assets,
     records,
     fixedAssets,
     consumables,
     groupRows,
-    peopleRows: dashboardPeopleRows(assets, records),
+    categoryRows,
+    peopleRows: assetPeopleRows,
+    assetPeopleRows,
+    consumablePeopleRows,
     scopeLabel: dashboardSearch ? "匹配底表明细" : "底表明细",
-    assetCount: fixedAssets.length,
+    assetCount: assets.length,
     groupCount: groupRows.length,
+    categoryCount: categoryRows.length,
     fixedCount: fixedAssets.length,
     fixedCodeCoverage: `${codeCount}/${fixedAssets.length || 0}`,
     consumableCount: consumables.length,
     consumableQuantity: consumables.reduce((sum, asset) => sum + Number(asset.quantity || 0), 0),
-    consumableRecordQuantity: consumableRecords.reduce((sum, record) => sum + Number(record.quantity || 0), 0),
+    consumableRecordQuantity: consumablePeopleRows.reduce((sum, row) => sum + Number(row.consumableQuantity || 0), 0),
     currentUsingCount: currentUsingAssets.length,
     borrowedFixedCount: currentUsingAssets.length,
     totalAmount,
@@ -2303,6 +2233,66 @@ function dashboardLedgerGroups(assets) {
   return [...groups.values()].sort((a, b) => b.quantity - a.quantity || a.name.localeCompare(b.name, "zh-Hans-CN", { numeric: true }));
 }
 
+const DASHBOARD_CATEGORY_RULES = [
+  { id: "computer", name: "计算机设备", icon: "▣", terms: ["电脑", "笔记本", "台式", "主机", "工作站", "服务器", "昭阳", "thinkpad", "小主机", "迷你主机", "mini pc", "图形工作站", "移动工作站"] },
+  { id: "display", name: "显示设备", icon: "▤", terms: ["显示器", "液晶显示器", "显示屏", "屏幕", "监视器", "投影", "电视", "aoc"] },
+  { id: "network", name: "网络设备", icon: "◌", terms: ["网络", "交换机", "路由器", "防火墙", "通信", "网卡", "无线网卡", "ap", "视频监控", "监控", "摄像"] },
+  { id: "storage", name: "存储设备", icon: "◉", terms: ["硬盘", "固态", "ssd", "m.2", "m2", "nvme", "pcie", "u盘", "存储", "sa1000", "三星750", "三星970", "三星980", "三星990", "机械硬盘"] },
+  { id: "office", name: "办公设备", icon: "▥", terms: ["打印", "扫描", "文件袋", "文件柜", "档案", "办公", "桌", "椅", "柜"] },
+  { id: "turnover", name: "周转器材", icon: "◇", terms: ["周转", "收纳", "工具箱"] },
+  { id: "peripheral", name: "外设配件", icon: "◆", terms: ["键盘", "鼠标", "耳机", "扩展坞", "转接器", "适配器", "线缆", "数据线", "hdmi", "usb", "type-c", "typec", "支架", "配件", "套件", "电源"] },
+  { id: "teaching", name: "教学资料", icon: "▧", terms: ["教材", "教程", "文档", "资料", "讲义", "python", "软件工具", "图书"] },
+  { id: "consumable", name: "耗材用品", icon: "◍", terms: ["耗材", "墨盒", "硒鼓", "纸", "电池"] },
+  { id: "other", name: "其他设备", icon: "◇", terms: [] }
+];
+
+function dashboardAssetCategory(asset) {
+  const text = rawAssetComparableText(asset);
+  const matched = DASHBOARD_CATEGORY_RULES.find((rule) => rule.id !== "other" && textHasAny(text, rule.terms));
+  if (matched) return matched;
+  if (assetKind(asset) === "耗材") return DASHBOARD_CATEGORY_RULES.find((rule) => rule.id === "consumable");
+  return DASHBOARD_CATEGORY_RULES.find((rule) => rule.id === "other");
+}
+
+function dashboardCategoryRows(groupRows) {
+  const rows = new Map();
+  for (const group of groupRows) {
+    const family = dashboardGroupFamily(group);
+    const key = family.id;
+    if (!rows.has(key)) {
+      rows.set(key, {
+        key,
+        name: family.name,
+        icon: family.icon,
+        quantity: 0,
+        groupCount: 0,
+        groups: [],
+        locations: new Set(),
+        statuses: new Map()
+      });
+    }
+    const row = rows.get(key);
+    row.quantity += Number(group.quantity || 0);
+    row.groupCount += 1;
+    row.groups.push(group);
+    group.locations.forEach((location) => row.locations.add(location));
+    group.statuses.forEach((count, status) => row.statuses.set(status, (row.statuses.get(status) || 0) + count));
+  }
+  const order = new Map(DASHBOARD_CATEGORY_RULES.map((item, index) => [item.id, index]));
+  return [...rows.values()].sort((a, b) => (order.get(a.key) ?? 99) - (order.get(b.key) ?? 99) || b.quantity - a.quantity);
+}
+
+function dashboardGroupFamily(group) {
+  const familyCounts = new Map();
+  for (const asset of group.assets || []) {
+    const family = dashboardAssetCategory(asset);
+    const quantity = Number(asset.quantity || 0) || 1;
+    familyCounts.set(family.id, (familyCounts.get(family.id) || 0) + quantity);
+  }
+  const [familyId] = [...familyCounts.entries()].sort((a, b) => b[1] - a[1])[0] || ["other", 0];
+  return DASHBOARD_CATEGORY_RULES.find((rule) => rule.id === familyId) || DASHBOARD_CATEGORY_RULES.find((rule) => rule.id === "other");
+}
+
 function dashboardGroupStatus(group) {
   const entries = [...group.statuses.entries()].sort((a, b) => b[1] - a[1]);
   if (!entries.length) return "-";
@@ -2317,60 +2307,51 @@ function dashboardSetText(values, limit = 2) {
   return list.length > limit ? `${visible} 等 ${list.length} 处` : visible;
 }
 
+function renderDashboardContent(metrics) {
+  if (dashboardMode === "category") return renderDashboardCategoryPanel(metrics);
+  if (dashboardMode === "assetUsage") return renderDashboardUsagePanel(metrics, "asset");
+  if (dashboardMode === "consumableUsage") return renderDashboardUsagePanel(metrics, "consumable");
+  if (dashboardMode === "stock") {
+    const rows = dashboardLedgerGroups(metrics.assets.filter((asset) => (asset.status || "in_stock") === "in_stock"));
+    return renderDashboardLedgerGroupsPanel(metrics, {
+      rows,
+      title: "在库资产清单",
+      hint: `当前在库 ${metrics.inStockCount} 件`,
+      emptyTitle: "还没有在库资产",
+      emptyText: "资产入库后会默认进入在库状态；借出、维修或报废的资产不会出现在这里。",
+      showQuantity: true
+    });
+  }
+  return renderDashboardLedgerGroupsPanel(metrics, {
+    title: "资产清单",
+    hint: dashboardSearch ? `筛选出 ${metrics.groupRows.length} 条` : `共 ${metrics.groupRows.length} 条数据`
+  });
+}
+
 function renderDashboardOverviewCards(metrics) {
   return `
     <section class="dashboard-overview-cards no-print">
-      <article class="dashboard-intro-card">
-        <span class="dashboard-card-icon">▤</span>
-        <div>
-          <strong>统一管理学校全部资产</strong>
-          <p>汇总资产类别、数量、使用、在放及人员领取/借用情况，支持查看明细与快速检索。</p>
-        </div>
-      </article>
-      ${renderDashboardOverviewStatCard("资产总数", metrics.assetCount, "所有资产数量总计", "▱")}
-      ${renderDashboardOverviewStatCard("资产类别", metrics.groupCount, "资产类别数量", "▦")}
-      ${renderDashboardOverviewStatCard("使用情况", metrics.currentUsingCount, "可点击查看每个人具名下资产", "人", { usage: true })}
-      ${renderDashboardOverviewStatCard("在库", metrics.inStockCount, "当前在库资产数量", "▥")}
+      ${renderDashboardOverviewStatCard("list", "清单总数", metrics.assetCount, "底账资产明细", "▤")}
+      ${renderDashboardOverviewStatCard("category", "资产类别", metrics.categoryCount, "按资产分类查看", "▦")}
+      ${renderDashboardOverviewStatCard("assetUsage", "资产使用情况", metrics.currentUsingCount, "按人员借用资产", "人")}
+      ${renderDashboardOverviewStatCard("consumableUsage", "耗材使用情况", metrics.consumableRecordQuantity, "按人员领用耗材", "▣")}
+      ${renderDashboardOverviewStatCard("stock", "在库", metrics.inStockCount, "当前可用资产", "▥")}
     </section>
   `;
 }
 
-function renderDashboardOverviewStatCard(label, value, sub, icon, options = {}) {
-  const tag = options.usage ? "button" : "article";
-  const actionAttrs = options.usage ? ` data-dashboard-usage type="button" aria-label="查看人员使用情况"` : "";
+function renderDashboardOverviewStatCard(mode, label, value, sub, icon) {
+  const active = dashboardMode === mode;
   return `
-    <${tag} class="dashboard-overview-stat ${options.usage ? "clickable" : ""}"${actionAttrs}>
+    <button class="dashboard-overview-stat clickable ${active ? "active" : ""}" data-dashboard-mode="${mode}" type="button" aria-label="查看${label}">
       <span class="dashboard-card-icon">${icon}</span>
       <div>
         <span>${label}</span>
         <strong>${value}</strong>
         <em>${sub}</em>
       </div>
-    </${tag}>
-  `;
-}
-
-function renderDashboardLedgerHero(metrics) {
-  const importAction = dashboardImportAction();
-  return `
-    <section class="ledger-command-panel">
-      <div class="ledger-command-copy">
-        <span class="eyebrow">统一资产底账</span>
-        <h2>学校资产 Excel 是全系统的底表</h2>
-        <p>资产台账、人员使用、耗材库存、出入库登记、盘点管理和操作记录都围绕这份底表联动：底表建账，人员表绑定，耗材表扣库，盘点核现实，流水做追溯。</p>
-        <div class="ledger-command-actions">
-          ${renderDashboardActionButton(importAction.label, importAction.action, "primary")}
-          ${renderDashboardActionButton("查看父子级台账", { view: "assets" }, "secondary")}
-          ${can("checks.manage") ? renderDashboardActionButton("创建盘点任务", { view: "checks" }, "secondary") : renderDashboardActionButton("查看盘点结果", { view: "checks" }, "secondary")}
-        </div>
-      </div>
-      <div class="ledger-health-grid">
-        ${renderLedgerHealth("固定资产", metrics.fixedCount, "一物一码，按资产编号追踪", metrics.fixedCount ? "ok" : "warn")}
-        ${renderLedgerHealth("耗材库存", metrics.consumableQuantity, "按名称+规格扣减库存", metrics.consumableCount ? "ok" : "warn")}
-        ${renderLedgerHealth("使用绑定", metrics.currentUsingCount, "来自出入库和人员表", metrics.currentUsingCount ? "warn" : "ok")}
-        ${renderLedgerHealth("盘点异常", metrics.checkAbnormalCount, "回写台账清查情况", metrics.checkAbnormalCount ? "bad" : "ok")}
-      </div>
-    </section>
+      <i class="dashboard-card-arrow">›</i>
+    </button>
   `;
 }
 
@@ -2385,126 +2366,178 @@ function dashboardImportEmptyAction() {
   return { label: item.label, ...item.action };
 }
 
-function renderLedgerHealth(label, value, note, tone) {
-  return `
-    <article class="ledger-health-card ${tone}">
-      <span>${label}</span>
-      <strong>${value}</strong>
-      <em>${note}</em>
-    </article>
-  `;
-}
-
-function renderDashboardActionButton(label, action, cls = "secondary") {
-  return `<button class="${cls} small" data-empty-action="${attrText(JSON.stringify(action))}" type="button">${label}</button>`;
-}
-
-function renderDashboardDataFlow(metrics) {
-  const importAction = dashboardImportAction().action;
-  const checkAction = can("checks.manage") ? { view: "checks" } : { view: "checks" };
-  const steps = [
-    ["1", "底表建账", `${metrics.assetCount} 条明细`, "学校资产底表决定系统里有什么资产", importAction, metrics.assetCount ? "ok" : "warn"],
-    ["2", "父子归类", `${metrics.groupCount} 个父级`, "按资产分类 + 名称 + 规格型号汇总", { view: "assets" }, metrics.groupCount ? "ok" : "warn"],
-    ["3", "人员绑定", `${metrics.currentUsingCount} 件使用中`, "人员资产表只绑定底表已有资产编号", { view: "assets", assetStatusFilter: "checked_out" }, metrics.currentUsingCount ? "warn" : "ok"],
-    ["4", "耗材扣库", `${metrics.consumableRecordQuantity} 件已领用`, "人员耗材表从耗材库存扣减数量", { view: "inventory" }, metrics.consumableCount ? "ok" : "warn"],
-    ["5", "盘点核实", `${metrics.checkItems.length} 条盘点`, "从当前台账生成盘点范围并回写结果", checkAction, metrics.checkAbnormalCount ? "bad" : "ok"],
-    ["6", "流水追溯", `${metrics.records.length} 条流水`, "所有入库、借出、归还、调拨、维修、报废留痕", { view: "records" }, metrics.records.length ? "ok" : "warn"]
-  ];
-  return `
-    <section class="ledger-flow-panel">
-      ${steps.map(([index, title, value, note, action, tone]) => `
-        <button class="ledger-flow-step ${tone}" data-empty-action="${attrText(JSON.stringify(action))}" type="button">
-          <span>${index}</span>
-          <strong>${title}</strong>
-          <b>${value}</b>
-          <em>${note}</em>
-        </button>
-      `).join("")}
-    </section>
-  `;
-}
-
-function renderDashboardLedgerGroupsPanel(metrics) {
-  const rows = metrics.groupRows.slice(0, dashboardSearch ? 20 : 8);
+function renderDashboardLedgerGroupsPanel(metrics, options = {}) {
+  const sourceRows = options.rows || metrics.groupRows;
+  const rows = sourceRows.slice(0, dashboardSearch ? 20 : 10);
+  const title = options.title || "资产清单";
+  const hint = options.hint || (dashboardSearch ? `筛选出 ${sourceRows.length} 条` : `共 ${sourceRows.length} 条数据`);
   return `
     <section class="dashboard-panel ledger-groups-panel">
       <div class="dashboard-table-head">
         <div class="section-title compact-title">
-          <h2>资产分类清单</h2>
-          <span class="hint">${dashboardSearch ? `筛选出 ${metrics.groupRows.length} 条` : `共 ${rows.length} 条数据`}</span>
+          <h2>${title}</h2>
+          <span class="hint">${hint}</span>
         </div>
         <div class="dashboard-table-tools no-print">
           <div class="dashboard-inline-search">
             <span>⌕</span>
-            <input id="dashboardSearch" placeholder="搜索资产名称、编号或位置" value="${attrText(dashboardSearch)}" />
+            <input id="dashboardSearch" placeholder="搜索资产编号、名称、规格、位置或使用人" value="${attrText(dashboardSearch)}" />
           </div>
-          <button class="secondary small" data-empty-action="${attrText(JSON.stringify({ view: "assets" }))}" type="button">筛选</button>
+          <button class="secondary small" data-empty-action="${attrText(JSON.stringify({ view: "assets" }))}" type="button">查看台账</button>
         </div>
       </div>
-      <div class="table-wrap compact-table dashboard-ledger-table">
-        <table>
-          <thead><tr><th>资产名称</th><th>类别</th><th>数量</th><th>状态</th><th>位置/部门</th><th>操作</th></tr></thead>
-          <tbody>
-            ${rows.map((group) => `
-              <tr>
-                <td><strong>${attrText(group.name)}</strong><div class="mini-meta">${attrText(group.spec)}</div></td>
-                <td>${attrText(group.category)}</td>
-                <td>${group.quantity}</td>
-                <td>${dashboardGroupStatus(group)}</td>
-                <td>${attrText(dashboardSetText(group.locations))}<div class="mini-meta">${attrText(dashboardSetText(group.departments))}</div></td>
-                <td><button class="ghost small dashboard-detail-link" data-ledger-open-group="${attrText(group.ledgerKey)}" type="button">查看详情 ›</button></td>
-              </tr>
-            `).join("") || emptyActionRow(6, "还没有学校资产底表", "先导入学校资产 Excel 底表，后续台账、人员绑定、耗材扣库和盘点才有统一数据源。", [dashboardImportEmptyAction()])}
-          </tbody>
-        </table>
-      </div>
+      ${renderDashboardLedgerTable(rows, {
+        showCategory: options.showCategory,
+        showQuantity: options.showQuantity,
+        emptyTitle: options.emptyTitle || "还没有学校资产底表",
+        emptyText: options.emptyText || "先导入学校资产 Excel 底表，后续台账、人员绑定、耗材扣库和盘点才有统一数据源。"
+      })}
       <div class="dashboard-table-foot">
-        <span>共 ${metrics.groupRows.length} 条数据</span>
-        <span>${dashboardSearch ? "显示前 20 条匹配结果" : "默认显示前 8 条"}</span>
+        <span>共 ${sourceRows.length} 条数据</span>
+        <span>${dashboardSearch ? "显示前 20 条匹配结果" : "默认显示前 10 条"}</span>
       </div>
     </section>
   `;
 }
 
-function dashboardPeopleRows(assets, records) {
+function renderDashboardLedgerTable(rows, options = {}) {
+  const showCategory = Boolean(options.showCategory);
+  const showQuantity = Boolean(options.showQuantity);
+  const colspan = 5 + (showCategory ? 1 : 0) + (showQuantity ? 1 : 0);
+  return `
+    <div class="table-wrap compact-table dashboard-ledger-table">
+      <table>
+        <thead>
+          <tr>
+            <th>资产名称</th>
+            ${showCategory ? "<th>资产类别</th>" : ""}
+            <th>资产规格</th>
+            <th>资产状态</th>
+            <th>资产位置</th>
+            ${showQuantity ? "<th>数量</th>" : ""}
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((group) => `
+            <tr>
+              <td><strong>${attrText(group.name)}</strong></td>
+              ${showCategory ? `<td>${attrText(group.category)}</td>` : ""}
+              <td>${attrText(group.spec)}</td>
+              <td>${dashboardGroupStatus(group)}</td>
+              <td>${attrText(dashboardSetText(group.locations))}<div class="mini-meta">${attrText(dashboardSetText(group.departments))}</div></td>
+              ${showQuantity ? `<td>${group.quantity}</td>` : ""}
+              <td><button class="ghost small dashboard-detail-link" data-ledger-open-group="${attrText(group.ledgerKey)}" type="button">查看详情</button></td>
+            </tr>
+          `).join("") || emptyActionRow(colspan, options.emptyTitle, options.emptyText, [dashboardImportEmptyAction()])}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderDashboardCategoryPanel(metrics) {
+  const categories = metrics.categoryRows;
+  const activeKey = dashboardCategory && categories.some((row) => row.key === dashboardCategory)
+    ? dashboardCategory
+    : categories[0]?.key || "";
+  const active = categories.find((row) => row.key === activeKey) || null;
+  const rows = active?.groups || [];
+  return `
+    <section class="dashboard-panel dashboard-category-panel">
+      <div class="dashboard-category-layout">
+        <aside class="dashboard-category-sidebar no-print">
+          <div class="section-title compact-title">
+            <h2>资产类别</h2>
+            <span class="hint">共 ${categories.length} 类</span>
+          </div>
+          <div class="dashboard-category-list">
+            ${categories.map((category) => `
+              <button class="${category.key === activeKey ? "active" : ""}" data-dashboard-category="${attrText(category.key)}" type="button">
+                <span>${attrText(category.name)}</span>
+                <b>${category.quantity}</b>
+              </button>
+            `).join("") || renderEmptyAction("还没有资产类别", "导入学校资产底表后，系统会按资产分类自动生成这里的类别。", [dashboardImportEmptyAction()])}
+          </div>
+        </aside>
+        <div class="dashboard-category-main">
+          <div class="dashboard-table-head">
+            <div class="section-title compact-title">
+              <h2>${attrText(active?.name || "资产类别")}</h2>
+              <span class="hint">${active ? `${active.groupCount} 组 / ${active.quantity} 件` : "等待导入底表"}</span>
+            </div>
+            <div class="dashboard-table-tools no-print">
+              <div class="dashboard-inline-search">
+                <span>⌕</span>
+                <input id="dashboardSearch" placeholder="搜索资产名称、规格、位置" value="${attrText(dashboardSearch)}" />
+              </div>
+              <button class="secondary small" data-empty-action="${attrText(JSON.stringify({ view: "assets" }))}" type="button">查看台账</button>
+            </div>
+          </div>
+          ${renderDashboardLedgerTable(rows, {
+            showQuantity: true,
+            emptyTitle: "这个类别下还没有资产",
+            emptyText: "导入底表后，资产会按资产分类、名称和规格自动进入对应类别。"
+          })}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function dashboardPeopleRows(assets, records, usageKind = "asset") {
   const rows = new Map();
   const ensure = (userId) => {
     const id = userId || "u-import-unknown";
     if (!rows.has(id)) {
       rows.set(id, {
         userId: id,
-        name: userName(id),
-        department: userDepartment(id),
+        name: dashboardPersonName(id),
+        department: dashboardPersonDepartment(id),
         fixed: 0,
         consumableQuantity: 0,
+        consumableRecords: 0,
         currentUsing: 0,
         returned: 0,
+        overdue: 0,
         abnormal: 0
       });
     }
     return rows.get(id);
   };
-  for (const asset of assets) {
-    const userId = dashboardAssetUsageUserId(asset);
-    if (!userId) continue;
-    const row = ensure(userId);
-    if (assetKind(asset) === "资产") {
+  if (usageKind === "asset") {
+    for (const asset of assets) {
+      if (assetKind(asset) !== "资产" || !dashboardAssetInPersonalUse(asset)) continue;
+      const userId = dashboardAssetUsageUserId(asset);
+      if (!dashboardUsageUserValid(userId)) continue;
+      const row = ensure(userId);
       row.fixed += 1;
-      if (asset.status === "checked_out" || flow.borrowerId) row.currentUsing += 1;
+      row.currentUsing += 1;
       if (["repair", "retired"].includes(asset.status)) row.abnormal += 1;
     }
   }
-  for (const record of records) {
-    if (recordKind(record) === "耗材" && record.type === "出库") {
-      ensure(dashboardPersonKey(record.userId)).consumableQuantity += Number(record.quantity || 0);
-    }
-    if (recordKind(record) === "资产" && record.type === "入库") {
-      const userId = dashboardPersonKey(record.userId);
-      if (rows.has(userId)) rows.get(userId).returned += Number(record.quantity || 0);
+  if (usageKind === "consumable") {
+    for (const record of records) {
+      if (recordKind(record) !== "耗材" || record.type !== "出库") continue;
+      const userId = dashboardRecordUsageUserId(record);
+      if (!dashboardUsageUserValid(userId)) continue;
+      const row = ensure(userId);
+      row.consumableQuantity += Number(record.quantity || 0);
+      row.consumableRecords += 1;
     }
   }
+  if (usageKind === "asset") {
+    for (const record of records) {
+      if (recordKind(record) !== "资产" || record.type !== "入库") continue;
+      const userId = dashboardRecordUsageUserId(record);
+      if (dashboardUsageUserValid(userId) && rows.has(userId)) rows.get(userId).returned += Number(record.quantity || 0);
+    }
+  }
+  rows.forEach((row) => {
+    row.overdue = dashboardPersonOverdueCount(row.userId);
+  });
   return [...rows.values()]
-    .filter((row) => row.fixed || row.consumableQuantity || row.currentUsing || row.returned || row.abnormal)
+    .filter((row) => usageKind === "consumable" ? row.consumableQuantity : (row.fixed || row.currentUsing || row.returned || row.abnormal))
     .sort((a, b) => (b.currentUsing + b.consumableQuantity + b.fixed) - (a.currentUsing + a.consumableQuantity + a.fixed));
 }
 
@@ -2512,13 +2545,91 @@ function dashboardPersonKey(userId) {
   return userId || "u-import-unknown";
 }
 
+function dashboardVirtualOwnerKey(name) {
+  return `import-owner:${name}`;
+}
+
+function dashboardVirtualOwnerName(key) {
+  return String(key || "").startsWith("import-owner:") ? String(key).slice("import-owner:".length) : "";
+}
+
+function dashboardPersonName(userId) {
+  return dashboardVirtualOwnerName(userId) || userName(userId);
+}
+
+function dashboardPersonDepartment(userId) {
+  return dashboardVirtualOwnerName(userId) ? "按导入文件识别" : userDepartment(userId);
+}
+
+function dashboardLooksLikePersonName(name) {
+  const clean = String(name || "").replace(/\s+/g, "");
+  if (!clean || ["未知用户", "未填写"].includes(clean)) return false;
+  if (/(管理员|系统|仓库|仓储|资产|管理处|管理|部门|学院|中心|办公室|项目|网管|后勤处|教务处|财务处|专业|班级)/.test(clean)) return false;
+  return true;
+}
+
+function dashboardUsageUserValid(userId) {
+  const key = dashboardPersonKey(userId);
+  if (!key || key === "u-import-unknown") return false;
+  const virtualName = dashboardVirtualOwnerName(key);
+  if (virtualName) return dashboardLooksLikePersonName(virtualName);
+  const user = state.users.find((item) => item.id === key);
+  if (!user || user.active === false) return false;
+  const cleanName = String(user.name || "").replace(/\s+/g, "");
+  if (user.id === "u-admin" || user.username === "admin" || ["系统管理员", "管理员"].includes(cleanName)) return false;
+  return dashboardLooksLikePersonName(user.name);
+}
+
+function dashboardPersonOverdueCount(userId) {
+  const key = dashboardPersonKey(userId);
+  const now = Date.now();
+  return (state.borrowOrders || []).filter((order) => {
+    if (dashboardPersonKey(order.borrowerId) !== key) return false;
+    if (order.status === "已归还" || order.actualReturnDate) return false;
+    if (!order.expectedReturnDate) return false;
+    return new Date(order.expectedReturnDate).getTime() < now;
+  }).length;
+}
+
 function dashboardAssetUsageUserId(asset) {
+  const currentUserId = dashboardAssetCurrentUserId(asset);
+  if (currentUserId && dashboardUsageUserValid(currentUserId)) return currentUserId;
+  const latestOut = latestAssetRecord(asset, "出库");
+  const importOwner = dashboardImportOwnerForRecord(latestOut, asset);
+  if (importOwner) return dashboardVirtualOwnerKey(importOwner);
   const flow = assetFlow(asset);
   if (flow.borrowerId) return dashboardPersonKey(flow.borrowerId);
-  if ((asset.status === "checked_out" || asset.status === "使用中") && (asset.useUserId || asset.keeperId)) {
-    return dashboardPersonKey(asset.useUserId || asset.keeperId);
-  }
+  if (currentUserId) return currentUserId;
   return "";
+}
+
+function dashboardAssetCurrentUserId(asset) {
+  if (!(asset.status === "checked_out" || asset.status === "使用中")) return "";
+  return dashboardPersonKey(asset.useUserId || asset.keeperId || "");
+}
+
+function dashboardAssetInPersonalUse(asset) {
+  if (assetKind(asset) !== "资产") return false;
+  const flow = assetFlow(asset);
+  return asset.status === "checked_out" || Boolean(flow.borrowerId);
+}
+
+function dashboardRecordUsageUserId(record) {
+  const asset = dashboardRecordAsset(record);
+  const importOwner = dashboardImportOwnerForRecord(record, asset);
+  if (importOwner) return dashboardVirtualOwnerKey(importOwner);
+  return dashboardPersonKey(record?.userId);
+}
+
+function dashboardImportOwnerForRecord(record, asset) {
+  if (!record || !asset) return "";
+  const user = state.users.find((item) => item.id === record.userId);
+  const userKey = compactAssetText(user?.name);
+  const assetKeys = [asset.name, asset.spec].map(compactAssetText).filter(Boolean);
+  if (!userKey || !assetKeys.includes(userKey)) return "";
+  const file = sourceFilesFromText(record.note).slice(-1)[0] || sourceFilesFromText(asset.remark).slice(-1)[0] || "";
+  const owner = personNameFromImportFileName(file);
+  return owner && compactAssetText(owner) !== userKey ? owner : "";
 }
 
 function dashboardPersonFixedAssets(userId, assets) {
@@ -2530,13 +2641,13 @@ function dashboardPersonFixedAssets(userId, assets) {
 
 function dashboardPersonConsumableRecords(userId, records) {
   return records
-    .filter((record) => recordKind(record) === "耗材" && record.type === "出库" && dashboardPersonKey(record.userId) === userId)
+    .filter((record) => recordKind(record) === "耗材" && record.type === "出库" && dashboardRecordUsageUserId(record) === userId)
     .sort((a, b) => recordMillis(b) - recordMillis(a));
 }
 
 function dashboardPersonRecordRows(userId, records) {
   return records
-    .filter((record) => dashboardPersonKey(record.userId) === userId)
+    .filter((record) => dashboardRecordUsageUserId(record) === userId)
     .sort((a, b) => recordMillis(b) - recordMillis(a))
     .slice(0, 12);
 }
@@ -2545,50 +2656,106 @@ function dashboardRecordAsset(record) {
   return state.assets.find((asset) => asset.id === record.assetId) || null;
 }
 
-function renderDashboardUsageDrawer(metrics) {
-  const rows = metrics.peopleRows;
-  const selectedUserId = dashboardUsageUserId && rows.some((row) => row.userId === dashboardUsageUserId)
-    ? dashboardUsageUserId
-    : rows[0]?.userId || "";
-  const selectedRow = rows.find((row) => row.userId === selectedUserId) || null;
+function renderDashboardUsagePanel(metrics, usageKind = "asset") {
+  const isConsumable = usageKind === "consumable";
+  const rows = isConsumable ? metrics.consumablePeopleRows : metrics.assetPeopleRows;
+  const selectedRow = rows.find((row) => row.userId === dashboardUsageUserId) || null;
+  const title = isConsumable ? "耗材使用情况" : "资产使用情况";
+  const hint = isConsumable
+    ? `共 ${rows.length} 个人员 / ${metrics.consumableRecordQuantity} 件耗材已领用`
+    : `共 ${rows.length} 个人员 / ${metrics.currentUsingCount} 件资产使用中`;
   return `
-    <div class="drawer-backdrop no-print" id="dashboardUsageBackdrop"></div>
-    <aside class="asset-drawer dashboard-usage-drawer resizable-drawer no-print" ${drawerWidthStyle("dashboard-usage", 900)} aria-label="人员使用情况">
-      ${renderDrawerResizeHandle("拖动调整人员使用情况窗口宽度")}
-      <div class="drawer-head">
-        <div>
-          <h2>人员使用情况</h2>
-          <p>按同一份资产底账、人员资产表、耗材领用表和出入库流水自动生成。</p>
+    <section class="dashboard-panel dashboard-usage-panel">
+      <div class="dashboard-table-head">
+        <div class="section-title compact-title">
+          <h2>${title}</h2>
+          <span class="hint">${hint}</span>
         </div>
-        <button class="ghost icon-button" id="closeDashboardUsage" type="button">×</button>
-      </div>
-      <div class="drawer-body">
-        ${rows.length ? `
-          <div class="dashboard-usage-layout">
-            <div class="dashboard-usage-people">
-              ${rows.map((row) => `
-                <button class="${row.userId === selectedUserId ? "active" : ""}" data-dashboard-person="${attrText(row.userId)}" type="button">
-                  <span>
-                    <strong>${attrText(row.name)}</strong>
-                    <em>${attrText(row.department || "-")}</em>
-                  </span>
-                  <b>${row.currentUsing}</b>
-                </button>
-              `).join("")}
-            </div>
-            ${renderDashboardUsageDetail(selectedRow, metrics)}
+        <div class="dashboard-table-tools no-print">
+          <div class="dashboard-inline-search">
+            <span>⌕</span>
+            <input id="dashboardSearch" placeholder="搜索姓名、部门或资产名称" value="${attrText(dashboardSearch)}" />
           </div>
-        ` : renderEmptyAction("还没有人员使用记录", "导入人员资产使用表、人员耗材领用表，或在台账里划一笔出借后，这里会自动按人员汇总。", can("records.manage") ? [{ label: "导入人员表", view: "records", mode: "import", importKind: "inbound" }, { label: "划一笔出借", view: "records", mode: "manual", action: "lend" }] : [{ label: "查看资产台账", view: "assets" }])}
+          <button class="secondary small" data-empty-action="${attrText(JSON.stringify({ view: "records", mode: "import", importKind: isConsumable ? "personConsumable" : "personAsset" }))}" type="button">导入人员表</button>
+        </div>
       </div>
-    </aside>
+      <div class="dashboard-usage-tabs no-print">
+        <button class="${!isConsumable ? "active" : ""}" data-dashboard-mode="assetUsage" type="button">资产使用情况</button>
+        <button class="${isConsumable ? "active" : ""}" data-dashboard-mode="consumableUsage" type="button">耗材使用情况</button>
+      </div>
+      ${rows.length ? `
+        <div class="dashboard-usage-cards">
+          ${rows.map((row) => renderDashboardUsageCard(row, metrics, selectedRow?.userId === row.userId, usageKind)).join("")}
+        </div>
+        ${selectedRow ? `
+          <div class="dashboard-usage-detail-shell">
+            <div class="asset-list-title">
+              <div>
+                <h3>${attrText(selectedRow.name)}的${isConsumable ? "耗材领用明细" : "资产使用明细"}</h3>
+                <span>${attrText(selectedRow.department || "-")} · ${isConsumable ? `耗材领用 ${selectedRow.consumableQuantity} 件` : `固定资产 ${selectedRow.fixed} 件`}</span>
+              </div>
+              <button class="ghost small" data-dashboard-person-clear type="button">收起明细</button>
+            </div>
+            ${renderDashboardUsageDetail(selectedRow, metrics, usageKind)}
+          </div>
+        ` : ""}
+      ` : renderEmptyAction(`还没有${isConsumable ? "耗材" : "资产"}使用记录`, isConsumable ? "导入人员耗材领用表或登记耗材领用后，这里会按人员汇总。" : "导入人员资产使用表或划一笔出借后，这里会按人员汇总。", can("records.manage") ? [{ label: isConsumable ? "导入耗材表" : "导入人员资产表", view: "records", mode: "import", importKind: isConsumable ? "personConsumable" : "personAsset" }] : [{ label: "查看资产台账", view: "assets" }])}
+    </section>
   `;
 }
 
-function renderDashboardUsageDetail(row, metrics) {
+function renderDashboardUsageCard(row, metrics, active, usageKind = "asset") {
+  const isConsumable = usageKind === "consumable";
+  return `
+    <button class="dashboard-usage-card ${active ? "active" : ""}" data-dashboard-person-card="${attrText(row.userId)}" type="button">
+      <span class="dashboard-usage-avatar ${isConsumable ? "consumable" : ""}">${isConsumable ? "耗" : "人"}</span>
+      <span class="dashboard-usage-card-main">
+        <span class="dashboard-usage-card-head">
+          <span>
+            <strong>${attrText(row.name)}</strong>
+            <em>${attrText(row.department || "-")}</em>
+          </span>
+          <span class="dashboard-usage-card-metrics">
+            <span><b>${isConsumable ? row.consumableQuantity : row.currentUsing}</b><em>${isConsumable ? "领用耗材" : "使用中资产"}</em></span>
+            <span><b class="${!isConsumable && row.overdue ? "bad-text" : ""}">${isConsumable ? row.consumableRecords : row.overdue}</b><em>${isConsumable ? "领用次数" : "逾期"}</em></span>
+          </span>
+        </span>
+        ${renderDashboardUsagePreview(row, metrics, usageKind)}
+      </span>
+    </button>
+  `;
+}
+
+function renderDashboardUsagePreview(row, metrics, usageKind = "asset") {
+  const fixedAssets = usageKind === "asset" ? dashboardPersonFixedAssets(row.userId, metrics.assets).slice(0, 3) : [];
+  const consumableRecords = usageKind === "consumable" ? dashboardPersonConsumableRecords(row.userId, metrics.records).slice(0, 3) : [];
+  const items = usageKind === "asset"
+    ? fixedAssets.map((asset) => ({
+      label: `${asset.name || "-"}${asset.spec ? ` ${asset.spec}` : ""}`,
+      badge: statusBadge(asset.status)
+    }))
+    : consumableRecords.map((record) => {
+      const asset = dashboardRecordAsset(record);
+      return {
+        label: `${asset?.name || assetName(record.assetId)} × ${record.quantity || 0}`,
+        badge: `<span class="badge ok">已领用</span>`
+      };
+    });
+  if (!items.length) return `<span class="dashboard-usage-preview empty">暂无${usageKind === "consumable" ? "耗材" : "资产"}预览</span>`;
+  return `
+    <span class="dashboard-usage-preview">
+      <strong>${usageKind === "consumable" ? "领用耗材" : "借用资产"}（预览）</strong>
+      ${items.map((item) => `<span><i>${attrText(item.label)}</i>${item.badge}</span>`).join("")}
+    </span>
+  `;
+}
+
+function renderDashboardUsageDetail(row, metrics, usageKind = "asset") {
   if (!row) return `<div class="empty compact-empty">请选择人员查看明细。</div>`;
   const fixedAssets = dashboardPersonFixedAssets(row.userId, metrics.assets);
   const consumableRecords = dashboardPersonConsumableRecords(row.userId, metrics.records);
   const records = dashboardPersonRecordRows(row.userId, metrics.records);
+  const isConsumable = usageKind === "consumable";
   return `
     <section class="dashboard-usage-detail">
       <div class="dashboard-usage-summary">
@@ -2597,17 +2764,11 @@ function renderDashboardUsageDetail(row, metrics) {
         <div><span>使用中</span><strong>${row.currentUsing}</strong></div>
         <div><span>异常</span><strong>${row.abnormal}</strong></div>
       </div>
-      <div class="dashboard-usage-section">
-        <h3>固定资产</h3>
-        ${renderDashboardPersonAssetTable(fixedAssets)}
-      </div>
-      <div class="dashboard-usage-section">
-        <h3>耗材领用</h3>
-        ${renderDashboardPersonConsumableTable(consumableRecords)}
-      </div>
+      ${!isConsumable ? `<div class="dashboard-usage-section"><h3>固定资产</h3>${renderDashboardPersonAssetTable(fixedAssets)}</div>` : ""}
+      ${isConsumable ? `<div class="dashboard-usage-section"><h3>耗材领用</h3>${renderDashboardPersonConsumableTable(consumableRecords)}</div>` : ""}
       <div class="dashboard-usage-section">
         <h3>最近出入库记录</h3>
-        ${renderDashboardPersonRecordList(records)}
+        ${renderDashboardPersonRecordList(records.filter((record) => usageKind === "consumable" ? recordKind(record) === "耗材" : recordKind(record) === "资产"))}
       </div>
     </section>
   `;
@@ -2679,60 +2840,6 @@ function renderDashboardPersonRecordList(records) {
   `;
 }
 
-function renderDashboardPeoplePanel(metrics) {
-  const rows = metrics.peopleRows.slice(0, dashboardSearch ? 20 : 8);
-  return `
-    <section class="dashboard-panel">
-      <div class="section-title compact-title">
-        <h2>人员使用情况</h2>
-        <span class="hint">由资产状态和出入库流水自动生成</span>
-      </div>
-      <div class="dashboard-person-list">
-        ${rows.map((row) => `
-          <article class="dashboard-person-row">
-            <div>
-              <strong>${attrText(row.name)}</strong>
-              <span>${attrText(row.department || "-")}</span>
-            </div>
-            <dl>
-              <div><dt>固定资产</dt><dd>${row.fixed}</dd></div>
-              <div><dt>耗材领用</dt><dd>${row.consumableQuantity}</dd></div>
-              <div><dt>使用中</dt><dd>${row.currentUsing}</dd></div>
-              <div><dt>异常</dt><dd>${row.abnormal}</dd></div>
-            </dl>
-          </article>
-        `).join("") || renderEmptyAction("还没有人员使用记录", "导入人员资产使用表或登记划一笔出借后，人员视角会自动从同一份底账生成。", can("records.manage") ? [{ label: "导入人员表", view: "records", mode: "import", importKind: "inbound" }, { label: "划一笔出借", view: "records", mode: "manual", action: "lend" }] : [{ label: "查看资产台账", view: "assets" }])}
-      </div>
-    </section>
-  `;
-}
-
-function renderDashboardExceptionsPanel(metrics, paperPending) {
-  const rows = [
-    ["状态不可用", metrics.unavailableCount, "维修中或已报废资产不能直接借用/领用", { view: "assets", assetStatusFilter: "repair" }],
-    ["盘点异常", metrics.checkAbnormalCount, "位置不符、盘亏、损坏、盘盈等盘点差异", { view: "checks" }],
-    ["导入异常", metrics.importExceptionCount, "资产编号不存在、冲突或库存不足", { view: "records", mode: "import" }],
-    ["纸质单待处理", paperPending, "纸质单据需要复核、归档或电子化留档", { view: "records", mode: "import", importKind: "word" }]
-  ];
-  return `
-    <section class="dashboard-panel">
-      <div class="section-title compact-title">
-        <h2>异常与待处理</h2>
-        <span class="hint">阻止错误导入和重复建账</span>
-      </div>
-      <div class="reminder-list">
-        ${rows.map(([label, value, note, action]) => `
-          <button class="reminder-row ${value ? "bad" : "ok"} dashboard-action-row" data-empty-action="${attrText(JSON.stringify(action))}" type="button">
-            <span class="reminder-dot"></span>
-            <div><strong>${label}</strong><em>${note}</em></div>
-            <b>${value}</b>
-          </button>
-        `).join("")}
-      </div>
-    </section>
-  `;
-}
-
 function dashboardStatCard(label, value, sub, icon) {
   return `
     <article class="dashboard-stat">
@@ -2743,100 +2850,6 @@ function dashboardStatCard(label, value, sub, icon) {
         <em>${sub}</em>
       </div>
     </article>
-  `;
-}
-
-function renderDashboardRecordPanel(title, records, emptyText) {
-  return `
-    <section class="dashboard-panel dashboard-record-panel">
-      <div class="section-title compact-title"><h2>${title}</h2><span class="hint">${records.length} 条</span></div>
-      ${renderDashboardRecordRows(records, emptyText)}
-    </section>
-  `;
-}
-
-function renderDashboardRecordRows(records, emptyText) {
-  if (!records.length) {
-    const isConsumable = emptyText.includes("耗材");
-    const isLedgerFlow = emptyText.includes("联动");
-    return renderEmptyAction(
-      emptyText,
-      isLedgerFlow
-        ? "导入学校资产底表、绑定人员资产、登记耗材领用或录入盘点后，系统会把同一份底账上的变化串成流水。"
-        : isConsumable ? "先完成耗材入库或领用，系统会在总览展示最近流水。" : "先完成资产入库、划一笔出借或电子档导入，系统会在总览展示最近流水。",
-      isLedgerFlow
-        ? can("records.manage")
-          ? [{ label: "导入学校资产底表", view: "records", mode: "import", importKind: "inbound" }, { label: "Word出借单导入", view: "records", mode: "import", importKind: "word" }]
-          : [{ label: "查看资产台账", view: "assets" }]
-        : isConsumable ? consumableEntryActions() : recordEntryActions()
-    );
-  }
-  return `<div class="dashboard-record-list">${records.map((record) => {
-    const asset = state.assets.find((item) => item.id === record.assetId) || {};
-    return `
-      <article class="dashboard-record-row">
-        <div class="record-main">
-          <strong>${asset.name || assetName(record.assetId)}</strong>
-          <span>${record.type} · ${recordDocumentType(record)} · ${userName(record.userId)}</span>
-          <em>${fmt(recordTime(record))} / 数量 ${record.quantity || "-"}</em>
-        </div>
-        <div class="record-side">
-          ${statusBadge(record.status)}
-          ${isAdmin() ? `<button class="danger small" data-delete-record="${record.id}" type="button">删除</button>` : ""}
-        </div>
-      </article>
-    `;
-  }).join("")}</div>`;
-}
-
-function renderReminderPanel(title, items, kind, activeCount, paperPending) {
-  const isConsumable = kind === "耗材";
-  const inStock = items.filter((asset) => asset.status === "in_stock").length;
-  const abnormal = items.filter((asset) => ["repair", "retired"].includes(asset.status)).length;
-  return `
-    <section class="dashboard-panel dashboard-reminder-panel">
-      <div class="section-title compact-title"><h2>${title}</h2><span class="hint">${items.length} 项</span></div>
-      <div class="reminder-list">
-        ${isConsumable
-          ? reminderRow("不可出借", `${abnormal} 项`, abnormal ? "bad" : "ok", "维修中或已报废的耗材")
-          : reminderRow("维修/报废", `${abnormal} 项`, abnormal ? "bad" : "ok", "当前不可直接领用或出借的资产")}
-        ${reminderRow(isConsumable ? "领用中" : "待归还", `${activeCount} 项`, activeCount ? "warn" : "ok", isConsumable ? "当前处于领用中的耗材" : "当前处于出库中的资产")}
-        ${reminderRow("可用库存", `${inStock} 项`, "ok", `仍在库的${kind}`)}
-        ${reminderRow("纸质单待处理", `${paperPending} 张`, paperPending ? "bad" : "ok", "等待复核、归档或电子化留档")}
-      </div>
-    </section>
-  `;
-}
-
-function reminderRow(label, value, tone, note) {
-  return `
-    <div class="reminder-row ${tone}">
-      <span class="reminder-dot"></span>
-      <div>
-        <strong>${label}</strong>
-        <em>${note}</em>
-      </div>
-      <b>${value}</b>
-    </div>
-  `;
-}
-
-function renderAssetCards(items, emptyText) {
-  const visible = items.slice(0, dashboardSearch ? 50 : 8);
-  return `
-    <div class="record-list">
-      ${visible.map((asset) => `
-        <article class="record-card">
-          <div class="card-head">
-            <strong>${asset.name} · ${asset.code}</strong>
-            ${isAdmin() ? `<button class="danger small" data-delete-asset="${asset.id}" type="button">删除</button>` : ""}
-          </div>
-          <p>${statusBadge(asset.status)} 数量：${asset.quantity}，位置：${blank(asset.location)}</p>
-          <p>借用人：${assetFlow(asset).borrowerName}，借出：${assetFlow(asset).borrowTime}，最近归还：${assetFlow(asset).returnTime}</p>
-          <p>保管人：${userName(asset.keeperId)}，备注：${displayRemark(asset.remark)}</p>
-        </article>
-      `).join("") || `<div class="empty">${emptyText}</div>`}
-    </div>
   `;
 }
 
@@ -2865,7 +2878,7 @@ function recordEntryActions() {
 }
 
 function consumableEntryActions() {
-  if (!can("records.manage")) return [{ label: "查看耗材库存", view: "inventory" }];
+  if (!can("records.manage")) return [{ label: "查看出入库记录", view: "records" }];
   return [
     { label: "耗材领用", view: "records", mode: "manual", action: "consume" },
     { label: "新增入库", view: "records", mode: "manual", action: "inbound" }
@@ -2879,6 +2892,8 @@ function renderAssetBatchToolbar(groups) {
     <div class="asset-batch-toolbar no-print">
       <span>已选 ${selected.length} 组 / ${selectedLedgerAssets(groups).length} 条资产</span>
       <div class="row-actions">
+        ${can("assets.manage") ? `<button class="secondary small" id="batchUpdateAssetLocations" type="button">更新位置</button>` : ""}
+        ${can("assets.manage") ? `<button class="secondary small" id="batchUpdateAssetImages" type="button">增加参考图</button>` : ""}
         <button class="secondary small" id="batchExportAssets" type="button">批量导出</button>
         <button class="secondary small" id="batchPrintAssetLabels" type="button">批量打印标签</button>
         ${can("base_data.manage") ? `<button class="secondary small" id="batchClassifyAssets" type="button">批量归类</button>` : ""}
@@ -2929,15 +2944,6 @@ function renderAssetLedgerActions(group) {
         ${groupHasStatus(group, "in_stock") ? `<button class="ghost small" data-ledger-status="in_stock" data-ledger-group="${attrText(group.key)}" type="button">在库划一笔</button>` : ""}
       </div>
     </td>
-  `;
-}
-
-function renderAssetLedgerGroupManager(groups) {
-  if (!can("base_data.view")) return "";
-  return `
-    <div id="assetDeviceGroupOverview" class="asset-device-group-overview no-print">
-      ${renderDeviceGroupOverview(groups)}
-    </div>
   `;
 }
 
@@ -3004,6 +3010,8 @@ function renderAssets() {
           ${renderAssetPagination(groups.length, totalPages, "top")}
         </div>
       ${renderAssetBatchToolbar(groups)}
+      ${assetLocationUpdateResult ? renderImportResult("位置更新结果", assetLocationUpdateResult) : ""}
+      ${assetImageUpdateResult ? renderImportResult("参考图更新结果", assetImageUpdateResult) : ""}
       <div class="table-wrap asset-table-wrap">
         <table>
           <thead>
@@ -3163,6 +3171,15 @@ function renderLedgerCheckoutForm(asset) {
   `;
 }
 
+function renderLedgerLocationCell(asset) {
+  return `
+    <div class="ledger-location-cell">
+      <span>${attrText(blank(asset.location))}</span>
+      ${can("assets.manage") ? `<button class="ghost small" data-ledger-location-edit="${asset.id}" type="button">更新位置</button>` : ""}
+    </div>
+  `;
+}
+
 function renderLedgerAssetRows(group, mode) {
   const assets = ledgerAssetsByStatus(group, mode === "group" ? "all" : mode);
   if (!assets.length) return `<div class="empty compact-empty">当前筛选下没有资产编号。</div>`;
@@ -3174,12 +3191,12 @@ function renderLedgerAssetRows(group, mode) {
         </thead>
         <tbody>
           ${assets.map((asset) => `
-            <tr>
+            <tr data-ledger-asset-row="${asset.id}">
               <td><button class="ledger-code-button" data-ledger-focus-asset="${asset.id}" type="button">${attrText(asset.code)}</button></td>
               <td>${statusBadge(asset.status)}</td>
               <td>${attrText(assetCurrentDepartment(asset))}</td>
               <td>${attrText(assetCurrentUserName(asset))}</td>
-              <td>${attrText(blank(asset.location))}</td>
+              <td>${renderLedgerLocationCell(asset)}</td>
               <td>${attrText(blank(asset.purchaseDate || asset.inboundDate))}</td>
               <td>${Number(asset.totalAmount || asset.unitPrice || 0).toFixed(2)}</td>
               <td>${attrText(blank(assetRemarkField(asset, ["清查盘点情况", "4月12日清查盘点情况"])))}</td>
@@ -3392,28 +3409,6 @@ function inventoryAvailabilityBadge(asset) {
   if (asset.status === "retired") return `<span class="badge bad">停用</span>`;
   if (asset.status === "repair") return `<span class="badge warn">维修中</span>`;
   return stockLevelText(asset);
-}
-
-function renderInventoryFlow(records, emptyText) {
-  return `
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>时间</th><th>耗材</th><th>数量</th><th>经办/领用人</th><th>单号</th><th>备注</th></tr></thead>
-        <tbody>
-          ${records.map((record) => `
-            <tr>
-              <td>${fmt(record.type === "入库" ? record.inTime : record.outTime)}</td>
-              <td>${assetName(record.assetId)}</td>
-              <td>${record.quantity}</td>
-              <td>${userName(record.userId)}</td>
-              <td>${blank(record.paperNo)}</td>
-              <td>${recordDisplayNote(record)}</td>
-            </tr>
-          `).join("") || emptyActionRow(6, emptyText, "先通过日常登记录入耗材入库、领用或退回，系统会在这里沉淀库存流水。", consumableEntryActions())}
-        </tbody>
-      </table>
-    </div>
-  `;
 }
 
 function renderInventoryStatusTable(items) {
@@ -3758,9 +3753,6 @@ function checkStatusSummary(statusCounts) {
     || `<span class="ledger-status-chip muted">暂无状态</span>`;
 }
 
-function blankLocationOptions(selected = "") {
-  return `<option value="" ${selected ? "" : "selected"}>留白</option>${locationOptions(selected)}`;
-}
 
 function blankStatusOptions(selected = "") {
   return `<option value="" ${selected ? "" : "selected"}>留白</option>${statusSelectOptions(selected)}`;
@@ -3824,47 +3816,6 @@ function renderCheckGroupPanel(groups, activeTask) {
                 <td><button class="${group.key === selectedCheckGroupKey ? "primary" : "secondary"} small" data-check-group="${attrText(group.key)}" type="button">查看编号</button></td>
               </tr>
             `).join("") || emptyActionRow(7, "还没有可盘点资产", "先导入学校资产 Excel 底表，盘点任务会从这份底账自动生成。", [{ label: "导入学校资产底表", view: "records", mode: "import" }])}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  `;
-}
-
-function renderCheckItemRow(item, activeItem, activeTask) {
-  const asset = checkAsset(item);
-  const canEdit = activeTask && can("checks.manage") && !item.previewOnly;
-  const isActive = activeItem?.id === item.id;
-  return `
-    <tr class="${isActive ? "check-item-active" : ""}">
-      <td>${isActive ? `<span class="badge warn">当前</span>` : checkDiffBadge(item.diffType)}</td>
-      <td><button class="ledger-code-button" data-check-active-item="${item.id}" data-check-group="${attrText(checkGroupKeyForItem(item))}" type="button">${attrText(asset.code || item.assetId || "-")}</button></td>
-      <td><strong>${attrText(asset.name || "未知资产")}</strong><div class="mini-meta">${attrText(displayCategoryText(asset.category || "-"))} · ${attrText(asset.spec || "未填写规格")}</div></td>
-      <td>${attrText(item.systemLocation || asset.location || "")}</td>
-      <td>${canEdit ? `<select data-check-location="${item.id}">${blankLocationOptions(item.actualLocation || "")}</select>` : attrText(item.actualLocation || "")}</td>
-      <td>${statusBadge(item.systemStatus || asset.status)}</td>
-      <td>${canEdit ? `<select data-check-status="${item.id}">${blankStatusOptions(item.actualStatus || "")}</select>` : attrText(statusText(item.actualStatus || ""))}</td>
-      <td>${userName(item.systemKeeperId || asset.keeperId || asset.useUserId)}</td>
-      <td>${canEdit ? `<select data-check-keeper="${item.id}">${blankKeeperOptions(item.actualKeeperId || "")}</select>` : attrText(item.actualKeeperId ? userName(item.actualKeeperId) : "")}</td>
-      <td>${canEdit ? `<input data-check-remark="${item.id}" value="${attrText(item.remark || "")}" placeholder="留白或填写异常说明" />` : attrText(item.remark || "")}</td>
-      <td>${canEdit ? `<button class="secondary small" data-save-check-item="${item.id}" type="button">保存并下一个</button>` : "-"}</td>
-    </tr>
-  `;
-}
-
-function renderCheckItemPanel(selectedGroup, activeItem, activeTask) {
-  return `
-    <section class="panel check-item-panel">
-      <div class="section-title">
-        <h2>盘点清单</h2>
-        <span class="hint">${selectedGroup ? `${selectedGroup.name} · ${selectedGroup.location}` : "点击上面的资产名称查看具体资产编号"}</span>
-      </div>
-      ${!activeTask && selectedGroup ? `<p class="hint check-preview-hint">下面是当前导入底账中的资产编号预览。生成盘点任务后，可以逐个保存，完成一个会自动跳到下一个。</p>` : ""}
-      <div class="table-wrap compact-table check-item-table">
-        <table>
-          <thead><tr><th>进度</th><th>资产编号</th><th>资产</th><th>账面位置</th><th>实际位置</th><th>账面状态</th><th>实际状态</th><th>账面使用人</th><th>实际使用人</th><th>备注</th><th>操作</th></tr></thead>
-          <tbody>
-            ${selectedGroup?.items.map((item) => renderCheckItemRow(item, activeItem, activeTask)).join("") || emptyActionRow(11, "请选择一个资产分组", "点击上方资产名称后，这里会列出该组下面所有资产编号。", [{ label: "查看资产台账", view: "assets" }])}
           </tbody>
         </table>
       </div>
@@ -4629,77 +4580,269 @@ function renderRecordModePanel() {
   `;
 }
 
-function renderImportPanel() {
-  return `<section class="panel">${renderImportPanelInner()}</section>`;
-}
-
 function renderImportPanelInner() {
   const config = importConfig();
-  const fileTypeText = importKind === "word" ? "支持 .docx 格式，可批量上传 Word 出借单" : "支持 .xlsx、.csv 格式，单次导入不超过 5000 条";
+  const result = activeImportResult();
   return `
-      <form id="bulkImportForm" class="import-flow import-board">
-        <div class="import-progress">
-          ${[
-            ["1", "上传文件", "选择或拖拽文件上传"],
-            ["2", "预览与校验", "校验数据并预览结果"],
-            ["3", "确认导入", "确认无误后完成导入"]
-          ].map(([index, title, desc], stepIndex) => `
-            <div class="import-progress-step ${stepIndex === 0 ? "active" : ""}">
-              <span>${index}</span>
-              <div><strong>${title}</strong><em>${desc}</em></div>
-            </div>
-          `).join("")}
-        </div>
-        <div class="import-kind-pills" aria-label="导入文件类型">
-          <button class="${importKind === "inbound" ? "active" : ""}" data-import-kind="inbound" type="button">Excel / CSV 入库表</button>
-          <button class="${importKind === "word" ? "active" : ""}" data-import-kind="word" type="button">Word 出借单</button>
-        </div>
-        <section class="import-upload-card">
-          <input id="bulkFileInput" name="file" class="visually-hidden" type="file" accept="${config.accept}" multiple />
-          <input id="bulkFolderInput" name="folder" class="visually-hidden" type="file" accept="${config.accept}" multiple webkitdirectory directory />
-          <div class="upload-zone" data-upload-zone>
-            <div class="upload-icon">☁</div>
-            <strong>拖拽文件到此处，或<span>点击上传</span></strong>
-            <p>${fileTypeText}</p>
-            <div class="upload-actions">
-              <label class="secondary" for="bulkFileInput">选择文件</label>
-              <label class="secondary" for="bulkFolderInput">选择文件夹</label>
-            </div>
+      <section class="record-import-shell">
+        <form id="bulkImportForm" class="import-flow import-board">
+          <div class="import-progress">
+            ${[
+              ["1", "上传文件", "选择或拖拽文件上传"],
+              ["2", "预览与校验", "校验数据并预览结果"],
+              ["3", "确认导入", "确认无误后完成导入"]
+            ].map(([index, title, desc], stepIndex) => `
+              <div class="import-progress-step ${stepIndex === 0 ? "active" : ""}">
+                <span>${index}</span>
+                <div><strong>${title}</strong><em>${desc}</em></div>
+              </div>
+            `).join("")}
           </div>
-          <div class="selected-files" id="selectedImportFiles">
-            <span class="hint">尚未选择文件</span>
+          <div class="record-import-grid">
+            <section class="import-upload-panel">
+              <div class="import-panel-title">
+                <div><span class="panel-title-icon">▧</span><h3>上传文件</h3></div>
+                <em>${attrText(config.shortLabel)}</em>
+              </div>
+              <div class="import-kind-grid compact-import-kind-grid" aria-label="导入文件类型">
+                ${importKindOptions().map((item) => `
+                  <button class="kind-card ${importKind === item.key ? "active" : ""}" data-import-kind="${item.key}" type="button">
+                    <b>${item.icon}</b>
+                    <span><strong>${item.label}</strong><em>${item.desc}</em></span>
+                  </button>
+                `).join("")}
+              </div>
+              <input id="bulkFileInput" name="file" class="visually-hidden" type="file" accept="${config.accept}" multiple />
+              <input id="bulkFolderInput" name="folder" class="visually-hidden" type="file" accept="${config.accept}" multiple webkitdirectory directory />
+              <div class="upload-zone" data-upload-zone>
+                <div class="upload-icon">⇧</div>
+                <strong>将文件拖拽到此处，或点击<span>选择文件</span></strong>
+                <p>${attrText(config.uploadHint)}</p>
+                <div class="upload-actions">
+                  <label class="primary" for="bulkFileInput">▣ 选择文件</label>
+                  <label class="secondary" for="bulkFolderInput">▢ 选择文件夹</label>
+                </div>
+              </div>
+              <div class="selected-files" id="selectedImportFiles">
+                <span class="hint">尚未选择文件</span>
+              </div>
+              <div class="import-template-actions">
+                <span>快速下载模板</span>
+                <button class="secondary small" id="downloadInboundTemplate" data-template-format="csv" type="button">Excel / CSV 模板下载</button>
+              </div>
+              <div class="import-submit-row">
+                <span class="hint">${attrText(config.description)}</span>
+                <button class="primary" type="submit">${attrText(config.button)}</button>
+              </div>
+            </section>
+            ${renderImportPreviewPanel(result)}
           </div>
-          <div class="import-submit-row">
-            <span class="hint">${config.description}</span>
-            <button class="primary" type="submit">${config.button}</button>
-          </div>
-        </section>
-      </form>
-      <section class="import-guide-panel">
-        <div class="import-guide-copy">
-          <div class="guide-title"><span>i</span><h3>导入说明</h3></div>
-          <ul>
-            <li>请先下载导入模板，按模板格式填写数据后再上传，确保导入顺利完成。</li>
-            <li>支持 .xlsx、.csv 格式文件，单次导入数据不超过 5000 条。</li>
-            <li>系统将自动校验数据的必填项、格式、重复等问题，校验通过后方可导入。</li>
-            <li>重复文件和重复行会自动标记；已存在资产/耗材只更新原记录，不新增重复资产。</li>
-            <li>导入成功后，系统将生成出入库记录并更新库存数量。</li>
-          </ul>
-        </div>
-        <div class="template-download-card">
-          <span class="template-icon">☷</span>
-          <div>
-            <strong>下载导入模板</strong>
-            <p>最新版本：v1.0.0 ｜ 更新于 2026-06-01</p>
-            <p>支持 Excel（.xlsx）或 CSV 格式</p>
-          </div>
-          <button class="secondary" id="downloadInboundTemplate" type="button">下载导入模板</button>
+        </form>
+        <div class="record-import-info-grid">
+          ${renderImportGuideCard()}
+          ${renderPaperDigitalCard()}
         </div>
       </section>
-      ${importResult ? renderImportResult("入库导入结果", importResult) : ""}
-      ${wordImportResult ? renderImportResult("Word 出借导入结果", wordImportResult) : ""}
+      ${result ? renderImportResult(`${config.resultTitle}结果`, result) : ""}
       ${renderImportArchives()}
-      ${isPaperModuleEnabled() ? renderPaperQueuePanel() : ""}
+  `;
+}
+
+function importKindOptions() {
+  return [
+    { key: "inbound", icon: "1", label: "学校资产底表", desc: "资产/耗材建账入库" },
+    { key: "personAsset", icon: "2", label: "人员资产使用表", desc: "按资产编号绑定人员" },
+    { key: "personConsumable", icon: "3", label: "人员耗材领用表", desc: "按耗材库存扣减" },
+    { key: "word", icon: "4", label: "Word 出借单", desc: "纸质单据电子化" }
+  ];
+}
+
+function importKindLabel(kind = importKind) {
+  return importKindOptions().find((item) => item.key === kind)?.label || "电子档导入";
+}
+
+function activeImportResult() {
+  return importKind === "word" ? wordImportResult : importResult;
+}
+
+function importPreviewMetrics(result = activeImportResult()) {
+  if (result) {
+    const skipped = result.skipped || [];
+    const recognized = Math.max(importProcessedCount(result) + skipped.length, Number(result.processedRows || 0));
+    const abnormal = skipped.length + Number(result.duplicateRows || 0) + Number(result.duplicateFiles || 0);
+    return {
+      recognized,
+      abnormal,
+      importable: Math.max(0, recognized - abnormal)
+    };
+  }
+  if (importKind === "personAsset") {
+    const rows = state.records.filter((record) => recordKind(record) === "资产" && record.type === "出库");
+    return { recognized: rows.length, abnormal: 0, importable: rows.length };
+  }
+  if (importKind === "personConsumable") {
+    const rows = state.records.filter((record) => recordKind(record) === "耗材" && record.type === "出库");
+    return { recognized: rows.length, abnormal: 0, importable: rows.length };
+  }
+  if (importKind === "word") {
+    const rows = (state.importArchives || []).filter((item) => String(item.category || "").includes("Word"));
+    return { recognized: rows.length, abnormal: (state.paperQueue || []).length, importable: rows.length };
+  }
+  return { recognized: state.assets.length, abnormal: 0, importable: state.assets.length };
+}
+
+function renderImportPreviewPanel(result) {
+  const metrics = importPreviewMetrics(result);
+  return `
+    <section class="import-preview-panel">
+      <div class="import-panel-title">
+        <div><span class="panel-title-icon">☷</span><h3>预览与校验</h3></div>
+        <div class="row-actions">
+          <button class="secondary small" data-import-recheck type="button">⟳ 重新校验</button>
+          <button class="secondary small" data-import-rules type="button">查看校验规则</button>
+        </div>
+      </div>
+      <div class="import-preview-metrics">
+        <div class="ok"><span>识别记录数</span><strong>${metrics.recognized}</strong><em>条</em></div>
+        <div class="warn"><span>异常项</span><strong>${metrics.abnormal}</strong><em>条</em></div>
+        <div class="info"><span>可导入</span><strong>${metrics.importable}</strong><em>条</em></div>
+      </div>
+      <div class="table-wrap compact-table import-preview-table">
+        <table>
+          <thead>${renderImportPreviewHeader()}</thead>
+          <tbody>${renderImportPreviewRows(result)}</tbody>
+        </table>
+      </div>
+      <div class="import-preview-foot">
+        <button class="download-link" data-empty-action="${attrText(JSON.stringify({ view: "reports", reportType: "ledger" }))}" type="button">查看全部预览数据（${metrics.recognized}条）</button>
+        <span><i class="dot ok"></i>通过 <i class="dot warn"></i>异常 <i class="dot bad"></i>错误</span>
+      </div>
+    </section>
+  `;
+}
+
+function renderImportPreviewHeader() {
+  if (activeImportResult()?.files?.length) {
+    return `<tr><th>序号</th><th>文件名称</th><th>导入类型</th><th>识别记录</th><th>异常</th><th>成功导入</th><th>校验结果</th></tr>`;
+  }
+  if (importKind === "personConsumable") {
+    return `<tr><th>序号</th><th>耗材名称</th><th>规格型号</th><th>数量</th><th>使用人</th><th>领用时间</th><th>校验结果</th></tr>`;
+  }
+  if (importKind === "word") {
+    return `<tr><th>序号</th><th>文件名称</th><th>单据类型</th><th>识别记录</th><th>异常</th><th>上传时间</th><th>校验结果</th></tr>`;
+  }
+  return `<tr><th>序号</th><th>资产编号</th><th>资产名称</th><th>类别</th><th>数量</th><th>使用人</th><th>入库时间</th><th>校验结果</th></tr>`;
+}
+
+function renderImportPreviewRows(result) {
+  if (result?.files?.length) {
+    return result.files.slice(0, IMPORT_PREVIEW_ROW_LIMIT).map((item, index) => `
+      <tr>
+        <td>${index + 1}</td>
+        <td>${attrText(item.fileName)}</td>
+        <td>${attrText(importKindLabel())}</td>
+        <td>${importProcessedCount(item)}</td>
+        <td>${Number(item.skipped || 0)}</td>
+        <td>${Number(item.imported || 0)}</td>
+        <td>${renderImportCheckBadge(Number(item.skipped || 0), item.error)}</td>
+      </tr>
+    `).join("");
+  }
+  if (importKind === "personConsumable") {
+    const records = state.records.filter((record) => recordKind(record) === "耗材" && record.type === "出库").slice(0, IMPORT_PREVIEW_ROW_LIMIT);
+    return records.map((record, index) => {
+      const asset = state.assets.find((item) => item.id === record.assetId);
+      return `
+        <tr>
+          <td>${index + 1}</td>
+          <td>${attrText(asset?.name || assetName(record.assetId))}</td>
+          <td>${attrText(blank(asset?.spec))}</td>
+          <td>${Number(record.quantity || 0)}</td>
+          <td>${attrText(userName(record.userId))}</td>
+          <td>${attrText(fmt(record.outTime || record.inTime))}</td>
+          <td>${renderImportCheckBadge(0)}</td>
+        </tr>
+      `;
+    }).join("") || emptyImportPreviewRow(7, "上传人员耗材领用表后，将在这里预览扣库结果。");
+  }
+  if (importKind === "word") {
+    const archives = (state.importArchives || []).filter((item) => String(item.category || "").includes("Word")).slice(0, IMPORT_PREVIEW_ROW_LIMIT);
+    return archives.map((item, index) => `
+      <tr>
+        <td>${index + 1}</td>
+        <td>${attrText(item.fileName)}</td>
+        <td>${attrText(item.category || "Word 单据")}</td>
+        <td>${importProcessedCount(item.result || {})}</td>
+        <td>${Number((item.result?.skipped || []).length || 0)}</td>
+        <td>${attrText(fmt(item.uploadedAt))}</td>
+        <td>${renderImportCheckBadge(Number((item.result?.skipped || []).length || 0))}</td>
+      </tr>
+    `).join("") || emptyImportPreviewRow(7, "上传 Word 出借单后，将在这里预览识别结果。");
+  }
+  if (importKind === "personAsset") {
+    const records = state.records.filter((record) => recordKind(record) === "资产" && record.type === "出库").slice(0, IMPORT_PREVIEW_ROW_LIMIT);
+    return records.map((record, index) => {
+      const asset = state.assets.find((item) => item.id === record.assetId);
+      return `
+        <tr>
+          <td>${index + 1}</td>
+          <td>${attrText(asset?.code || record.assetId)}</td>
+          <td>${attrText(asset?.name || assetName(record.assetId))}</td>
+          <td>${attrText(displayCategoryText(asset?.category || "-"))}</td>
+          <td>${Number(record.quantity || 1)}</td>
+          <td>${attrText(userName(record.userId))}</td>
+          <td>${attrText(fmt(record.outTime || record.inTime))}</td>
+          <td>${renderImportCheckBadge(0)}</td>
+        </tr>
+      `;
+    }).join("") || emptyImportPreviewRow(8, "上传人员资产使用表后，将在这里预览人员绑定结果。");
+  }
+  const assets = state.assets.slice(0, IMPORT_PREVIEW_ROW_LIMIT);
+  return assets.map((asset, index) => `
+    <tr>
+      <td>${index + 1}</td>
+      <td>${attrText(asset.code || asset.id)}</td>
+      <td>${attrText(asset.name || "-")}</td>
+      <td>${attrText(displayCategoryText(asset.category || "-"))}</td>
+      <td>${Number(asset.quantity || 1)}</td>
+      <td>${attrText(assetCurrentUserName(asset))}</td>
+      <td>${attrText(fmt(asset.inboundDate || asset.purchaseDate))}</td>
+      <td>${renderImportCheckBadge(0)}</td>
+    </tr>
+  `).join("") || emptyImportPreviewRow(8, "上传学校资产底表后，将在这里预览资产和耗材建账结果。");
+}
+
+function emptyImportPreviewRow(colspan, text) {
+  return `<tr><td colspan="${colspan}" class="empty">${attrText(text)}</td></tr>`;
+}
+
+function renderImportCheckBadge(abnormal = 0, error = "") {
+  if (error) return `<span class="import-check-badge bad">错误</span>`;
+  if (Number(abnormal || 0) > 0) return `<span class="import-check-badge warn">异常</span>`;
+  return `<span class="import-check-badge ok">通过</span>`;
+}
+
+function renderImportGuideCard() {
+  return `
+    <section class="import-guide-card">
+      <div class="guide-title"><span>i</span><h3>导入说明</h3></div>
+      <ul>
+        <li>请先下载导入模板，按模板格式准备数据后上传。</li>
+        <li>学校资产底表用于建账；人员资产表只绑定已有资产编号，不新增重复资产。</li>
+        <li>人员耗材领用表会按耗材名称和规格匹配库存，库存不足时标记异常。</li>
+        <li>系统会校验必填项、格式、重复文件和重复行，校验通过后再写入底账和流水。</li>
+      </ul>
+    </section>
+  `;
+}
+
+function renderPaperDigitalCard() {
+  return `
+    <section class="paper-digital-card">
+      <div class="guide-title"><span>▤</span><h3>纸质单据电子化</h3></div>
+      <p>支持纸质出借单、耗材领用单通过 Word 模板或扫描件进入电子档导入，自动识别后生成流水，减少手工录入错误。</p>
+      <button class="secondary" data-import-kind="word" type="button">前往扫描识别</button>
+    </section>
   `;
 }
 
@@ -4785,48 +4928,92 @@ function importResultSummary(result = {}) {
 
 function renderImportArchives() {
   if (!state.importArchives?.length) {
-    return renderEmptyAction("还没有电子档留档", "导入 Excel、Word 或纸质单据后，系统会在这里保留原始电子档和处理记录。", [{ label: "导入Word单据", view: "records", mode: "import" }, { label: "新增入库", view: "records", mode: "manual", action: "inbound" }]);
+    return `
+      <section class="import-history-panel">
+        <div class="section-title"><h2>导入历史</h2><span class="hint">导入后会保留原始电子档和校验结果</span></div>
+        ${renderEmptyAction("还没有导入历史", "导入学校资产底表、人员资产表、人员耗材表或 Word 单据后，会在这里看到处理记录。", [{ label: "导入Word单据", view: "records", mode: "import", importKind: "word" }, { label: "新增入库", view: "records", mode: "manual", action: "inbound" }])}
+      </section>
+    `;
   }
   return `
-    <div class="archive-list">
-      <div class="section-title"><h2>导入电子档留档</h2></div>
+    <section class="import-history-panel">
+      <div class="section-title">
+        <h2>导入历史</h2>
+        <select aria-label="导入历史类型筛选">
+          <option>全部类型</option>
+        </select>
+      </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>文件名</th><th>类型</th><th>上传人</th><th>上传时间</th><th>导入结果</th><th>操作</th></tr></thead>
+          <thead><tr><th>导入时间</th><th>文件名称</th><th>导入类型</th><th>上传人</th><th>识别记录数</th><th>成功导入</th><th>异常/错误</th><th>状态</th><th>操作</th></tr></thead>
           <tbody>
             ${state.importArchives.map((item) => `
               <tr>
-                <td>${item.fileName}</td>
-                <td>${item.category}</td>
-                <td>${userName(item.uploadedBy)}</td>
                 <td>${fmt(item.uploadedAt)}</td>
-                <td>${attrText(importResultSummary(item.result || {}))}</td>
-                <td><button class="download-link" data-download-archive="${item.id}" type="button">下载</button></td>
+                <td>${attrText(item.fileName)}</td>
+                <td>${attrText(importArchiveType(item))}</td>
+                <td>${userName(item.uploadedBy)}</td>
+                <td>${importProcessedCount(item.result || {})}</td>
+                <td>${Number(item.result?.imported || 0)}</td>
+                <td>${importArchiveAbnormalCount(item)}</td>
+                <td>${renderImportArchiveStatus(item)}</td>
+                <td>
+                  <div class="row-actions">
+                    <button class="ghost small" data-import-archive-detail="${item.id}" type="button">查看详情</button>
+                    <button class="secondary small" data-download-archive="${item.id}" type="button">下载结果</button>
+                  </div>
+                </td>
               </tr>
             `).join("")}
           </tbody>
         </table>
       </div>
-    </div>
-  `;
-}
-
-function renderLegacyImportPanel() {
-  return `
-    <section class="panel">
-      <div class="section-title">
-        <h2>批量导入出入库记录</h2>
-      </div>
-      <form id="importForm" class="import-row">
-        <input name="file" type="file" accept=".xlsx,.csv" required />
-        <button class="primary" type="submit">导入记录</button>
-      </form>
     </section>
   `;
 }
 
-function renderRecordForm() {
-  return `<section class="panel">${renderRecordFormInner()}</section>`;
+function importArchiveType(item) {
+  const category = String(item.category || "");
+  if (category.includes("Word")) return "Word 出借单";
+  if (category.includes("耗材")) return "人员耗材领用表";
+  if (category.includes("出库") || category.includes("出借")) return "人员资产使用表";
+  if (category.includes("入库")) return "学校资产底表";
+  return category || "电子档导入";
+}
+
+function importArchiveAbnormalCount(item) {
+  const result = item.result || {};
+  return Number((result.skipped || []).length || 0) + Number(result.duplicateRows || 0) + Number(result.duplicateFiles || 0);
+}
+
+function renderImportArchiveStatus(item) {
+  const abnormal = importArchiveAbnormalCount(item);
+  const imported = Number(item.result?.imported || 0);
+  if (abnormal && imported) return `<span class="import-history-status warn">部分成功</span>`;
+  if (abnormal && !imported) return `<span class="import-history-status bad">导入异常</span>`;
+  return `<span class="import-history-status ok">导入成功</span>`;
+}
+
+function importArchiveDetailText(item) {
+  const result = item.result || {};
+  const skipped = Number((result.skipped || []).length || 0);
+  const duplicates = Number(result.duplicateRows || 0) + Number(result.duplicateFiles || 0);
+  const abnormal = skipped + duplicates;
+  return [
+    `文件名称：${item.fileName || "-"}`,
+    `导入类型：${importArchiveType(item)}`,
+    `上传时间：${fmt(item.uploadedAt)}`,
+    `上传人：${userName(item.uploadedBy)}`,
+    `识别记录数：${importProcessedCount(result)}`,
+    `成功导入：${Number(result.imported || 0)}`,
+    `新建资产：${Number(result.createdAssets || 0)}`,
+    `已存在：${Number(result.existingAssets || 0)}`,
+    `已更新：${Number(result.updatedAssets || 0)}`,
+    `需处理异常：${skipped}`,
+    `重复未写入：${duplicates}`,
+    `合计未写入/需确认：${abnormal}`,
+    result.message ? `说明：${result.message}` : ""
+  ].filter(Boolean).join("\n");
 }
 
 function recordActionConfig(action = recordActionMode) {
@@ -5064,11 +5251,6 @@ function renderAssetRequests() {
   `;
 }
 
-function priorityBadge(priority) {
-  const cls = priority === "紧急" ? "bad" : priority === "高" ? "warn" : "ok";
-  return `<span class="badge ${cls}">${priority || "普通"}</span>`;
-}
-
 function renderPurchaseWishes() {
   const wishes = state.purchaseWishes || [];
   const canManageWishes = can("purchase_wishes.manage");
@@ -5160,14 +5342,38 @@ function renderUsers() {
         </table>
       </div>
     </section>
+    ${can("users.manage") ? `<section class="panel">
+      <div class="section-title"><h2>历史导入用户重检</h2><span class="hint">扫描历史导入中被误识别为用户的资产名，默认只做停用修复，不删除数据。</span></div>
+      <div class="form-grid" style="grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin-bottom: 10px;">
+        <label><input id="repairUserIncludeInactive" type="checkbox" ${userRepairOptions.includeInactive ? "checked" : ""}/> 包含已停用用户</label>
+        <label><input id="repairUserSkipAdmin" type="checkbox" ${userRepairOptions.skipAdmin ? "checked" : ""}/> 跳过管理员</label>
+        <label><input id="repairUserSkipReferenced" type="checkbox" ${userRepairOptions.skipReferenced ? "checked" : ""}/> 跳过有关联资产/记录账号</label>
+      </div>
+      <div class="row-actions">
+        <button class="secondary small" id="runUserRepairDryrun" type="button">预检可疑用户</button>
+        <button class="danger small" id="runUserRepairFix" type="button">执行修复（停用）</button>
+        <button class="secondary small" id="runUserRepairFixFromList" type="button">按预检列表修复（不重扫）</button>
+        <button class="danger small" id="runUserRepairDeleteFromList" type="button">按预检列表清除（不可恢复）</button>
+        <button class="ghost small" id="clearUserRepairState" type="button">清空结果</button>
+      </div>
+      ${renderUserRepairResult()}
+    </section>` : ""}
     <section class="panel">
-      <div class="section-title"><h2>用户列表</h2></div>
+      <div class="section-title">
+        <h2>用户列表</h2>
+      </div>
+      ${can("users.manage") ? `<div class="row-actions user-batch-actions">
+        <label class="hint"><input id="selectAllImportedUserRows" type="checkbox" /> 全选当前列表</label>
+        <span class="hint" id="selectedImportedUserRowsCount">已选 0 条</span>
+        <button class="danger small" id="clearSelectedImportedUserRows" type="button" disabled>批量删除所选（不可恢复）</button>
+      </div>` : ""}
       <div class="table-wrap">
         <table>
-          <thead><tr><th>账号</th><th>姓名</th><th>操作</th><th>角色</th>${isMultiDepartment() ? "<th>部门</th>" : ""}<th>状态</th></tr></thead>
+          <thead><tr>${can("users.manage") ? `<th class="user-select-col">选择</th>` : ""}<th>账号</th><th>姓名</th><th>操作</th><th>角色</th>${isMultiDepartment() ? "<th>部门</th>" : ""}<th>状态</th></tr></thead>
           <tbody>
-            ${state.users.map((user) => `
+            ${(state.users || []).filter((user) => user.id === state.currentUser?.id || isLikelyPersonName(user.name)).map((user) => `
               <tr data-user-row="${user.id}">
+                ${can("users.manage") ? `<td class="user-select-col">${user.id === state.currentUser.id ? "" : `<input data-imported-user-select="${user.id}" type="checkbox" title="选择 ${user.name}" />`}</td>` : ""}
                 <td>${user.username}</td>
                 <td>${user.name}</td>
                 <td>
@@ -5188,6 +5394,48 @@ function renderUsers() {
       </div>
     </section>
   `;
+}
+
+function renderUserRepairResult() {
+  if (!userRepairState) {
+    return "<p class=\"hint\">尚未运行，建议先点“预检可疑用户”查看结果。</p>";
+  }
+  if (userRepairState.loading) {
+    return `<p class=\"hint\">扫描中...</p>`;
+  }
+  if (["fix", "delete"].includes(userRepairState.mode)) {
+    const updated = userRepairState.updated || [];
+    const skipped = userRepairState.skipped || [];
+    const modeLabel = userRepairState.mode === "delete" ? "删除" : "停用";
+    return `
+      <p>预检命中 <b>${userRepairState.checked || 0}</b> 条，已${modeLabel} <b>${updated.length}</b> 条，跳过 <b>${skipped.length}</b> 条。</p>
+      ${updated.length ? `<h4>已${modeLabel}</h4><div class="table-wrap"><table><thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>原因</th></tr></thead><tbody>${updated.map((item) => `<tr><td>${item.username}</td><td>${item.name}</td><td>${item.department || "-"}</td><td>${item.reason}</td></tr>`).join("")}</tbody></table></div>` : ""}
+      ${skipped.length ? `<h4>跳过</h4><div class="table-wrap"><table><thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>原因</th></tr></thead><tbody>${skipped.map((item) => `<tr><td>${item.username}</td><td>${item.name}</td><td>${item.department || "-"}</td><td>${item.reason}</td></tr>`).join("")}</tbody></table></div>` : ""}
+    `;
+  }
+  const candidates = userRepairState.candidates || [];
+    return `
+      <p>本次预检命中 <b>${userRepairState.checked || candidates.length || 0}</b> 条可疑记录。</p>
+      ${!candidates.length ? "<p class=\"hint\">未发现明显误识别用户。</p>" : `
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>资产引用</th><th>记录引用</th><th>异常特征</th><th>可修复</th></tr></thead>
+          <tbody>
+            ${candidates.map((item) => {
+              const refs = item.referenceCounts || {};
+              const assetRefs = Number(refs.keeperAssetsCount || 0) + Number(refs.useUserAssetsCount || 0) + Number(refs.paperOwnerCount || 0);
+              return `<tr><td>${item.username}</td><td>${item.name}</td><td>${item.department || "-"}</td><td>${assetRefs}</td><td>${Number(refs.recordsCount || 0)}</td><td>${item.lookLikeAssetName ? "疑似资产名" : "其他可疑名"}</td><td>${item.canRepair ? "可修复" : "暂不可修复"}</td></tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    `}
+    `;
+}
+
+function getUserRepairCandidateIds() {
+  const candidates = (userRepairState && userRepairState.mode === "dryrun" ? userRepairState.candidates : null) || [];
+  return [...new Set((candidates || []).map((item) => String(item.id || "").trim()).filter(Boolean))];
 }
 
 function purchaseWishTotal(item) {
@@ -5291,28 +5539,6 @@ function renderAssetRequestMessages() {
               <tr>
                 <td>${item.userName || userName(item.userId)}</td><td>${item.assetName}</td><td>${item.quantity}</td><td>${blank(item.reason)}</td>
                 <td><div class="row-actions"><button class="secondary small" data-approve-asset-request="${item.id}" type="button">批准</button><button class="ghost small" data-reject-asset-request="${item.id}" type="button">驳回</button></div></td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  `;
-}
-
-function renderPurchaseWishMessages() {
-  const wishes = (state.purchaseWishes || []).filter((item) => item.status === "待采购" || item.status === "已采纳");
-  if (!wishes.length) return "";
-  return `
-    <div class="message-table">
-      <div class="section-title"><h2>采购需求</h2><span class="hint">待跟进 ${wishes.length} 项</span></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>提交人</th><th>设备</th><th>数量</th><th>优先级</th><th>状态</th></tr></thead>
-          <tbody>
-            ${wishes.slice(0, 8).map((item) => `
-              <tr>
-                <td>${item.userName || userName(item.userId)}</td><td>${item.itemName}</td><td>${item.quantity}</td><td>${priorityBadge(item.priority)}</td><td>${requestStatusBadge(item.status)}</td>
               </tr>
             `).join("")}
           </tbody>
@@ -5634,6 +5860,12 @@ function renderContextMenu() {
       <button data-user-password type="button">改密码</button>
       <button data-user-delete type="button">删除用户</button>
     </div>
+    ${can("assets.manage") ? `
+    <div class="context-menu compact asset-row-context-menu" id="assetRowContextMenu" aria-hidden="true">
+      <button data-asset-row-location type="button">更新位置</button>
+      <button data-asset-row-image type="button">上传参考图</button>
+      <button data-asset-row-view type="button">查看资产</button>
+    </div>` : ""}
   `;
 }
 
@@ -5722,22 +5954,6 @@ async function startQrScanner(onResult) {
     close();
     alert(`摄像头无法启动：${exc.message || "请检查浏览器权限"}`);
   }
-}
-
-function renderRecordCards(records) {
-  if (!records.length) return renderEmptyAction("还没有出入库记录", "新增入库、划一笔出借、归还登记和耗材领用都会出现在这里。", recordEntryActions());
-  return `<div class="record-list">${records.map((record) => `
-    <article class="record-card">
-      <div class="card-head">
-        <strong>${record.type} · ${assetName(record.assetId)}</strong>
-        ${isAdmin() ? `<button class="danger small" data-delete-record="${record.id}" type="button">删除</button>` : ""}
-      </div>
-      <p>${statusBadge(record.status)} 单据：${recordDocumentType(record)}，数量：${record.quantity}，使用人：${userName(record.userId)}</p>
-      <p>入库：${fmt(record.inTime)}，出库：${fmt(record.outTime)}</p>
-      <p>纸质单号：${record.paperNo || "-"}</p>
-      ${record.displayNote ? `<p>备注：${recordDisplayNote(record)}</p>` : ""}
-    </article>
-  `).join("")}</div>`;
 }
 
 function updateManualRecordPreview() {
@@ -5840,19 +6056,49 @@ function importConfig() {
       extensions: [".docx"],
       endpoint: "/api/records/import-word-checkout",
       resultKey: "wordImportResult",
-      button: "导入 Word 出借单",
+      shortLabel: "Word 出借单",
+      resultTitle: "Word 出借单导入",
+      button: "确认导入 Word 单据",
       uploadHint: "支持 .docx，单次可上传多个文件，也可选择包含 Word 单据的文件夹",
       description: "标准表格会自动导入出借记录；手写图片或扫描件会进入待复核队列。"
     };
   }
+  if (importKind === "personAsset") {
+    return {
+      accept: ".docx,.doc,.xlsx,.csv",
+      extensions: [".docx", ".doc", ".xlsx", ".csv"],
+      endpoint: "/api/records/import-person-assets",
+      resultKey: "importResult",
+      shortLabel: "人员资产使用表",
+      resultTitle: "人员资产使用表导入",
+      button: "确认导入人员资产表",
+      uploadHint: "支持 .docx、.xlsx、.csv；旧版 .doc 请先另存为 .docx。资产编号必须已存在于学校资产底表。",
+      description: "Word 表格、Excel 或 CSV 都会按资产编号匹配底表，匹配成功后绑定到使用人名下并生成出库流水。"
+    };
+  }
+  if (importKind === "personConsumable") {
+    return {
+      accept: ".docx,.doc,.xlsx,.csv",
+      extensions: [".docx", ".doc", ".xlsx", ".csv"],
+      endpoint: "/api/records/import-person-consumables",
+      resultKey: "importResult",
+      shortLabel: "人员耗材领用表",
+      resultTitle: "人员耗材领用表导入",
+      button: "确认导入耗材领用表",
+      uploadHint: "支持 .docx、.xlsx、.csv；旧版 .doc 请先另存为 .docx。按耗材名称、规格型号和数量匹配库存。",
+      description: "Word 表格、Excel 或 CSV 都会按耗材名称和规格匹配现有库存；库存不足、耗材不存在或人员缺失会标记异常。"
+    };
+  }
   return {
-    accept: ".xlsx,.csv",
-    extensions: [".xlsx", ".csv"],
+    accept: ".docx,.doc,.xlsx,.csv",
+    extensions: [".docx", ".doc", ".xlsx", ".csv"],
     endpoint: "/api/records/import-inbound",
     resultKey: "importResult",
-    button: "导入入库记录",
-    uploadHint: "支持 .xlsx、.csv，单次可上传多个文件，也可选择包含入库表的文件夹",
-    description: `表头：资产编号、类型、数量${isMultiDepartment() ? "、部门" : ""}、借用人、入库时间、纸质单号、备注。`
+    shortLabel: "学校资产底表",
+    resultTitle: "学校资产底表导入",
+    button: "确认导入学校资产底表",
+    uploadHint: "支持 .docx、.xlsx、.csv；旧版 .doc 请先另存为 .docx，固定资产和耗材都可以在这里建账。",
+    description: `表头建议包含：资产分类、资产名称、规格型号、资产编号、数量、取得日期、部门、存放地点、状态。`
   };
 }
 
@@ -5938,6 +6184,107 @@ async function importFilesBatch(files, endpoint, resultKey) {
   applyAssetUrlSelection();
   summary.message = `已处理 ${files.length} 个文件`;
   return summary;
+}
+
+function openAssetLocationUpdateImport() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".xlsx,.csv";
+  input.multiple = true;
+  input.style.display = "none";
+  document.body.appendChild(input);
+  input.addEventListener("change", async () => {
+    const files = Array.from(input.files || []).filter((file) => [".xlsx", ".csv"].some((extension) => file.name.toLowerCase().endsWith(extension)));
+    input.remove();
+    if (!files.length) {
+      alert("请选择 .xlsx 或 .csv 位置更新表。表头至少包含资产编号和新位置。");
+      return;
+    }
+    try {
+      assetLocationUpdateResult = await importFilesBatch(files, "/api/assets/location-import", "locationUpdateResult");
+      alert(importResultSummary(assetLocationUpdateResult));
+      render();
+    } catch (exc) {
+      alert(exc.message || "位置更新失败");
+    }
+  }, { once: true });
+  input.click();
+}
+
+function openAssetImageUpdateImport() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".xlsx,.csv";
+  input.multiple = true;
+  input.style.display = "none";
+  document.body.appendChild(input);
+  input.addEventListener("change", async () => {
+    const files = Array.from(input.files || []).filter((file) => [".xlsx", ".csv"].some((extension) => file.name.toLowerCase().endsWith(extension)));
+    input.remove();
+    if (!files.length) {
+      alert("请选择 .xlsx 或 .csv 参考图表。表头至少包含资产名称；图片可插在 Excel 对应行，或填写在参考图/图片列。");
+      return;
+    }
+    try {
+      assetImageUpdateResult = await importFilesBatch(files, "/api/assets/image-import", "imageUpdateResult");
+      alert(importResultSummary(assetImageUpdateResult));
+      render();
+    } catch (exc) {
+      alert(exc.message || "参考图更新失败");
+    }
+  }, { once: true });
+  input.click();
+}
+
+async function updateSingleAssetLocation(assetId) {
+  const asset = state.assets.find((item) => item.id === assetId);
+  if (!asset) return;
+  const location = prompt(`更新“${asset.name}（${asset.code || "无编号"}）”的位置`, asset.location || "");
+  if (location === null) return;
+  const cleanLocation = location.trim();
+  if (!cleanLocation) {
+    alert("位置不能为空。");
+    return;
+  }
+  try {
+    state = await api("/api/assets/location", {
+      method: "POST",
+      body: JSON.stringify(withActor({ assetId: asset.id, location: cleanLocation }))
+    });
+    render();
+  } catch (exc) {
+    alert(exc.message || "位置更新失败");
+  }
+}
+
+function uploadSingleAssetReferenceImage(assetId) {
+  const asset = state.assets.find((item) => item.id === assetId);
+  if (!asset) return;
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/png,image/jpeg,image/webp,image/gif";
+  input.style.display = "none";
+  document.body.appendChild(input);
+  input.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    input.remove();
+    if (!file) return;
+    if (file.size > 8 * 1024 * 1024) {
+      alert("图片太大，请选择 8MB 以内的图片。");
+      return;
+    }
+    try {
+      const image = await imageToDataUrl(file);
+      state = await api("/api/assets/image", {
+        method: "POST",
+        body: JSON.stringify(withActor({ assetId: asset.id, image }))
+      });
+      render();
+    } catch (exc) {
+      alert(exc.message || "参考图上传失败");
+    }
+  }, { once: true });
+  input.click();
 }
 
 function readFileAsDataUrl(file) {
@@ -6233,14 +6580,57 @@ function renderPrintableAssetSheets(items) {
 }
 
 function downloadInboundTemplate() {
-  const header = isMultiDepartment()
-    ? "资产编号,类型,数量,部门,借用人,入库时间,纸质单号,备注"
-    : "资产编号,类型,数量,借用人,入库时间,纸质单号,备注";
-  const sample = isMultiDepartment()
-    ? "CK-2026-001,入库,1,生产一组,张三,2026-06-02T16:30,SZ-IN-100,批量入库"
-    : "CK-2026-001,入库,1,张三,2026-06-02T16:30,SZ-IN-100,批量入库";
-  const csv = `\ufeff${header}\n${sample}\n`;
-  downloadTextFile("入库记录导入模板.csv", csv);
+  const templates = {
+    inbound: {
+      fileName: "学校资产底表导入模板.csv",
+      header: "资产分类,资产名称,规格型号,资产编号,数量,单位,资产原值,取得日期,部门,具体存放地点,资产状态,清查盘点情况,清查盘盈情况,纸质单号,备注",
+      sample: "电子设备,联想笔记本电脑,ThinkPad X1,304014-2010105-000001,1,台,6800,2026-06-01,训练中心,701室,在库,未盘点,,RK-20260601,学校资产底表导入"
+    },
+    personAsset: {
+      fileName: "人员资产使用表导入模板.csv",
+      header: isMultiDepartment()
+        ? "资产编号,资产名称,规格型号,类型,数量,部门,使用人,出库时间,纸质单号,备注"
+        : "资产编号,资产名称,规格型号,类型,数量,使用人,出库时间,纸质单号,备注",
+      sample: isMultiDepartment()
+        ? "304014-2010105-000001,联想笔记本电脑,ThinkPad X1,出库,1,训练中心,张三,2026-06-01,CK-20260601,人员资产使用表导入"
+        : "304014-2010105-000001,联想笔记本电脑,ThinkPad X1,出库,1,张三,2026-06-01,CK-20260601,人员资产使用表导入"
+    },
+    personConsumable: {
+      fileName: "人员耗材领用表导入模板.csv",
+      header: isMultiDepartment()
+        ? "耗材名称,规格型号,类型,数量,单位,部门,使用人,出库时间,纸质单号,备注"
+        : "耗材名称,规格型号,类型,数量,单位,使用人,出库时间,纸质单号,备注",
+      sample: isMultiDepartment()
+        ? "A4打印纸,80g,出库,5,包,训练中心,李四,2026-06-01,HC-20260601,人员耗材领用表导入"
+        : "A4打印纸,80g,出库,5,包,李四,2026-06-01,HC-20260601,人员耗材领用表导入"
+    },
+    word: {
+      fileName: "Word出借单导入说明.csv",
+      header: "单据类型,支持格式,必填内容,说明",
+      sample: "出借单或耗材领用单,.docx,申领人/物品名称/数量/领用日期,可上传单个 Word 文件或整个文件夹"
+    }
+  };
+  const template = templates[importKind] || templates.inbound;
+  const csv = `\ufeff${template.header}\n${template.sample}\n`;
+  downloadTextFile(template.fileName, csv);
+}
+
+function importRuleText() {
+  if (importKind === "personAsset") {
+    return "人员资产使用表校验规则：资产编号必须已存在于学校资产底表；资产不能处于维修或报废；同一资产已被他人使用时标记冲突；导入后只更新原资产状态并生成出库流水。";
+  }
+  if (importKind === "personConsumable") {
+    return "人员耗材领用表校验规则：按耗材名称和规格型号匹配库存；库存数量必须足够；耗材不存在、库存不足或领用人缺失会标记异常；导入后扣减库存并生成耗材出库流水。";
+  }
+  if (importKind === "word") {
+    return "Word 单据校验规则：优先识别标准表格；无法自动识别的扫描件进入待复核；重复文件不会重复生成流水。";
+  }
+  return "学校资产底表校验规则：按资产编号去重，已有资产执行增量更新；资产分类、资产名称、规格型号用于归类；耗材会按名称和规格进入库存管理。";
+}
+
+function recheckImportPreview() {
+  renderSelectedFiles(selectedImportFiles(document.querySelector("#bulkImportForm"), importConfig().extensions));
+  alert("已重新读取当前选择文件。导入前系统会在后台再次校验必填项、重复文件、重复行和匹配关系。");
 }
 
 function bindContextMenu() {
@@ -6378,6 +6768,136 @@ async function revokeAdmin(userId) {
     render();
   } catch (exc) {
     alert(exc.message);
+  }
+}
+
+async function repairImportedUsers(mode) {
+  if (!can("users.manage")) return;
+  const payload = {
+    mode,
+    includeInactive: Boolean(document.querySelector("#repairUserIncludeInactive")?.checked),
+    skipAdmin: Boolean(document.querySelector("#repairUserSkipAdmin")?.checked),
+    skipReferenced: Boolean(document.querySelector("#repairUserSkipReferenced")?.checked),
+  };
+  if (mode === "fixFromList" || mode === "deleteFromList") {
+    const candidateIds = getUserRepairCandidateIds();
+    if (!candidateIds.length) {
+      const actionText = mode === "deleteFromList" ? "清除" : "修复";
+      alert(`请先运行“预检可疑用户”，确认有可处理项后，再点击“按预检列表${actionText}”。`);
+      return;
+    }
+    payload.candidateIds = candidateIds;
+  }
+  const isDirectFix = mode === "fix" || mode === "fixFromList" || mode === "deleteFromList";
+  const finalMode = mode === "fixFromList" ? "fix" : mode === "deleteFromList" ? "delete" : mode;
+  payload.mode = finalMode;
+  if (finalMode === "delete") {
+    payload.unlinkReferences = true;
+  }
+  userRepairOptions = {
+    includeInactive: payload.includeInactive,
+    skipAdmin: payload.skipAdmin,
+    skipReferenced: payload.skipReferenced,
+  };
+  if (isDirectFix) {
+    if (finalMode === "delete") {
+      if (!confirm("该操作会先解绑选中的可疑账号历史引用，再执行不可恢复删除，请确认无误后继续。")) return;
+    } else {
+      if (!confirm("该操作将停用可疑账号（默认不删除），是否继续？请先确认预检结果无误。")) return;
+    }
+  }
+  userRepairState = { mode: finalMode, loading: true };
+  render();
+  try {
+    userRepairState = await api("/api/users/repair", {
+      method: "POST",
+      body: JSON.stringify(withActor(payload)),
+    });
+    applyUserRepairResultToState(userRepairState);
+    if (userRepairState?.checked) {
+      userRepairState.source = finalMode === "fix" && payload.candidateIds ? "candidate-only" : "full-scan";
+    }
+    if (finalMode === "delete") {
+      userRepairState.source = payload.candidateIds ? "candidate-only" : "full-scan";
+    }
+    render();
+    if (finalMode === "fix") {
+      alert(`修复完成：停用 ${userRepairState.updatedCount || 0} 条，跳过 ${userRepairState.skippedCount || 0} 条。`);
+      return;
+    }
+    if (finalMode === "delete") {
+      alert(`清除完成：清除 ${userRepairState.updatedCount || 0} 条，跳过 ${userRepairState.skippedCount || 0} 条。`);
+    }
+  } catch (exc) {
+    userRepairState = null;
+    alert(exc.message);
+    render();
+  }
+}
+
+function applyUserRepairResultToState(result) {
+  const changedIds = new Set((result?.updated || []).map((item) => String(item.id || "").trim()).filter(Boolean));
+  if (!changedIds.size) return;
+  if (result.mode === "delete") {
+    state.users = (state.users || []).filter((user) => !changedIds.has(String(user.id)));
+    return;
+  }
+  if (result.mode === "fix") {
+    state.users = (state.users || []).map((user) => changedIds.has(String(user.id)) ? { ...user, active: false } : user);
+  }
+}
+
+function updateSelectedImportedUserRowsUI() {
+  const selectedCount = document.querySelectorAll("[data-imported-user-select]:checked").length;
+  const countLabel = document.querySelector("#selectedImportedUserRowsCount");
+  const batchButton = document.querySelector("#clearSelectedImportedUserRows");
+  const selectAll = document.querySelector("#selectAllImportedUserRows");
+  const rowCheckboxes = [...document.querySelectorAll("[data-imported-user-select]")];
+  if (countLabel) countLabel.textContent = `已选 ${selectedCount} 条`;
+  if (batchButton) batchButton.disabled = selectedCount === 0;
+  if (selectAll) {
+    selectAll.checked = rowCheckboxes.length > 0 && selectedCount === rowCheckboxes.length;
+    selectAll.indeterminate = selectedCount > 0 && selectedCount < rowCheckboxes.length;
+  }
+}
+
+async function clearSelectedImportedUsers() {
+  if (!can("users.manage")) return;
+  const selectedIds = [...document.querySelectorAll("[data-imported-user-select]:checked")]
+    .map((item) => String(item.dataset.importedUserSelect || "").trim())
+    .filter(Boolean);
+  if (!selectedIds.length) {
+    alert("请先在用户列表左侧勾选需要批量删除的记录。");
+    return;
+  }
+  const selectedUsers = selectedIds
+    .map((id) => state.users.find((user) => String(user.id) === id))
+    .filter(Boolean);
+  const preview = selectedUsers.slice(0, 6).map((user) => user.name).join("、");
+  const suffix = selectedUsers.length > 6 ? ` 等 ${selectedUsers.length} 条` : ` ${selectedUsers.length} 条`;
+  if (!confirm(`将删除你勾选的用户：${preview}${suffix}。系统会先解绑历史引用，再执行不可恢复删除；管理员和当前账号会跳过。是否继续？`)) return;
+  userRepairState = { mode: "delete", loading: true };
+  render();
+  try {
+    userRepairState = await api("/api/users/repair", {
+      method: "POST",
+      body: JSON.stringify(withActor({
+        mode: "delete",
+        candidateIds: selectedIds,
+        includeInactive: true,
+        skipAdmin: true,
+        unlinkReferences: true,
+        forceSelected: true,
+      })),
+    });
+    applyUserRepairResultToState(userRepairState);
+    userRepairState.source = "selected-list";
+    render();
+    alert(`删除完成：删除 ${userRepairState.updatedCount || 0} 条，跳过 ${userRepairState.skippedCount || 0} 条。`);
+  } catch (exc) {
+    userRepairState = null;
+    alert(exc.message);
+    render();
   }
 }
 
@@ -6592,6 +7112,51 @@ function closeUserContextMenu() {
   menu.setAttribute("aria-hidden", "true");
 }
 
+function bindAssetRowContextMenu() {
+  const menu = document.querySelector("#assetRowContextMenu");
+  if (!menu || !can("assets.manage")) return;
+  let selectedAssetId = "";
+
+  document.querySelectorAll("[data-ledger-asset-row]").forEach((row) => {
+    row.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      selectedAssetId = row.dataset.ledgerAssetRow || "";
+      const left = Math.min(event.clientX, window.innerWidth - 190);
+      const top = Math.min(event.clientY, window.innerHeight - 170);
+      menu.style.left = `${left}px`;
+      menu.style.top = `${top}px`;
+      menu.classList.add("open");
+      menu.setAttribute("aria-hidden", "false");
+      setTimeout(() => document.addEventListener("click", closeAssetRowContextMenu, { once: true }), 0);
+    });
+  });
+
+  menu.querySelector("[data-asset-row-location]")?.addEventListener("click", async () => {
+    closeAssetRowContextMenu();
+    if (selectedAssetId) await updateSingleAssetLocation(selectedAssetId);
+  });
+
+  menu.querySelector("[data-asset-row-image]")?.addEventListener("click", () => {
+    closeAssetRowContextMenu();
+    if (selectedAssetId) uploadSingleAssetReferenceImage(selectedAssetId);
+  });
+
+  menu.querySelector("[data-asset-row-view]")?.addEventListener("click", () => {
+    closeAssetRowContextMenu();
+    if (!selectedAssetId) return;
+    selectedAssetDetailId = selectedAssetId;
+    render();
+  });
+}
+
+function closeAssetRowContextMenu() {
+  const menu = document.querySelector("#assetRowContextMenu");
+  if (!menu) return;
+  menu.classList.remove("open");
+  menu.setAttribute("aria-hidden", "true");
+}
+
 function bindResizableDrawers() {
   document.querySelectorAll("[data-drawer-resize-handle]").forEach((handle) => {
     handle.addEventListener("pointerdown", (event) => {
@@ -6733,30 +7298,31 @@ function bindEvents() {
     dashboardSearch = value;
   });
 
-  document.querySelectorAll("[data-dashboard-usage]").forEach((button) => {
+  document.querySelectorAll("[data-dashboard-mode]").forEach((button) => {
     button.addEventListener("click", () => {
-      dashboardUsageOpen = true;
+      dashboardMode = button.dataset.dashboardMode || "list";
+      if (dashboardMode !== "usage") dashboardUsageUserId = "";
       ledgerDrawerKey = "";
       ledgerDrawerMode = "";
       render();
     });
   });
 
-  document.querySelectorAll("[data-dashboard-person]").forEach((button) => {
+  document.querySelectorAll("[data-dashboard-category]").forEach((button) => {
     button.addEventListener("click", () => {
-      dashboardUsageUserId = button.dataset.dashboardPerson || "";
+      dashboardCategory = button.dataset.dashboardCategory || "";
       render();
     });
   });
 
-  document.querySelector("#closeDashboardUsage")?.addEventListener("click", () => {
-    dashboardUsageOpen = false;
-    dashboardUsageUserId = "";
-    render();
+  document.querySelectorAll("[data-dashboard-person-card]").forEach((button) => {
+    button.addEventListener("click", () => {
+      dashboardUsageUserId = button.dataset.dashboardPersonCard || "";
+      render();
+    });
   });
 
-  document.querySelector("#dashboardUsageBackdrop")?.addEventListener("click", () => {
-    dashboardUsageOpen = false;
+  document.querySelector("[data-dashboard-person-clear]")?.addEventListener("click", () => {
     dashboardUsageUserId = "";
     render();
   });
@@ -6802,6 +7368,8 @@ function bindEvents() {
     render();
   });
 
+  document.querySelector("#batchUpdateAssetLocations")?.addEventListener("click", openAssetLocationUpdateImport);
+  document.querySelector("#batchUpdateAssetImages")?.addEventListener("click", openAssetImageUpdateImport);
   document.querySelector("#batchExportAssets")?.addEventListener("click", downloadAssetsTable);
   document.querySelector("#batchPrintAssetLabels")?.addEventListener("click", async () => {
     try {
@@ -6842,7 +7410,6 @@ function bindEvents() {
       ledgerDrawerKey = button.dataset.ledgerOpenGroup || "";
       ledgerDrawerMode = "group";
       selectedAssetDetailId = "";
-      dashboardUsageOpen = false;
       render();
     });
   });
@@ -6881,6 +7448,10 @@ function bindEvents() {
       const select = form?.querySelector("select[name='userId']");
       select?.focus();
     });
+  });
+
+  document.querySelectorAll("[data-ledger-location-edit]").forEach((button) => {
+    button.addEventListener("click", () => updateSingleAssetLocation(button.dataset.ledgerLocationEdit));
   });
 
   document.querySelectorAll("[data-ledger-checkout-form]").forEach((form) => {
@@ -7650,6 +8221,13 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-import-archive-detail]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = (state.importArchives || []).find((archive) => archive.id === button.dataset.importArchiveDetail);
+      if (item) alert(importArchiveDetailText(item));
+    });
+  });
+
   document.querySelector("#departmentFilter")?.addEventListener("change", (event) => {
     selectedDepartment = event.target.value;
     render();
@@ -7667,6 +8245,12 @@ function bindEvents() {
       render();
     });
   });
+
+  document.querySelector("[data-import-rules]")?.addEventListener("click", () => {
+    alert(importRuleText());
+  });
+
+  document.querySelector("[data-import-recheck]")?.addEventListener("click", recheckImportPreview);
 
   document.querySelectorAll("#bulkFileInput, #bulkFolderInput").forEach((input) => {
     input.addEventListener("change", () => {
@@ -7699,7 +8283,7 @@ function bindEvents() {
     const config = importConfig();
     const files = selectedImportFiles(event.target, config.extensions);
     if (!files.length) {
-      alert(importKind === "word" ? "请选择 .docx 文件，或选择包含 Word 文件的文件夹" : "请选择 .xlsx 或 .csv 文件，或选择包含这些文件的文件夹");
+      alert(`请选择${config.shortLabel}文件，或选择包含这些文件的文件夹。`);
       return;
     }
     const result = await importFilesBatch(files, config.endpoint, config.resultKey);
@@ -7883,6 +8467,19 @@ function bindEvents() {
       await deleteUser(button.dataset.deleteUser);
     });
   });
+  document.querySelector("#selectAllImportedUserRows")?.addEventListener("change", (event) => {
+    document.querySelectorAll("[data-imported-user-select]").forEach((checkbox) => {
+      checkbox.checked = event.target.checked;
+    });
+    updateSelectedImportedUserRowsUI();
+  });
+  document.querySelectorAll("[data-imported-user-select]").forEach((checkbox) => {
+    checkbox.addEventListener("change", updateSelectedImportedUserRowsUI);
+  });
+  document.querySelector("#clearSelectedImportedUserRows")?.addEventListener("click", async () => {
+    await clearSelectedImportedUsers();
+  });
+  updateSelectedImportedUserRowsUI();
 
   document.querySelectorAll("[data-promote-user]").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -7894,6 +8491,23 @@ function bindEvents() {
     button.addEventListener("click", async () => {
       await revokeAdmin(button.dataset.revokeAdmin);
     });
+  });
+
+  document.querySelector("#runUserRepairDryrun")?.addEventListener("click", async () => {
+    await repairImportedUsers("dryrun");
+  });
+  document.querySelector("#runUserRepairFix")?.addEventListener("click", async () => {
+    await repairImportedUsers("fix");
+  });
+  document.querySelector("#runUserRepairFixFromList")?.addEventListener("click", async () => {
+    await repairImportedUsers("fixFromList");
+  });
+  document.querySelector("#runUserRepairDeleteFromList")?.addEventListener("click", async () => {
+    await repairImportedUsers("deleteFromList");
+  });
+  document.querySelector("#clearUserRepairState")?.addEventListener("click", () => {
+    userRepairState = null;
+    render();
   });
 
   document.querySelectorAll("[data-approve-admin-request]").forEach((button) => {
@@ -8223,6 +8837,7 @@ function bindEvents() {
   bindContextMenu();
   bindDepartmentContextMenu();
   bindUserContextMenu();
+  bindAssetRowContextMenu();
 }
 
 loadState();
